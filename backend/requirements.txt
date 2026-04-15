@@ -11,3 +11,5 @@ langchain-ollama
 sentence-transformers
 faiss-cpu
 pypdf
+python-jose[cryptography]
+bcrypt

@@ -7,6 +7,7 @@ load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .api.auth import router as auth_router
 from .api.chat import router as chat_router
 from .api.documents import router as documents_router
 from .core.settings import settings
@@ -20,7 +21,10 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://10.20.2.60:5173",
+        "http://10.20.2.60:3000",
     ],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|10\.20\.2\.\d+)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,7 +33,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup() -> None:
-    """Initialize database tables at app startup."""
+    """Initialize database tables and seed default admin at app startup."""
 
     init_db()
 
@@ -41,5 +45,6 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+app.include_router(auth_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")

@@ -24,6 +24,11 @@ class Settings:
     retriever_k: int
     llm_model: str
     llm_temperature: float
+    # Auth
+    secret_key: str
+    access_token_expire_minutes: int
+    admin_default_username: str
+    admin_default_password: str
 
 
 
@@ -73,6 +78,10 @@ def get_settings() -> Settings:
         retriever_k=_int_env("RETRIEVER_K", 4),
         llm_model=os.getenv("LLM_MODEL", "llama3.1:8b"),
         llm_temperature=_float_env("LLM_TEMPERATURE", 0.0),
+        secret_key=os.getenv("SECRET_KEY", "change-this-secret-key-in-production"),
+        access_token_expire_minutes=_int_env("ACCESS_TOKEN_EXPIRE_MINUTES", 1440),
+        admin_default_username=os.getenv("ADMIN_DEFAULT_USERNAME", "admin"),
+        admin_default_password=os.getenv("ADMIN_DEFAULT_PASSWORD", "Admin@123"),
     )
 
 

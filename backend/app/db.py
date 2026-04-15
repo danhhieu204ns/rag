@@ -35,8 +35,36 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    """Create all configured database tables."""
+    """Create all configured database tables and seed default admin if needed."""
 
     from . import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _seed_admin()
+
+
+def _seed_admin() -> None:
+    """Create default admin account on first run if none exists."""
+
+    from .models import AdminUser
+    from .core.security import hash_password
+
+    db = SessionLocal()
+    try:
+        exists = db.query(AdminUser).first()
+        if exists:
+            return
+
+        admin = AdminUser(
+            username=settings.admin_default_username,
+            hashed_password=hash_password(settings.admin_default_password),
+            is_active=True,
+        )
+        db.add(admin)
+        db.commit()
+        print(
+            f"[init_db] Default admin created — "
+            f"username: {settings.admin_default_username}"
+        )
+    finally:
+        db.close()

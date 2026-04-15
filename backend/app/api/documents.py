@@ -10,10 +10,11 @@ from sqlalchemy.orm import Session
 
 from ..core.settings import settings
 from ..db import get_db
-from ..models import Document, DocumentChunk
+from ..models import AdminUser, Document, DocumentChunk
 from ..schemas import DocumentRead, DocumentUpdate, EmbedDocumentResponse
 from ..services.document_processing import load_source_documents, split_source_documents
 from ..services.rag_runtime import rebuild_index_from_chunks
+from .auth import require_admin
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -33,7 +34,10 @@ def _to_document_read(document: Document, chunk_count: int) -> DocumentRead:
 
 
 @router.get("", response_model=list[DocumentRead])
-def list_documents(db: Session = Depends(get_db)) -> list[DocumentRead]:
+def list_documents(
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
+) -> list[DocumentRead]:
     """Return all uploaded documents with chunk counters."""
 
     rows = (
@@ -51,6 +55,7 @@ async def upload_document(
     file: UploadFile = File(...),
     title: str | None = Form(default=None),
     db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
 ) -> DocumentRead:
     """Upload one document into storage and persist metadata in database."""
 
@@ -79,7 +84,11 @@ async def upload_document(
 
 
 @router.get("/{document_id}", response_model=DocumentRead)
-def get_document(document_id: int, db: Session = Depends(get_db)) -> DocumentRead:
+def get_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
+) -> DocumentRead:
     """Return one document metadata by id."""
 
     row = (
@@ -102,6 +111,7 @@ def update_document(
     document_id: int,
     payload: DocumentUpdate,
     db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
 ) -> DocumentRead:
     """Update document title."""
 
@@ -119,7 +129,11 @@ def update_document(
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_document(document_id: int, db: Session = Depends(get_db)) -> None:
+def delete_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
+) -> None:
     """Delete document metadata, source file, and rebuild global vector index."""
 
     document = db.get(Document, document_id)
@@ -138,7 +152,11 @@ def delete_document(document_id: int, db: Session = Depends(get_db)) -> None:
 
 
 @router.post("/{document_id}/embed", response_model=EmbedDocumentResponse)
-def embed_document(document_id: int, db: Session = Depends(get_db)) -> EmbedDocumentResponse:
+def embed_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
+) -> EmbedDocumentResponse:
     """Create chunks for one document and rebuild global FAISS index."""
 
     document = db.get(Document, document_id)
@@ -204,7 +222,10 @@ def embed_document(document_id: int, db: Session = Depends(get_db)) -> EmbedDocu
 
 
 @router.post("/reindex", response_model=EmbedDocumentResponse)
-def rebuild_global_index(db: Session = Depends(get_db)) -> EmbedDocumentResponse:
+def rebuild_global_index(
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
+) -> EmbedDocumentResponse:
     """Rebuild global vector index from all saved chunks."""
 
     all_chunks = db.query(DocumentChunk).order_by(DocumentChunk.id.asc()).all()
