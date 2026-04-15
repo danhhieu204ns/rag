@@ -20,7 +20,6 @@ class Settings:
     embedding_model_name: str
     chunk_size: int
     chunk_overlap: int
-    chunking_method: str
     retriever_k: int
     llm_model: str
     llm_temperature: float
@@ -66,10 +65,9 @@ def get_settings() -> Settings:
         index_dir=index_dir,
         database_path=storage_dir / "app.db",
         ollama_base_url=ollama_base_url,
-        embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", "nomic-embed-text"),
+        embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", "bge-m3"),
         chunk_size=_int_env("CHUNK_SIZE", 500),
         chunk_overlap=_int_env("CHUNK_OVERLAP", 50),
-        chunking_method=os.getenv("CHUNKING_METHOD", "recursive").lower(),
         retriever_k=_int_env("RETRIEVER_K", 4),
         llm_model=os.getenv("LLM_MODEL", "llama3.1:8b"),
         llm_temperature=_float_env("LLM_TEMPERATURE", 0.0),

@@ -28,10 +28,9 @@ uvicorn app.main:app --reload
 Optional tuning:
 
 - `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
-- `EMBEDDING_MODEL_NAME` (default: `nomic-embed-text`)
+- `EMBEDDING_MODEL_NAME` (default: `bge-m3`)
 - `CHUNK_SIZE`
 - `CHUNK_OVERLAP`
-- `CHUNKING_METHOD` (`recursive`, `character`, `markdown`, `python`)
 - `RETRIEVER_K`
 - `LLM_MODEL` (default: `llama3.1:8b`)
 - `LLM_TEMPERATURE`
@@ -39,6 +38,6 @@ Optional tuning:
 Before running queries, ensure Ollama is available and models are pulled:
 
 ```bash
-ollama pull nomic-embed-text
+ollama pull bge-m3
 ollama pull llama3.1:8b
 ```

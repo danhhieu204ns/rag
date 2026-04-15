@@ -72,7 +72,7 @@ Nếu service hoạt động, lệnh sẽ trả về danh sách models (JSON).
 ### Pull models cần cho dự án
 
 ```bash
-ollama pull nomic-embed-text
+ollama pull bge-m3
 ollama pull llama3.1:8b
 ```
 
@@ -92,7 +92,7 @@ Mở `.env` và thêm tối thiểu:
 
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
-EMBEDDING_MODEL_NAME=nomic-embed-text
+EMBEDDING_MODEL_NAME=bge-m3
 LLM_MODEL=llama3.1:8b
 ```
 
@@ -185,10 +185,9 @@ VITE_API_BASE_URL=http://localhost:8000/api
 - `APP_NAME` (default: `RAG App Backend`)
 - `APP_ENV` (default: `development`)
 - `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
-- `EMBEDDING_MODEL_NAME` (default: `nomic-embed-text`)
+- `EMBEDDING_MODEL_NAME` (default: `bge-m3`)
 - `CHUNK_SIZE` (default: `500`)
 - `CHUNK_OVERLAP` (default: `50`)
-- `CHUNKING_METHOD` (`recursive` | `character` | `markdown` | `python`, default: `recursive`)
 - `RETRIEVER_K` (default: `4`)
 - `LLM_MODEL` (default: `llama3.1:8b`)
 - `LLM_TEMPERATURE` (default: `0.0`)

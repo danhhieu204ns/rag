@@ -155,7 +155,6 @@ def embed_document(document_id: int, db: Session = Depends(get_db)) -> EmbedDocu
             loaded_documents,
             chunk_size=settings.chunk_size,
             chunk_overlap=settings.chunk_overlap,
-            chunking_method=settings.chunking_method,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
