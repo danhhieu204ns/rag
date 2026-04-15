@@ -66,7 +66,7 @@ def get_settings() -> Settings:
         index_dir=index_dir,
         database_path=storage_dir / "app.db",
         ollama_base_url=ollama_base_url,
-        embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", "bge-m3"),
+        embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3").strip(),
         embedding_device=os.getenv("EMBEDDING_DEVICE", "cpu").strip().lower(),
         chunk_size=_int_env("CHUNK_SIZE", 500),
         chunk_overlap=_int_env("CHUNK_OVERLAP", 50),
