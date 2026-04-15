@@ -30,7 +30,8 @@ rag/
 ## 2) Công nghệ sử dụng
 
 - Backend: FastAPI, SQLAlchemy, LangChain, FAISS
-- Embedding + Chat model: Ollama (`langchain-ollama`)
+- Embedding model: `bge-m3` chạy trực tiếp bằng Python (`sentence-transformers`)
+- Chat model: Ollama (`langchain-ollama`)
 - Database: SQLite (`backend/storage/app.db` được tạo tự động)
 - Frontend: React, Vite, Axios, React Router
 
@@ -69,14 +70,13 @@ curl http://localhost:11434/api/tags
 
 Nếu service hoạt động, lệnh sẽ trả về danh sách models (JSON).
 
-### Pull models cần cho dự án
+### Pull model chat cần cho dự án
 
 ```bash
-ollama pull bge-m3
 ollama pull llama3.1:8b
 ```
 
-Bạn có thể thay model bằng model khác và cập nhật lại biến môi trường tương ứng.
+Embedding `bge-m3` được tải trực tiếp trong Python ở lần chạy đầu tiên.
 
 ## 5) Cài đặt và chạy
 
@@ -92,7 +92,8 @@ Mở `.env` và thêm tối thiểu:
 
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
-EMBEDDING_MODEL_NAME=bge-m3
+EMBEDDING_MODEL_NAME=BAAI/bge-m3
+EMBEDDING_DEVICE=cpu
 LLM_MODEL=llama3.1:8b
 ```
 
@@ -185,7 +186,8 @@ VITE_API_BASE_URL=http://localhost:8000/api
 - `APP_NAME` (default: `RAG App Backend`)
 - `APP_ENV` (default: `development`)
 - `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
-- `EMBEDDING_MODEL_NAME` (default: `bge-m3`)
+- `EMBEDDING_MODEL_NAME` (default: `BAAI/bge-m3`)
+- `EMBEDDING_DEVICE` (default: `cpu`, có thể đặt `cuda` nếu có GPU)
 - `CHUNK_SIZE` (default: `500`)
 - `CHUNK_OVERLAP` (default: `50`)
 - `RETRIEVER_K` (default: `4`)
@@ -207,7 +209,8 @@ Các file/thư mục này đã được ignore trong git.
 - Nếu chưa embed tài liệu hoặc index rỗng, chat vẫn chạy nhưng sẽ không có ngữ cảnh truy xuất.
 - Sau khi xóa tài liệu, hệ thống tự rebuild index từ các chunks còn lại.
 - CORS đã mở cho frontend local (`5173`, `3000`) trong backend.
-- Cần đảm bảo Ollama đang chạy và đã pull đủ embedding/chat models.
+- Cần đảm bảo Ollama đang chạy cho chat model.
+- Lần chạy đầu cho embedding cần internet để tải weights `bge-m3` từ Hugging Face.
 
 ## 12) Lệnh nhanh (Windows PowerShell)
 

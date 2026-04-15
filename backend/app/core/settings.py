@@ -18,6 +18,7 @@ class Settings:
     database_path: Path
     ollama_base_url: str
     embedding_model_name: str
+    embedding_device: str
     chunk_size: int
     chunk_overlap: int
     retriever_k: int
@@ -66,6 +67,7 @@ def get_settings() -> Settings:
         database_path=storage_dir / "app.db",
         ollama_base_url=ollama_base_url,
         embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", "bge-m3"),
+        embedding_device=os.getenv("EMBEDDING_DEVICE", "cpu").strip().lower(),
         chunk_size=_int_env("CHUNK_SIZE", 500),
         chunk_overlap=_int_env("CHUNK_OVERLAP", 50),
         retriever_k=_int_env("RETRIEVER_K", 4),
