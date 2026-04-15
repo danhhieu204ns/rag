@@ -23,6 +23,7 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://10.20.2.60:5173",
         "http://10.20.2.60:3000",
+        "*"
     ],
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|10\.20\.2\.\d+)(:\d+)?$",
     allow_credentials=True,

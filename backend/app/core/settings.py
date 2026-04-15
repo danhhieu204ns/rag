@@ -18,7 +18,7 @@ class Settings:
     database_path: Path
     ollama_base_url: str
     embedding_model_name: str
-    embedding_device: str
+    chunking_method: str
     chunk_size: int
     chunk_overlap: int
     retriever_k: int
@@ -47,6 +47,14 @@ def _float_env(name: str, default: float) -> float:
     return float(raw_value)
 
 
+def _chunking_method_env(default: str = "recursive") -> str:
+    raw_value = os.getenv("CHUNKING_METHOD", default).strip().lower()
+    allowed = {"recursive", "semantic"}
+    if raw_value not in allowed:
+        return default
+    return raw_value
+
+
 
 def get_settings() -> Settings:
     """Create immutable settings object from environment values."""
@@ -71,8 +79,8 @@ def get_settings() -> Settings:
         index_dir=index_dir,
         database_path=storage_dir / "app.db",
         ollama_base_url=ollama_base_url,
-        embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", "bge-m3"),
-        embedding_device=os.getenv("EMBEDDING_DEVICE", "cpu").strip().lower(),
+        embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", "bge-m3").strip(),
+        chunking_method=_chunking_method_env(),
         chunk_size=_int_env("CHUNK_SIZE", 500),
         chunk_overlap=_int_env("CHUNK_OVERLAP", 50),
         retriever_k=_int_env("RETRIEVER_K", 4),
