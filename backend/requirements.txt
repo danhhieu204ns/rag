@@ -11,4 +11,6 @@ langchain-text-splitters
 langchain-ollama
 faiss-cpu
 pypdf
+python-jose[cryptography]
+bcrypt
 ollama

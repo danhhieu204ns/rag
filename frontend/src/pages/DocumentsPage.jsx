@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import api from "../api";
 
-function DocumentsPage() {
+function DocumentsPage({ onAdminLogout }) {
   const [documents, setDocuments] = useState([]);
   const [titleDrafts, setTitleDrafts] = useState({});
   const [selectedFile, setSelectedFile] = useState(null);
@@ -115,80 +116,97 @@ function DocumentsPage() {
   }, []);
 
   return (
-    <div className="panel panel-main">
-      <div className="panel-head">
-        <h2>Quản lý tài liệu</h2>
-        <div className="panel-actions">
-          <span className="muted">Tài liệu: {documents.length}</span>
-          <span className="muted">Tổng chunks: {totalChunks}</span>
-          <button onClick={rebuildIndex} disabled={isBusy}>
-            Rebuild index
+    <div className="admin-docs-shell">
+      <header className="admin-docs-head">
+        <div>
+          <h1>Admin - Quan ly tai lieu</h1>
+          <p>Upload, embedding va cap nhat kho tri thuc cho chatbot user.</p>
+        </div>
+        <div className="admin-docs-top-actions">
+          <Link to="/chat" className="ghost-link">
+            Mo user chat
+          </Link>
+          <button className="danger" onClick={onAdminLogout}>
+            Dang xuat
           </button>
         </div>
-      </div>
+      </header>
 
-      <form className="upload-form" onSubmit={uploadDocument}>
-        <input
-          type="file"
-          onChange={(event) => setSelectedFile(event.target.files?.[0] || null)}
-          accept=".pdf,.txt,.md"
-        />
-        <input
-          type="text"
-          placeholder="Title (optional)"
-          value={uploadTitle}
-          onChange={(event) => setUploadTitle(event.target.value)}
-        />
-        <button type="submit" disabled={isBusy || !selectedFile}>
-          {isBusy ? "Đang xử lý..." : "Upload"}
-        </button>
-      </form>
+      <div className="panel panel-main admin-docs-panel">
+        <div className="panel-head">
+          <h2>Danh sach tai lieu</h2>
+          <div className="panel-actions">
+            <span className="muted">Tai lieu: {documents.length}</span>
+            <span className="muted">Tong chunks: {totalChunks}</span>
+            <button onClick={rebuildIndex} disabled={isBusy}>
+            Rebuild index
+            </button>
+          </div>
+        </div>
 
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>Tiêu đề</th>
-              <th>File gốc</th>
-              <th>Status</th>
-              <th>Chunks</th>
-              <th>Hành động</th>
-            </tr>
-          </thead>
-          <tbody>
-            {documents.map((doc) => (
-              <tr key={doc.id}>
-                <td>{doc.id}</td>
-                <td>
-                  <input
-                    value={titleDrafts[doc.id] || ""}
-                    onChange={(event) =>
-                      setTitleDrafts((prev) => ({ ...prev, [doc.id]: event.target.value }))
-                    }
-                  />
-                </td>
-                <td>{doc.original_filename}</td>
-                <td>{doc.status}</td>
-                <td>{doc.chunk_count}</td>
-                <td className="row-actions">
-                  <button onClick={() => saveTitle(doc.id)} disabled={isBusy}>
-                    Save
-                  </button>
-                  <button onClick={() => embedDocument(doc.id)} disabled={isBusy}>
-                    Embed
-                  </button>
-                  <button className="danger" onClick={() => deleteDocument(doc.id)} disabled={isBusy}>
-                    Delete
-                  </button>
-                </td>
+        <form className="upload-form" onSubmit={uploadDocument}>
+          <input
+            type="file"
+            onChange={(event) => setSelectedFile(event.target.files?.[0] || null)}
+            accept=".pdf,.txt,.md"
+          />
+          <input
+            type="text"
+            placeholder="Title (optional)"
+            value={uploadTitle}
+            onChange={(event) => setUploadTitle(event.target.value)}
+          />
+          <button type="submit" disabled={isBusy || !selectedFile}>
+            {isBusy ? "Dang xu ly..." : "Upload"}
+          </button>
+        </form>
+
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Tieu de</th>
+                <th>File goc</th>
+                <th>Status</th>
+                <th>Chunks</th>
+                <th>Hanh dong</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody>
+              {documents.map((doc) => (
+                <tr key={doc.id}>
+                  <td>{doc.id}</td>
+                  <td>
+                    <input
+                      value={titleDrafts[doc.id] || ""}
+                      onChange={(event) =>
+                        setTitleDrafts((prev) => ({ ...prev, [doc.id]: event.target.value }))
+                      }
+                    />
+                  </td>
+                  <td>{doc.original_filename}</td>
+                  <td>{doc.status}</td>
+                  <td>{doc.chunk_count}</td>
+                  <td className="row-actions">
+                    <button onClick={() => saveTitle(doc.id)} disabled={isBusy}>
+                      Save
+                    </button>
+                    <button onClick={() => embedDocument(doc.id)} disabled={isBusy}>
+                      Embed
+                    </button>
+                    <button className="danger" onClick={() => deleteDocument(doc.id)} disabled={isBusy}>
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
 
-      {error ? <p className="error-text">{error}</p> : null}
+        {error ? <p className="error-text">{error}</p> : null}
+      </div>
     </div>
   );
 }
