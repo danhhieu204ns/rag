@@ -4,11 +4,10 @@ import json
 import shutil
 from pathlib import Path
 
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_ollama import ChatOllama
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 
 from ..core.settings import settings
 from ..models import ChatMessage, DocumentChunk
@@ -24,15 +23,14 @@ def _index_files_exist(index_dir: Path) -> bool:
 
 
 def get_embeddings() -> Embeddings:
-    """Create or return cached local HuggingFace embedding model instance."""
+    """Create or return cached Ollama embedding model instance."""
 
     global _embeddings
 
     if _embeddings is None:
-        _embeddings = HuggingFaceEmbeddings(
-            model_name=settings.embedding_model_name,
-            model_kwargs={"device": settings.embedding_device},
-            encode_kwargs={"normalize_embeddings": True},
+        _embeddings = OllamaEmbeddings(
+            model=settings.embedding_model_name,
+            base_url=settings.ollama_base_url,
         )
 
     return _embeddings
