@@ -93,7 +93,6 @@ Mở `.env` và thêm tối thiểu:
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
 EMBEDDING_MODEL_NAME=BAAI/bge-m3
-EMBEDDING_DEVICE=cpu
 LLM_MODEL=llama3.1:8b
 ```
 
@@ -187,7 +186,6 @@ VITE_API_BASE_URL=http://localhost:8000/api
 - `APP_ENV` (default: `development`)
 - `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
 - `EMBEDDING_MODEL_NAME` (default: `BAAI/bge-m3`)
-- `EMBEDDING_DEVICE` (default: `cpu`, có thể đặt `cuda` nếu có GPU)
 - `CHUNK_SIZE` (default: `500`)
 - `CHUNK_OVERLAP` (default: `50`)
 - `RETRIEVER_K` (default: `4`)

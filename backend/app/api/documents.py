@@ -13,7 +13,7 @@ from ..db import get_db
 from ..models import Document, DocumentChunk
 from ..schemas import DocumentRead, DocumentUpdate, EmbedDocumentResponse
 from ..services.document_processing import load_source_documents, split_source_documents
-from ..services.rag_runtime import rebuild_index_from_chunks
+from ..services.rag_runtime import get_embeddings, rebuild_index_from_chunks
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -151,10 +151,13 @@ def embed_document(document_id: int, db: Session = Depends(get_db)) -> EmbedDocu
 
     try:
         loaded_documents = load_source_documents(file_path)
+        embeddings = get_embeddings() if settings.chunking_method == "semantic" else None
         split_documents = split_source_documents(
             loaded_documents,
             chunk_size=settings.chunk_size,
             chunk_overlap=settings.chunk_overlap,
+            chunking_method=settings.chunking_method,
+            embeddings=embeddings,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

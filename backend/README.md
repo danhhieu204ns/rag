@@ -29,7 +29,6 @@ Optional tuning:
 
 - `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
 - `EMBEDDING_MODEL_NAME` (default: `BAAI/bge-m3`)
-- `EMBEDDING_DEVICE` (reserved, currently unused with Ollama embeddings)
 - `CHUNK_SIZE`
 - `CHUNK_OVERLAP`
 - `RETRIEVER_K`
