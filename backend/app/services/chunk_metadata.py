@@ -6,6 +6,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel, Field
 from langchain_ollama import ChatOllama
 
 from ..core.settings import settings
@@ -382,6 +383,10 @@ def _fallback_search_optimization(chunk_text: str) -> dict[str, list[str]]:
     }
 
 
+class HyQResultModel(BaseModel):
+    summary: str = Field(description="Tóm tắt nội dung chính ngắn gọn")
+    questions: list[str] = Field(description="Danh sách câu hỏi tiếng Việt có dấu")
+
 class MetadataBundleGenerator:
     def __init__(self) -> None:
         self.summary_words = max(20, settings.hyq_summary_words)
@@ -390,7 +395,7 @@ class MetadataBundleGenerator:
         self.model_name = settings.metadata_model or settings.hyq_model or settings.llm_model
         self.base_url = settings.ollama_base_url
         self.num_thread = max(1, settings.metadata_ollama_num_thread)
-        self.num_predict = max(64, settings.metadata_ollama_num_predict)
+        self.num_predict = max(128, settings.metadata_ollama_num_predict)
         self._thread_local = threading.local()
         self._llm_disabled = not self.use_llm
 
@@ -404,53 +409,18 @@ class MetadataBundleGenerator:
                 self._llm_disabled = True
                 return None
 
-            llm = ChatOllama(
+            base_llm = ChatOllama(
                 model=self.model_name,
                 base_url=self.base_url,
                 temperature=0.0,
                 num_thread=self.num_thread,
                 num_predict=self.num_predict,
+                format="json",
             )
+            llm = base_llm.with_structured_output(HyQResultModel)
             self._thread_local.llm = llm
 
         return llm
-
-    def _parse_llm_json(self, raw_output: str) -> tuple[dict[str, list[str]] | None, HyQResult | None]:
-        payload = _extract_json_payload(raw_output)
-        if payload is None:
-            return None, None
-
-        search_payload: dict[str, Any] | None = None
-        hyq_payload: dict[str, Any] | None = None
-
-        nested_search = payload.get("search_optimization")
-        if isinstance(nested_search, dict):
-            search_payload = nested_search
-        elif any(key in payload for key in ("keywords", "entities", "organizations", "dates", "document_codes")):
-            search_payload = payload
-
-        nested_hyq = payload.get("hyq")
-        if isinstance(nested_hyq, dict):
-            hyq_payload = nested_hyq
-        elif any(key in payload for key in ("summary", "questions")):
-            hyq_payload = payload
-
-        parsed_search = (
-            _parse_search_optimization_payload(search_payload)
-            if isinstance(search_payload, dict)
-            else None
-        )
-        parsed_hyq = (
-            _parse_hyq_payload(
-                hyq_payload,
-                summary_words=self.summary_words,
-                question_count=self.question_count,
-            )
-            if isinstance(hyq_payload, dict)
-            else None
-        )
-
-        return parsed_search, parsed_hyq
 
     def _generate_with_llm(
         self,
@@ -465,29 +435,21 @@ class MetadataBundleGenerator:
 
         try:
             prompt = (
-                "Bạn đang chuẩn bị metadata cho hybrid RAG. "
-                "Chỉ trả về DUY NHẤT một đối tượng JSON có 2 trường: "
-                "search_optimization (object) và hyq (object). "
-                "search_optimization phải gồm: keywords, entities, organizations, dates, document_codes (đều là array string). "
-                f"hyq.summary phải <= {self.summary_words} từ. "
-                f"hyq.questions phải chứa chính xác {self.question_count} câu hỏi tiếng Việt có dấu. "
-                "Không dùng markdown fences.\n\n"
-                f"h2: {context.get('h2') or ''}\n"
-                f"h3: {context.get('h3') or ''}\n"
-                f"seed_keywords: {', '.join(fallback_search.get('keywords') or [])}\n"
-                f"seed_document_codes: {', '.join(fallback_search.get('document_codes') or [])}\n"
-                f"seed_organizations: {', '.join(fallback_search.get('organizations') or [])}\n"
-                f"seed_entities: {', '.join(fallback_search.get('entities') or [])}\n"
-                f"seed_dates: {', '.join(fallback_search.get('dates') or [])}\n\n"
-                f"chunk_text:\n{chunk_text}"
+                f"Hãy tóm tắt ngắn gọn (dưới {self.summary_words} từ) và sinh ra chính xác {self.question_count} "
+                "câu hỏi tiếng Việt từ đoạn văn bản sau.\n"
+                f"Ngữ cảnh H2: {context.get('h2') or ''}\n"
+                f"Ngữ cảnh H3: {context.get('h3') or ''}\n\n"
+                f"Nội dung văn bản:\n{chunk_text}"
             )
-            response = llm.invoke(prompt)
-        except Exception:
-            self._llm_disabled = True
+            response: HyQResultModel = llm.invoke(prompt)
+            
+            # Using structured output guarantees adherence to the Pydantic schema
+            hyq = HyQResult(summary=response.summary, questions=response.questions)
+            return fallback_search, hyq
+            
+        except Exception as e:
+            # Fallback gracefully
             return None, None
-
-        raw_output = str(getattr(response, "content", response) or "")
-        return self._parse_llm_json(raw_output)
 
     def generate(
         self,
@@ -505,11 +467,7 @@ class MetadataBundleGenerator:
             fallback_search=fallback_search,
         )
 
-        if llm_search is None:
-            return fallback_search, llm_hyq
-
-        merged_search = _merge_search_optimization(llm_search, fallback_search)
-        return merged_search, llm_hyq
+        return fallback_search, llm_hyq
 
 
 _metadata_bundle_generator: MetadataBundleGenerator | None = None
