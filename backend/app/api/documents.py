@@ -300,7 +300,7 @@ def embed_document(
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
 ) -> EmbedDocumentResponse:
-    """Create chunks for one document and rebuild global FAISS index."""
+    """Create chunks for one document and rebuild global Qdrant index."""
 
     document = db.get(Document, document_id)
     if document is None:
@@ -426,7 +426,7 @@ def embed_document(
 
     all_chunks = db.query(DocumentChunk).order_by(DocumentChunk.id.asc()).all()
     _emit_progress(
-        "[embed_document] Rebuilding FAISS from %d parent chunks after embedding document_id=%s",
+        "[embed_document] Rebuilding Qdrant from %d parent chunks after embedding document_id=%s",
         len(all_chunks),
         document_id,
     )
@@ -440,7 +440,7 @@ def embed_document(
         raise HTTPException(
             status_code=502,
             detail=(
-                "Failed to rebuild embedding index using Ollama. "
+                "Failed to rebuild Qdrant collection using Ollama embeddings. "
                 f"base_url={settings.ollama_base_url}, embedding_model={settings.embedding_model_name}. "
                 f"Root cause: {exc}"
             ),
@@ -484,7 +484,7 @@ def rebuild_global_index(
         raise HTTPException(
             status_code=502,
             detail=(
-                "Failed to rebuild embedding index using Ollama. "
+                "Failed to rebuild Qdrant collection using Ollama embeddings. "
                 f"base_url={settings.ollama_base_url}, embedding_model={settings.embedding_model_name}. "
                 f"Root cause: {exc}"
             ),

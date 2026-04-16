@@ -3,17 +3,16 @@ from __future__ import annotations
 import json
 import logging
 import re
-import shutil
 import time
 import unicodedata
 from collections import defaultdict
-from pathlib import Path
 from typing import Any
 
-from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, PointStruct, VectorParams
 from sqlalchemy.orm import Session
 
 from ..core.settings import settings
@@ -24,7 +23,7 @@ logger = logging.getLogger(__name__)
 _EMBED_BATCH_SIZE = 16
 
 _embeddings: Embeddings | None = None
-_vectorstore: FAISS | None = None
+_qdrant_client: QdrantClient | None = None
 _llm: ChatOllama | None = None
 
 
@@ -93,17 +92,77 @@ def _compact_source_metadata(raw_json: str | None) -> dict[str, object]:
     return raw_metadata
 
 
-def _index_files_exist(index_dir: Path) -> bool:
-    return (index_dir / "index.faiss").exists() and (index_dir / "index.pkl").exists()
-
-
 def _emit_reindex_progress(message: str, *args: object) -> None:
     text = message % args if args else message
     logger.info(text)
     print(text, flush=True)
 
 
-def _build_faiss_with_batch_embeddings(documents: list[Document]) -> FAISS:
+def _get_qdrant_client() -> QdrantClient:
+    global _qdrant_client
+
+    if _qdrant_client is not None:
+        return _qdrant_client
+
+    if settings.qdrant_url:
+        kwargs: dict[str, str] = {"url": settings.qdrant_url}
+        if settings.qdrant_api_key:
+            kwargs["api_key"] = settings.qdrant_api_key
+        _qdrant_client = QdrantClient(**kwargs)
+    else:
+        settings.qdrant_path.mkdir(parents=True, exist_ok=True)
+        _qdrant_client = QdrantClient(path=str(settings.qdrant_path))
+
+    return _qdrant_client
+
+
+def _qdrant_collection_exists(client: QdrantClient) -> bool:
+    collections = client.get_collections().collections
+    return any(item.name == settings.qdrant_collection_name for item in collections)
+
+
+def _clear_qdrant_collection(client: QdrantClient) -> None:
+    if _qdrant_collection_exists(client):
+        client.delete_collection(collection_name=settings.qdrant_collection_name)
+
+
+def _serialize_qdrant_payload(metadata: dict[str, object], child_text: str) -> dict[str, object]:
+    payload = dict(metadata)
+    payload["child_text"] = child_text
+    return json.loads(json.dumps(payload, ensure_ascii=False))
+
+
+def _search_qdrant_children(query: str, limit: int) -> list[Document]:
+    if limit <= 0:
+        return []
+
+    client = _get_qdrant_client()
+    if not _qdrant_collection_exists(client):
+        return []
+
+    query_vector = get_embeddings().embed_query(query)
+    points = client.search(
+        collection_name=settings.qdrant_collection_name,
+        query_vector=query_vector,
+        limit=limit,
+        with_payload=True,
+    )
+
+    documents: list[Document] = []
+    for point in points:
+        payload = point.payload if isinstance(point.payload, dict) else {}
+        child_text = str(payload.get("child_text") or "")
+        metadata = {
+            key: value
+            for key, value in payload.items()
+            if key != "child_text"
+        }
+        documents.append(Document(page_content=child_text, metadata=metadata))
+
+    return documents
+
+
+def _rebuild_qdrant_collection_with_batch_embeddings(documents: list[Document]) -> int:
     texts = [item.page_content for item in documents]
     metadatas = [dict(item.metadata or {}) for item in documents]
     embeddings_client = get_embeddings()
@@ -129,12 +188,47 @@ def _build_faiss_with_batch_embeddings(documents: list[Document]) -> FAISS:
             elapsed,
         )
 
-    text_embeddings = list(zip(texts, all_vectors))
-    return FAISS.from_embeddings(
-        text_embeddings,
-        embeddings_client,
-        metadatas=metadatas,
+    if not all_vectors:
+        return 0
+
+    client = _get_qdrant_client()
+    _clear_qdrant_collection(client)
+
+    vector_size = len(all_vectors[0])
+    client.create_collection(
+        collection_name=settings.qdrant_collection_name,
+        vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
     )
+
+    upsert_batch_size = max(1, _EMBED_BATCH_SIZE)
+    upsert_batch_count = (total + upsert_batch_size - 1) // upsert_batch_size
+    for batch_index, start in enumerate(range(0, total, upsert_batch_size), start=1):
+        end = min(start + upsert_batch_size, total)
+        points: list[PointStruct] = []
+
+        for idx in range(start, end):
+            points.append(
+                PointStruct(
+                    id=idx + 1,
+                    vector=all_vectors[idx],
+                    payload=_serialize_qdrant_payload(metadatas[idx], texts[idx]),
+                )
+            )
+
+        client.upsert(
+            collection_name=settings.qdrant_collection_name,
+            points=points,
+            wait=True,
+        )
+        _emit_reindex_progress(
+            "[reindex] Upserted child docs %d/%d (batch %d/%d)",
+            end,
+            total,
+            batch_index,
+            upsert_batch_count,
+        )
+
+    return total
 
 
 def _load_chunks_by_ids(db: Session, chunk_ids: list[int]) -> list[DocumentChunk]:
@@ -180,13 +274,12 @@ def _vector_parent_candidates(
     top_k: int,
     document_ids: list[int] | None,
 ) -> tuple[list[int], dict[int, str]]:
-    vectorstore = load_index_if_available()
-    if vectorstore is None:
+    if not load_index_if_available():
         return [], {}
 
     probe_multiplier = max(1, settings.hybrid_probe_multiplier)
     probe_k = max(top_k * probe_multiplier, top_k)
-    children = vectorstore.similarity_search(query, k=probe_k)
+    children = _search_qdrant_children(query, limit=probe_k)
 
     wanted_docs = {int(doc_id) for doc_id in document_ids} if document_ids else None
     parent_ids: list[int] = []
@@ -353,40 +446,26 @@ def get_llm() -> ChatOllama:
 
 
 
-def load_index_if_available() -> FAISS | None:
-    """Load FAISS index from disk once and cache it in memory."""
+def load_index_if_available() -> bool:
+    """Check whether Qdrant child collection exists."""
 
-    global _vectorstore
-
-    if _vectorstore is not None:
-        return _vectorstore
-
-    if _index_files_exist(settings.index_dir):
-        _vectorstore = FAISS.load_local(
-            str(settings.index_dir),
-            get_embeddings(),
-            allow_dangerous_deserialization=True,
-        )
-
-    return _vectorstore
+    client = _get_qdrant_client()
+    return _qdrant_collection_exists(client)
 
 
 
 def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
-    """Rebuild global FAISS index from all chunks available in database."""
+    """Rebuild global Qdrant collection from all chunks available in database."""
 
-    global _vectorstore
     started_at = time.perf_counter()
+    client = _get_qdrant_client()
 
     if not chunks:
-        _emit_reindex_progress("[reindex] No chunks found. Clearing FAISS index directory.")
-        if settings.index_dir.exists():
-            shutil.rmtree(settings.index_dir)
-        settings.index_dir.mkdir(parents=True, exist_ok=True)
-        _vectorstore = None
+        _emit_reindex_progress("[reindex] No chunks found. Clearing Qdrant collection.")
+        _clear_qdrant_collection(client)
         return 0
 
-    _emit_reindex_progress("[reindex] Start rebuilding FAISS from %d parent chunks.", len(chunks))
+    _emit_reindex_progress("[reindex] Start rebuilding Qdrant from %d parent chunks.", len(chunks))
 
     documents: list[Document] = []
     for chunk in chunks:
@@ -417,11 +496,8 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
             )
 
     if not documents:
-        _emit_reindex_progress("[reindex] No child documents generated. Clearing FAISS index directory.")
-        if settings.index_dir.exists():
-            shutil.rmtree(settings.index_dir)
-        settings.index_dir.mkdir(parents=True, exist_ok=True)
-        _vectorstore = None
+        _emit_reindex_progress("[reindex] No child documents generated. Clearing Qdrant collection.")
+        _clear_qdrant_collection(client)
         return 0
 
     _emit_reindex_progress(
@@ -430,19 +506,16 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
         settings.embedding_model_name,
     )
 
-    vectorstore = _build_faiss_with_batch_embeddings(documents)
-    settings.index_dir.mkdir(parents=True, exist_ok=True)
-    vectorstore.save_local(str(settings.index_dir))
-    _vectorstore = vectorstore
+    indexed_count = _rebuild_qdrant_collection_with_batch_embeddings(documents)
 
     elapsed = time.perf_counter() - started_at
     _emit_reindex_progress(
         "[reindex] Completed. Indexed %d child documents in %.2f seconds.",
-        len(documents),
+        indexed_count,
         elapsed,
     )
 
-    return len(documents)
+    return indexed_count
 
 
 
@@ -454,12 +527,11 @@ def similarity_search(
 ) -> list[Document]:
     """Search relevant parent chunks using hybrid (vector + keyword) retrieval."""
 
-    vectorstore = load_index_if_available()
-    if vectorstore is None:
+    if not load_index_if_available():
         return []
 
     if db is None:
-        return vectorstore.similarity_search(query, k=top_k)
+        return _search_qdrant_children(query, limit=top_k)
 
     vector_parent_ids, parent_child_type = _vector_parent_candidates(
         query,

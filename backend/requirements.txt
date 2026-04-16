@@ -8,7 +8,7 @@ langchain-core
 langchain-community
 langchain-text-splitters
 langchain-ollama
-faiss-cpu
+qdrant-client
 pypdf
 python-jose[cryptography]
 bcrypt

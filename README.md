@@ -3,7 +3,7 @@
 Ứng dụng RAG (Retrieval-Augmented Generation) cho phép:
 
 - Upload và quản lý tài liệu (`.pdf`, `.txt`, `.md`)
-- Chunk + embedding theo parent-child (HyQ) và lưu FAISS index
+- Chunk + embedding theo parent-child (HyQ) và lưu index trên Qdrant
 - Chat hỏi đáp dựa trên ngữ cảnh đã truy xuất
 - Truy vết nguồn theo document/chunk/trang + metadata schema từ kết quả retrieval
 - Lưu lịch sử phiên chat bằng SQLite
@@ -30,8 +30,8 @@ rag/
 
 ## 2) Công nghệ sử dụng
 
-- Backend: FastAPI, SQLAlchemy, LangChain, FAISS
-- Embedding model: `bge-m3` chạy trực tiếp bằng Python (`sentence-transformers`)
+- Backend: FastAPI, SQLAlchemy, LangChain, Qdrant
+- Embedding model: `bge-m3` phục vụ qua Ollama (`langchain-ollama`)
 - Chat model: Ollama (`langchain-ollama`)
 - Database: SQLite (`backend/storage/app.db` được tạo tự động)
 - Frontend: React, Vite, Axios, React Router
@@ -94,6 +94,7 @@ Mở `.env` và thêm tối thiểu:
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
 EMBEDDING_MODEL_NAME=BAAI/bge-m3
+QDRANT_COLLECTION_NAME=global_child_chunks
 PDF_PARSER_MODE=legacy
 LLM_MODEL=llama3.1:8b
 ```
@@ -207,6 +208,9 @@ VITE_API_BASE_URL=http://localhost:8000/api
 - `APP_ENV` (default: `development`)
 - `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
 - `EMBEDDING_MODEL_NAME` (default: `BAAI/bge-m3`)
+- `QDRANT_URL` (default: rỗng, dùng local embedded Qdrant)
+- `QDRANT_API_KEY` (default: rỗng)
+- `QDRANT_COLLECTION_NAME` (default: `global_child_chunks`)
 - `PDF_PARSER_MODE` (default: `legacy`, hỗ trợ `legacy` hoặc `marker`)
 - `CHUNK_SIZE` (default: `500`)
 - `CHUNK_OVERLAP` (default: `50`)
@@ -228,7 +232,7 @@ VITE_API_BASE_URL=http://localhost:8000/api
 Thư mục `backend/storage/` được tạo khi chạy backend, bao gồm:
 
 - `uploads/`: file đã upload
-- `indexes/global_faiss/`: FAISS index (`index.faiss`, `index.pkl`)
+- `indexes/global_qdrant/`: dữ liệu Qdrant local (khi không cấu hình `QDRANT_URL`)
 - `app.db`: SQLite database
 
 Các file/thư mục này đã được ignore trong git.

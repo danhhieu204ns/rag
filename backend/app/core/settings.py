@@ -14,7 +14,10 @@ class Settings:
     base_dir: Path
     storage_dir: Path
     uploads_dir: Path
-    index_dir: Path
+    qdrant_path: Path
+    qdrant_collection_name: str
+    qdrant_url: str
+    qdrant_api_key: str
     database_path: Path
     ollama_base_url: str
     embedding_model_name: str
@@ -92,11 +95,11 @@ def get_settings() -> Settings:
     base_dir = Path(__file__).resolve().parents[2]
     storage_dir = base_dir / "storage"
     uploads_dir = storage_dir / "uploads"
-    index_dir = storage_dir / "indexes" / "global_faiss"
+    qdrant_path = storage_dir / "indexes" / "global_qdrant"
 
     storage_dir.mkdir(parents=True, exist_ok=True)
     uploads_dir.mkdir(parents=True, exist_ok=True)
-    index_dir.parent.mkdir(parents=True, exist_ok=True)
+    qdrant_path.mkdir(parents=True, exist_ok=True)
 
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
 
@@ -106,7 +109,10 @@ def get_settings() -> Settings:
         base_dir=base_dir,
         storage_dir=storage_dir,
         uploads_dir=uploads_dir,
-        index_dir=index_dir,
+        qdrant_path=qdrant_path,
+        qdrant_collection_name=_string_env("QDRANT_COLLECTION_NAME", "global_child_chunks"),
+        qdrant_url=_string_env("QDRANT_URL", ""),
+        qdrant_api_key=_string_env("QDRANT_API_KEY", ""),
         database_path=storage_dir / "app.db",
         ollama_base_url=ollama_base_url,
         embedding_model_name=_string_env("EMBEDDING_MODEL_NAME", "bge-m3"),

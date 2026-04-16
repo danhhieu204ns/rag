@@ -13,6 +13,7 @@
 - HyQ enrichment at indexing time (`summary` + hypothetical `questions`)
 - Parent-child retrieval: child vectors are indexed, parent chunk text is returned to LLM
 - Hybrid retrieval (vector + keyword) with reciprocal-rank-fusion
+- Qdrant as vector store backend (local mode by default, remote mode optional)
 - Chat query endpoint with persistent chat memory
 
 ## Run
@@ -37,6 +38,9 @@ Optional tuning:
 
 - `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
 - `EMBEDDING_MODEL_NAME` (default: `BAAI/bge-m3`)
+- `QDRANT_URL` (default: empty -> local embedded Qdrant)
+- `QDRANT_API_KEY` (default: empty)
+- `QDRANT_COLLECTION_NAME` (default: `global_child_chunks`)
 - `PDF_PARSER_MODE` (default: `legacy`, supports: `legacy`, `marker`)
 - `CHUNK_SIZE`
 - `CHUNK_OVERLAP`
@@ -54,6 +58,10 @@ Optional tuning:
 - `HYBRID_PROBE_MULTIPLIER` (default: `4`)
 
 If `HYQ_USE_LLM=true`, ensure the selected HyQ model is available in Ollama.
+
+If `QDRANT_URL` is empty, backend uses local embedded Qdrant persisted at:
+
+- `backend/storage/indexes/global_qdrant/`
 
 If `PDF_PARSER_MODE=marker`, install Marker in backend venv:
 
