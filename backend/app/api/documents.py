@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from sqlalchemy.exc import OperationalError
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -14,11 +17,19 @@ from ..core.settings import settings
 from ..db import get_db
 from ..models import AdminUser, Document, DocumentChunk
 from ..schemas import DocumentChunkListResponse, DocumentChunkRead, DocumentRead, DocumentUpdate, EmbedDocumentResponse
+from ..services.chunk_metadata import build_structured_chunk_metadata
 from ..services.document_processing import load_source_documents, split_source_documents
 from .auth import require_admin
 from ..services.rag_runtime import rebuild_index_from_chunks
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+logger = logging.getLogger(__name__)
+
+
+def _emit_progress(message: str, *args: object) -> None:
+    text = message % args if args else message
+    logger.info(text)
+    print(text, flush=True)
 
 
 def _to_int(value: Any) -> int | None:
@@ -273,6 +284,13 @@ def delete_document(
     db.commit()
 
     remaining_chunks = db.query(DocumentChunk).order_by(DocumentChunk.id.asc()).all()
+    _emit_progress(
+        "[delete_document] Rebuilding global index after deleting document_id=%s (remaining_parent_chunks=%s).",
+        document_id,
+        len(remaining_chunks),
+    )
+    db.expunge_all()
+    db.rollback()
     rebuild_index_from_chunks(remaining_chunks)
 
 
@@ -288,48 +306,132 @@ def embed_document(
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found.")
 
-    file_path = settings.uploads_dir / document.stored_filename
+    original_filename = document.original_filename
+    stored_filename = document.stored_filename
+    started_at = time.perf_counter()
+    _emit_progress(
+        "[embed_document] Start embedding document_id=%s file='%s'",
+        document_id,
+        original_filename,
+    )
+    # Release transaction early before expensive OCR/chunking work.
+    db.rollback()
+
+    file_path = settings.uploads_dir / stored_filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Stored file does not exist.")
 
     try:
         loaded_documents = load_source_documents(file_path)
+        _emit_progress(
+            "[embed_document] Loaded %d source document blocks for document_id=%s",
+            len(loaded_documents),
+            document_id,
+        )
         split_documents = split_source_documents(
             loaded_documents,
             chunk_size=settings.chunk_size,
             chunk_overlap=settings.chunk_overlap,
         )
+        _emit_progress(
+            "[embed_document] Split into %d chunks for document_id=%s",
+            len(split_documents),
+            document_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete()
-
     new_chunks: list[DocumentChunk] = []
-    for item in split_documents:
+    total_split_chunks = len(split_documents)
+    for chunk_position, item in enumerate(split_documents, start=1):
         text = item.page_content.strip()
         if not text:
             continue
 
         item_metadata = dict(item.metadata or {})
+        chunk_index = len(new_chunks)
+        source_page = _extract_source_page(item_metadata)
+        source_kind = _extract_source_kind(item_metadata, file_path.suffix.lower())
+        structured_metadata = build_structured_chunk_metadata(
+            document_id=document_id,
+            chunk_index=chunk_index,
+            file_name=original_filename,
+            source_page=source_page,
+            raw_metadata=item_metadata,
+            chunk_text=text,
+        )
+
         new_chunks.append(
             DocumentChunk(
                 document_id=document_id,
-                chunk_index=len(new_chunks),
+                chunk_index=chunk_index,
                 content=text,
-                source_page=_extract_source_page(item_metadata),
-                source_kind=_extract_source_kind(item_metadata, file_path.suffix.lower()),
-                source_metadata_json=_serialize_source_metadata(item_metadata),
+                source_page=source_page,
+                source_kind=source_kind,
+                source_metadata_json=_serialize_source_metadata(structured_metadata),
             )
         )
 
-    if new_chunks:
-        db.add_all(new_chunks)
+        if chunk_position % 20 == 0 or chunk_position == total_split_chunks:
+            _emit_progress(
+                "[embed_document] Prepared chunk metadata %d/%d for document_id=%s",
+                chunk_position,
+                total_split_chunks,
+                document_id,
+            )
 
-    document.status = "embedded" if new_chunks else "uploaded"
-    db.add(document)
-    db.commit()
+    write_attempts = 3
+    for attempt in range(write_attempts):
+        try:
+            target_document = db.get(Document, document_id)
+            if target_document is None:
+                raise HTTPException(status_code=404, detail="Document not found.")
+
+            _emit_progress(
+                "[embed_document] Writing chunks to DB document_id=%s (attempt=%d/%d, chunks=%d)",
+                document_id,
+                attempt + 1,
+                write_attempts,
+                len(new_chunks),
+            )
+            db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete(
+                synchronize_session=False
+            )
+
+            if new_chunks:
+                db.add_all(new_chunks)
+
+            target_document.status = "embedded" if new_chunks else "uploaded"
+            db.add(target_document)
+            db.commit()
+            _emit_progress("[embed_document] DB write committed for document_id=%s", document_id)
+            break
+        except OperationalError as exc:
+            db.rollback()
+            _emit_progress(
+                "[embed_document] DB locked on document_id=%s (attempt=%d/%d)",
+                document_id,
+                attempt + 1,
+                write_attempts,
+            )
+            if "database is locked" not in str(exc).lower() or attempt == write_attempts - 1:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Database is busy while embedding document. "
+                        "Please retry after a few seconds."
+                    ),
+                ) from exc
+            time.sleep(0.4 * (attempt + 1))
 
     all_chunks = db.query(DocumentChunk).order_by(DocumentChunk.id.asc()).all()
+    _emit_progress(
+        "[embed_document] Rebuilding FAISS from %d parent chunks after embedding document_id=%s",
+        len(all_chunks),
+        document_id,
+    )
+    db.expunge_all()
+    db.rollback()
     try:
         indexed_count = rebuild_index_from_chunks(all_chunks)
     except ValueError as exc:
@@ -343,6 +445,15 @@ def embed_document(
                 f"Root cause: {exc}"
             ),
         ) from exc
+
+    elapsed = time.perf_counter() - started_at
+    _emit_progress(
+        "[embed_document] Completed document_id=%s chunks_created=%s indexed_children=%s elapsed=%.2fs",
+        document_id,
+        len(new_chunks),
+        indexed_count,
+        elapsed,
+    )
 
     return EmbedDocumentResponse(
         document_id=document_id,
@@ -359,6 +470,12 @@ def rebuild_global_index(
     """Rebuild global vector index from all saved chunks."""
 
     all_chunks = db.query(DocumentChunk).order_by(DocumentChunk.id.asc()).all()
+    _emit_progress(
+        "[rebuild_global_index] Triggered with %d parent chunks.",
+        len(all_chunks),
+    )
+    db.expunge_all()
+    db.rollback()
     try:
         indexed_count = rebuild_index_from_chunks(all_chunks)
     except ValueError as exc:

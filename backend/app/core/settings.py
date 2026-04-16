@@ -24,6 +24,15 @@ class Settings:
     retriever_k: int
     llm_model: str
     llm_temperature: float
+    hyq_enabled: bool
+    hyq_use_llm: bool
+    hyq_model: str
+    hyq_summary_words: int
+    hyq_questions_per_chunk: int
+    hybrid_vector_rrf_weight: float
+    hybrid_keyword_rrf_weight: float
+    hybrid_rrf_k: int
+    hybrid_probe_multiplier: int
     # Auth
     secret_key: str
     access_token_expire_minutes: int
@@ -45,6 +54,19 @@ def _float_env(name: str, default: float) -> float:
     if raw_value is None:
         return default
     return float(raw_value)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _string_env(name: str, default: str) -> str:
@@ -94,6 +116,15 @@ def get_settings() -> Settings:
         retriever_k=_int_env("RETRIEVER_K", 4),
         llm_model=_string_env("LLM_MODEL", "llama3.1:8b"),
         llm_temperature=_float_env("LLM_TEMPERATURE", 0.0),
+        hyq_enabled=_bool_env("HYQ_ENABLED", True),
+        hyq_use_llm=_bool_env("HYQ_USE_LLM", False),
+        hyq_model=_string_env("HYQ_MODEL", ""),
+        hyq_summary_words=_int_env("HYQ_SUMMARY_WORDS", 50),
+        hyq_questions_per_chunk=_int_env("HYQ_QUESTIONS_PER_CHUNK", 3),
+        hybrid_vector_rrf_weight=_float_env("HYBRID_VECTOR_RRF_WEIGHT", 1.0),
+        hybrid_keyword_rrf_weight=_float_env("HYBRID_KEYWORD_RRF_WEIGHT", 1.2),
+        hybrid_rrf_k=_int_env("HYBRID_RRF_K", 60),
+        hybrid_probe_multiplier=_int_env("HYBRID_PROBE_MULTIPLIER", 4),
         secret_key=os.getenv("SECRET_KEY", "change-this-secret-key-in-production"),
         access_token_expire_minutes=_int_env("ACCESS_TOKEN_EXPIRE_MINUTES", 1440),
         admin_default_username=os.getenv("ADMIN_DEFAULT_USERNAME", "admin"),

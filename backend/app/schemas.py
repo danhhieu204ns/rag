@@ -50,6 +50,43 @@ class EmbedDocumentResponse(BaseModel):
     indexed_chunks: int
 
 
+class ChunkSourceInfo(BaseModel):
+    file_name: str | None = None
+    page_number: int | None = Field(default=None, ge=1)
+    doc_type: str | None = None
+
+
+class ChunkContextMetadata(BaseModel):
+    h2: str | None = None
+    h3: str | None = None
+
+
+class ChunkSearchOptimization(BaseModel):
+    entities: list[str] = Field(default_factory=list)
+    organizations: list[str] = Field(default_factory=list)
+    dates: list[str] = Field(default_factory=list)
+    document_codes: list[str] = Field(default_factory=list)
+
+
+class ChunkAdminTags(BaseModel):
+    security_level: str | None = None
+    department: str | None = None
+
+
+class ChunkHyQMetadata(BaseModel):
+    summary: str | None = None
+    questions: list[str] = Field(default_factory=list)
+
+
+class ChunkMetadataRead(BaseModel):
+    chunk_id: str | None = None
+    source_info: ChunkSourceInfo = Field(default_factory=ChunkSourceInfo)
+    context: ChunkContextMetadata = Field(default_factory=ChunkContextMetadata)
+    search_optimization: ChunkSearchOptimization = Field(default_factory=ChunkSearchOptimization)
+    admin_tags: ChunkAdminTags = Field(default_factory=ChunkAdminTags)
+    hyq: ChunkHyQMetadata = Field(default_factory=ChunkHyQMetadata)
+
+
 class DocumentChunkRead(BaseModel):
     id: int
     document_id: int
@@ -57,7 +94,7 @@ class DocumentChunkRead(BaseModel):
     content: str
     source_page: int | None = Field(default=None, ge=1)
     source_kind: str | None = None
-    source_metadata: dict[str, Any] | None = None
+    source_metadata: ChunkMetadataRead | dict[str, Any] | None = None
     created_at: datetime
 
 
@@ -75,7 +112,9 @@ class SourceItem(BaseModel):
     chunk_index: int | None = None
     page: int | None = Field(default=None, ge=1)
     source_kind: str | None = None
-    source_metadata: dict[str, Any] | None = None
+    source_metadata: ChunkMetadataRead | dict[str, Any] | None = None
+    retrieval_mode: str | None = None
+    retrieval_score: float | None = None
     excerpt: str
 
 

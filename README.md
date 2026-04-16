@@ -3,9 +3,9 @@
 Ứng dụng RAG (Retrieval-Augmented Generation) cho phép:
 
 - Upload và quản lý tài liệu (`.pdf`, `.txt`, `.md`)
-- Chunk + embedding tài liệu và lưu FAISS index
+- Chunk + embedding theo parent-child (HyQ) và lưu FAISS index
 - Chat hỏi đáp dựa trên ngữ cảnh đã truy xuất
-- Truy vết nguồn theo document/chunk/trang từ kết quả retrieval
+- Truy vết nguồn theo document/chunk/trang + metadata schema từ kết quả retrieval
 - Lưu lịch sử phiên chat bằng SQLite
 
 ## 1) Kiến trúc dự án
@@ -119,6 +119,12 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+Khi chạy embed PDF lớn (OCR/Marker), nên chạy không `--reload` để ổn định hơn:
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
 Backend URL: `http://localhost:8000`
 
 - Health check: `GET /api/health`
@@ -155,7 +161,8 @@ VITE_API_BASE_URL=http://localhost:8000/api
 2. Bấm `Embed` trên từng tài liệu (hoặc `Rebuild index`).
 3. Chuyển sang trang `Chat` để đặt câu hỏi.
 4. Hệ thống sẽ:
-	 - truy xuất chunks liên quan từ FAISS,
+	 - truy xuất hybrid (vector + keyword) từ child index,
+	 - kéo ngược parent chunk text để đưa vào prompt,
 	 - gửi ngữ cảnh + lịch sử chat vào LLM,
 	 - lưu cả tin nhắn user và assistant vào DB.
 
@@ -206,6 +213,15 @@ VITE_API_BASE_URL=http://localhost:8000/api
 - `RETRIEVER_K` (default: `4`)
 - `LLM_MODEL` (default: `llama3.1:8b`)
 - `LLM_TEMPERATURE` (default: `0.0`)
+- `HYQ_ENABLED` (default: `true`)
+- `HYQ_USE_LLM` (default: `false`)
+- `HYQ_MODEL` (default: dùng lại `LLM_MODEL` nếu để trống)
+- `HYQ_SUMMARY_WORDS` (default: `50`)
+- `HYQ_QUESTIONS_PER_CHUNK` (default: `3`)
+- `HYBRID_VECTOR_RRF_WEIGHT` (default: `1.0`)
+- `HYBRID_KEYWORD_RRF_WEIGHT` (default: `1.2`)
+- `HYBRID_RRF_K` (default: `60`)
+- `HYBRID_PROBE_MULTIPLIER` (default: `4`)
 
 ## 10) Dữ liệu runtime được sinh tự động
 

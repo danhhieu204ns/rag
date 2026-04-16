@@ -1,16 +1,27 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import shutil
+import time
+import unicodedata
+from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from sqlalchemy.orm import Session
 
 from ..core.settings import settings
 from ..models import ChatMessage, DocumentChunk
+from .chunk_metadata import build_hyq_children, build_keyword_blob, extract_document_codes
+
+logger = logging.getLogger(__name__)
+_EMBED_BATCH_SIZE = 16
 
 _embeddings: Embeddings | None = None
 _vectorstore: FAISS | None = None
@@ -24,6 +35,27 @@ def _to_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _to_float(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_lookup_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", str(text or ""))
+    without_marks = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    return " ".join(without_marks.lower().split())
+
+
+def _lookup_terms(query: str) -> list[str]:
+    normalized = _normalize_lookup_text(query)
+    terms = re.findall(r"[a-z0-9/-]+", normalized)
+    return [term for term in terms if len(term) >= 2]
 
 
 def _parse_chunk_source_metadata(raw_json: str | None) -> dict[str, object]:
@@ -44,23 +76,249 @@ def _compact_source_metadata(raw_json: str | None) -> dict[str, object]:
         return {}
 
     wanted_keys = {
-        "source",
-        "source_parser",
-        "source_type",
-        "marker_page_id",
-        "marker_text_extraction_method",
-        "marker_block_counts",
+        "chunk_id",
+        "source_info",
+        "context",
+        "search_optimization",
+        "admin_tags",
+        "hyq",
     }
     compact = {
         key: value
         for key, value in raw_metadata.items()
         if key in wanted_keys and value is not None
     }
-    return compact
+    if compact:
+        return compact
+    return raw_metadata
 
 
 def _index_files_exist(index_dir: Path) -> bool:
     return (index_dir / "index.faiss").exists() and (index_dir / "index.pkl").exists()
+
+
+def _emit_reindex_progress(message: str, *args: object) -> None:
+    text = message % args if args else message
+    logger.info(text)
+    print(text, flush=True)
+
+
+def _build_faiss_with_batch_embeddings(documents: list[Document]) -> FAISS:
+    texts = [item.page_content for item in documents]
+    metadatas = [dict(item.metadata or {}) for item in documents]
+    embeddings_client = get_embeddings()
+
+    total = len(texts)
+    batch_size = max(1, _EMBED_BATCH_SIZE)
+    batch_count = (total + batch_size - 1) // batch_size
+
+    all_vectors: list[list[float]] = []
+    for batch_index, start in enumerate(range(0, total, batch_size), start=1):
+        end = min(start + batch_size, total)
+        batch_started_at = time.perf_counter()
+        batch_vectors = embeddings_client.embed_documents(texts[start:end])
+        all_vectors.extend(batch_vectors)
+
+        elapsed = time.perf_counter() - batch_started_at
+        _emit_reindex_progress(
+            "[reindex] Embedded child docs %d/%d (batch %d/%d, %.2fs)",
+            end,
+            total,
+            batch_index,
+            batch_count,
+            elapsed,
+        )
+
+    text_embeddings = list(zip(texts, all_vectors))
+    return FAISS.from_embeddings(
+        text_embeddings,
+        embeddings_client,
+        metadatas=metadatas,
+    )
+
+
+def _load_chunks_by_ids(db: Session, chunk_ids: list[int]) -> list[DocumentChunk]:
+    if not chunk_ids:
+        return []
+
+    rows = db.query(DocumentChunk).filter(DocumentChunk.id.in_(chunk_ids)).all()
+    row_by_id = {row.id: row for row in rows}
+    return [row_by_id[chunk_id] for chunk_id in chunk_ids if chunk_id in row_by_id]
+
+
+def _chunk_to_context_document(
+    chunk: DocumentChunk,
+    *,
+    retrieval_mode: str | None = None,
+    retrieval_score: float | None = None,
+    child_type: str | None = None,
+) -> Document:
+    metadata: dict[str, Any] = {
+        "document_id": chunk.document_id,
+        "chunk_id": chunk.id,
+        "chunk_index": chunk.chunk_index,
+        "source_page": chunk.source_page,
+        "source_kind": chunk.source_kind,
+    }
+
+    source_metadata = _compact_source_metadata(chunk.source_metadata_json)
+    if source_metadata:
+        metadata["source_metadata"] = source_metadata
+
+    if retrieval_mode:
+        metadata["retrieval_mode"] = retrieval_mode
+    if retrieval_score is not None:
+        metadata["retrieval_score"] = retrieval_score
+    if child_type:
+        metadata["child_type"] = child_type
+
+    return Document(page_content=chunk.content, metadata=metadata)
+
+
+def _vector_parent_candidates(
+    query: str,
+    top_k: int,
+    document_ids: list[int] | None,
+) -> tuple[list[int], dict[int, str]]:
+    vectorstore = load_index_if_available()
+    if vectorstore is None:
+        return [], {}
+
+    probe_multiplier = max(1, settings.hybrid_probe_multiplier)
+    probe_k = max(top_k * probe_multiplier, top_k)
+    children = vectorstore.similarity_search(query, k=probe_k)
+
+    wanted_docs = {int(doc_id) for doc_id in document_ids} if document_ids else None
+    parent_ids: list[int] = []
+    parent_child_type: dict[int, str] = {}
+    seen_parent_ids: set[int] = set()
+
+    for child in children:
+        parent_chunk_id = _to_int(child.metadata.get("parent_chunk_id"))
+        if parent_chunk_id is None:
+            parent_chunk_id = _to_int(child.metadata.get("chunk_id"))
+        if parent_chunk_id is None:
+            continue
+
+        if parent_chunk_id in seen_parent_ids:
+            continue
+
+        if wanted_docs is not None:
+            child_document_id = _to_int(child.metadata.get("document_id"))
+            if child_document_id is None or child_document_id not in wanted_docs:
+                continue
+
+        seen_parent_ids.add(parent_chunk_id)
+        parent_ids.append(parent_chunk_id)
+        parent_child_type[parent_chunk_id] = str(child.metadata.get("child_type") or "summary")
+
+        if len(parent_ids) >= probe_k:
+            break
+
+    return parent_ids, parent_child_type
+
+
+def _metadata_document_codes(metadata: dict[str, object]) -> set[str]:
+    search_optimization = metadata.get("search_optimization")
+    if not isinstance(search_optimization, dict):
+        return set()
+
+    raw_codes = search_optimization.get("document_codes")
+    if not isinstance(raw_codes, list):
+        return set()
+
+    return {
+        str(item).upper()
+        for item in raw_codes
+        if str(item).strip()
+    }
+
+
+def _keyword_match_score(
+    *,
+    query_terms: list[str],
+    query_codes: list[str],
+    metadata: dict[str, object],
+    content: str,
+) -> float:
+    if not query_terms and not query_codes:
+        return 0.0
+
+    keyword_blob = build_keyword_blob(metadata, content)
+    normalized_blob = _normalize_lookup_text(keyword_blob)
+    metadata_codes = _metadata_document_codes(metadata)
+
+    score = 0.0
+    for code in query_codes:
+        if code in metadata_codes:
+            score += 12.0
+        elif _normalize_lookup_text(code) in normalized_blob:
+            score += 6.0
+
+    for term in query_terms:
+        if term in normalized_blob:
+            score += 1.0
+
+    return score
+
+
+def _keyword_parent_candidates(
+    query: str,
+    top_k: int,
+    db: Session,
+    document_ids: list[int] | None,
+) -> list[int]:
+    query_terms = _lookup_terms(query)
+    query_codes = [code.upper() for code in extract_document_codes(query)]
+    if not query_terms and not query_codes:
+        return []
+
+    chunk_query = db.query(DocumentChunk)
+    if document_ids:
+        chunk_query = chunk_query.filter(DocumentChunk.document_id.in_([int(item) for item in document_ids]))
+    candidates = chunk_query.order_by(DocumentChunk.id.asc()).all()
+
+    scored: list[tuple[int, float]] = []
+    for candidate in candidates:
+        metadata = _compact_source_metadata(candidate.source_metadata_json)
+        score = _keyword_match_score(
+            query_terms=query_terms,
+            query_codes=query_codes,
+            metadata=metadata,
+            content=candidate.content,
+        )
+        if score <= 0:
+            continue
+
+        scored.append((candidate.id, score))
+
+    scored.sort(key=lambda item: (item[1], -item[0]), reverse=True)
+
+    probe_multiplier = max(1, settings.hybrid_probe_multiplier)
+    probe_k = max(top_k * probe_multiplier, top_k)
+    return [chunk_id for chunk_id, _ in scored[:probe_k]]
+
+
+def _rrf_merge(
+    vector_ids: list[int],
+    keyword_ids: list[int],
+    top_k: int,
+) -> tuple[list[int], dict[int, float]]:
+    if not vector_ids and not keyword_ids:
+        return [], {}
+
+    rrf_k = max(1, settings.hybrid_rrf_k)
+    scores: dict[int, float] = defaultdict(float)
+
+    for rank, chunk_id in enumerate(vector_ids, start=1):
+        scores[chunk_id] += settings.hybrid_vector_rrf_weight / (rrf_k + rank)
+
+    for rank, chunk_id in enumerate(keyword_ids, start=1):
+        scores[chunk_id] += settings.hybrid_keyword_rrf_weight / (rrf_k + rank)
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    merged_ids = [chunk_id for chunk_id, _ in ranked[:top_k]]
+    return merged_ids, scores
 
 
 
@@ -73,6 +331,7 @@ def get_embeddings() -> Embeddings:
         _embeddings = OllamaEmbeddings(
             model=settings.embedding_model_name,
             base_url=settings.ollama_base_url,
+            client_kwargs={"timeout": 180},
         )
 
     return _embeddings
@@ -117,19 +376,24 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
     """Rebuild global FAISS index from all chunks available in database."""
 
     global _vectorstore
+    started_at = time.perf_counter()
 
     if not chunks:
+        _emit_reindex_progress("[reindex] No chunks found. Clearing FAISS index directory.")
         if settings.index_dir.exists():
             shutil.rmtree(settings.index_dir)
         settings.index_dir.mkdir(parents=True, exist_ok=True)
         _vectorstore = None
         return 0
 
+    _emit_reindex_progress("[reindex] Start rebuilding FAISS from %d parent chunks.", len(chunks))
+
     documents: list[Document] = []
     for chunk in chunks:
         metadata: dict[str, object] = {
             "document_id": chunk.document_id,
             "chunk_id": chunk.id,
+            "parent_chunk_id": chunk.id,
             "chunk_index": chunk.chunk_index,
             "source_page": chunk.source_page,
             "source_kind": chunk.source_kind,
@@ -139,17 +403,44 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
         if source_metadata:
             metadata["source_metadata"] = source_metadata
 
-        documents.append(
-            Document(
-                page_content=chunk.content,
-                metadata=metadata,
-            )
-        )
+        child_chunks = build_hyq_children(source_metadata, chunk.content)
+        for child_index, (child_type, child_text) in enumerate(child_chunks):
+            child_metadata = dict(metadata)
+            child_metadata["child_type"] = child_type
+            child_metadata["child_index"] = child_index
 
-    vectorstore = FAISS.from_documents(documents, get_embeddings())
+            documents.append(
+                Document(
+                    page_content=child_text,
+                    metadata=child_metadata,
+                )
+            )
+
+    if not documents:
+        _emit_reindex_progress("[reindex] No child documents generated. Clearing FAISS index directory.")
+        if settings.index_dir.exists():
+            shutil.rmtree(settings.index_dir)
+        settings.index_dir.mkdir(parents=True, exist_ok=True)
+        _vectorstore = None
+        return 0
+
+    _emit_reindex_progress(
+        "[reindex] Generated %d child documents. Creating embeddings with model '%s'.",
+        len(documents),
+        settings.embedding_model_name,
+    )
+
+    vectorstore = _build_faiss_with_batch_embeddings(documents)
     settings.index_dir.mkdir(parents=True, exist_ok=True)
     vectorstore.save_local(str(settings.index_dir))
     _vectorstore = vectorstore
+
+    elapsed = time.perf_counter() - started_at
+    _emit_reindex_progress(
+        "[reindex] Completed. Indexed %d child documents in %.2f seconds.",
+        len(documents),
+        elapsed,
+    )
 
     return len(documents)
 
@@ -158,33 +449,64 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
 def similarity_search(
     query: str,
     top_k: int,
+    db: Session | None = None,
     document_ids: list[int] | None = None,
 ) -> list[Document]:
-    """Search relevant chunks from global FAISS index."""
+    """Search relevant parent chunks using hybrid (vector + keyword) retrieval."""
 
     vectorstore = load_index_if_available()
     if vectorstore is None:
         return []
 
-    probe_k = max(top_k * 3, top_k)
-    documents = vectorstore.similarity_search(query, k=probe_k)
+    if db is None:
+        return vectorstore.similarity_search(query, k=top_k)
 
-    if document_ids:
-        wanted = {int(doc_id) for doc_id in document_ids}
-        documents = [
-            item
-            for item in documents
-            if int(item.metadata.get("document_id", -1)) in wanted
-        ]
+    vector_parent_ids, parent_child_type = _vector_parent_candidates(
+        query,
+        top_k,
+        document_ids,
+    )
+    keyword_parent_ids = _keyword_parent_candidates(
+        query,
+        top_k,
+        db,
+        document_ids,
+    )
 
-    return documents[:top_k]
+    merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, top_k)
+    if not merged_parent_ids:
+        return []
+
+    chunks = _load_chunks_by_ids(db, merged_parent_ids)
+    vector_set = set(vector_parent_ids)
+    keyword_set = set(keyword_parent_ids)
+
+    results: list[Document] = []
+    for chunk in chunks:
+        if chunk.id in vector_set and chunk.id in keyword_set:
+            retrieval_mode = "hybrid"
+        elif chunk.id in keyword_set:
+            retrieval_mode = "keyword"
+        else:
+            retrieval_mode = "vector"
+
+        results.append(
+            _chunk_to_context_document(
+                chunk,
+                retrieval_mode=retrieval_mode,
+                retrieval_score=scores.get(chunk.id),
+                child_type=parent_child_type.get(chunk.id),
+            )
+        )
+
+    return results[:top_k]
 
 
 
-def build_sources(context_docs: list[Document]) -> list[dict[str, int | str | dict[str, object] | None]]:
+def build_sources(context_docs: list[Document]) -> list[dict[str, int | str | float | dict[str, object] | None]]:
     """Extract compact source payload from retrieved chunks."""
 
-    sources: list[dict[str, int | str | dict[str, object] | None]] = []
+    sources: list[dict[str, int | str | float | dict[str, object] | None]] = []
     for doc in context_docs:
         text = doc.page_content.strip().replace("\n", " ")
 
@@ -200,6 +522,8 @@ def build_sources(context_docs: list[Document]) -> list[dict[str, int | str | di
                 "page": _to_int(doc.metadata.get("source_page")),
                 "source_kind": str(doc.metadata.get("source_kind")) if doc.metadata.get("source_kind") is not None else None,
                 "source_metadata": source_metadata,
+                "retrieval_mode": str(doc.metadata.get("retrieval_mode")) if doc.metadata.get("retrieval_mode") is not None else None,
+                "retrieval_score": _to_float(doc.metadata.get("retrieval_score")),
                 "excerpt": text[:280],
             }
         )
@@ -220,9 +544,45 @@ def generate_answer(
         f"{message.role.upper()}: {message.content}" for message in history_messages[-8:]
     )
 
-    context_block = "\n\n".join(
-        f"[Chunk {index}] {doc.page_content}" for index, doc in enumerate(context_docs, start=1)
-    )
+    context_lines: list[str] = []
+    for index, doc in enumerate(context_docs, start=1):
+        source_metadata = doc.metadata.get("source_metadata")
+        source_info = source_metadata.get("source_info") if isinstance(source_metadata, dict) else None
+        context = source_metadata.get("context") if isinstance(source_metadata, dict) else None
+        search_optimization = source_metadata.get("search_optimization") if isinstance(source_metadata, dict) else None
+
+        meta_parts: list[str] = []
+        if isinstance(source_info, dict):
+            if source_info.get("file_name"):
+                meta_parts.append(f"file={source_info.get('file_name')}")
+            if source_info.get("page_number"):
+                meta_parts.append(f"page={source_info.get('page_number')}")
+            if source_info.get("doc_type"):
+                meta_parts.append(f"doc_type={source_info.get('doc_type')}")
+
+        if isinstance(context, dict):
+            if context.get("h2"):
+                meta_parts.append(f"h2={context.get('h2')}")
+            if context.get("h3"):
+                meta_parts.append(f"h3={context.get('h3')}")
+
+        if isinstance(search_optimization, dict):
+            document_codes = search_optimization.get("document_codes")
+            if isinstance(document_codes, list) and document_codes:
+                meta_parts.append(f"document_codes={', '.join(str(item) for item in document_codes[:3])}")
+
+        retrieval_mode = doc.metadata.get("retrieval_mode")
+        if retrieval_mode is not None:
+            meta_parts.append(f"retrieval={retrieval_mode}")
+
+        prefix = f"[Chunk {index}]"
+        if meta_parts:
+            prefix += " " + " | ".join(meta_parts)
+
+        context_lines.append(prefix)
+        context_lines.append(doc.page_content)
+
+    context_block = "\n\n".join(context_lines)
 
     if not context_block:
         context_block = "No retrieved context available."
@@ -246,7 +606,7 @@ def generate_answer(
 
 
 
-def parse_sources(raw_json: str | None) -> list[dict[str, int | str | dict[str, object] | None]]:
+def parse_sources(raw_json: str | None) -> list[dict[str, int | str | float | dict[str, object] | None]]:
     """Parse serialized sources from chat message payload."""
 
     if not raw_json:

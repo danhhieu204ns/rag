@@ -158,6 +158,7 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
     retrieved_docs = similarity_search(
         user_text,
         top_k=top_k,
+        db=db,
         document_ids=payload.document_ids,
     )
 
