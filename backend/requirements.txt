@@ -12,3 +12,6 @@ langchain-ollama
 faiss-cpu
 pypdf
 ollama
+
+# Optional dependency when PDF_PARSER_MODE=marker
+# marker-pdf

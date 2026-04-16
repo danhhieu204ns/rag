@@ -94,6 +94,17 @@ function ChatPage() {
     sendMessage(event);
   }
 
+  function buildSourceLabel(source) {
+    const segments = [`Doc #${source.document_id ?? "?"}`];
+    if (source.page) {
+      segments.push(`Trang ${source.page}`);
+    }
+    if (source.chunk_index !== null && source.chunk_index !== undefined) {
+      segments.push(`Chunk ${source.chunk_index}`);
+    }
+    return segments.join(" | ");
+  }
+
   useEffect(() => {
     fetchSessions().catch(() => setError("Không thể tải danh sách phiên chat."));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -147,7 +158,7 @@ function ChatPage() {
                     <ul>
                       {message.sources.map((source, index) => (
                         <li key={`${message.id}-${index}`}>
-                          Doc #{source.document_id ?? "?"}: {source.excerpt}
+                          {buildSourceLabel(source)}: {source.excerpt}
                         </li>
                       ))}
                     </ul>

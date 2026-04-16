@@ -5,6 +5,7 @@
 - Upload và quản lý tài liệu (`.pdf`, `.txt`, `.md`)
 - Chunk + embedding tài liệu và lưu FAISS index
 - Chat hỏi đáp dựa trên ngữ cảnh đã truy xuất
+- Truy vết nguồn theo document/chunk/trang từ kết quả retrieval
 - Lưu lịch sử phiên chat bằng SQLite
 
 ## 1) Kiến trúc dự án
@@ -93,7 +94,19 @@ Mở `.env` và thêm tối thiểu:
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
 EMBEDDING_MODEL_NAME=BAAI/bge-m3
+PDF_PARSER_MODE=legacy
 LLM_MODEL=llama3.1:8b
+```
+
+`PDF_PARSER_MODE`:
+
+- `legacy`: dùng parser cũ (`PyPDFLoader`)
+- `marker`: dùng Marker để parse PDF theo layout + metadata trang
+
+Nếu dùng `marker`, cài thêm trong backend venv:
+
+```bash
+pip install marker-pdf
 ```
 
 Nếu chưa setup Ollama và pull models, làm theo mục "Setup Ollama" phía trên.
@@ -186,6 +199,7 @@ VITE_API_BASE_URL=http://localhost:8000/api
 - `APP_ENV` (default: `development`)
 - `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
 - `EMBEDDING_MODEL_NAME` (default: `BAAI/bge-m3`)
+- `PDF_PARSER_MODE` (default: `legacy`, hỗ trợ `legacy` hoặc `marker`)
 - `CHUNK_SIZE` (default: `500`)
 - `CHUNK_OVERLAP` (default: `50`)
 - `RETRIEVER_K` (default: `4`)

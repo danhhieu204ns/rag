@@ -17,6 +17,48 @@ _vectorstore: FAISS | None = None
 _llm: ChatOllama | None = None
 
 
+def _to_int(value: object) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_chunk_source_metadata(raw_json: str | None) -> dict[str, object]:
+    if not raw_json:
+        return {}
+    try:
+        data = json.loads(raw_json)
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except json.JSONDecodeError:
+        return {}
+
+
+def _compact_source_metadata(raw_json: str | None) -> dict[str, object]:
+    raw_metadata = _parse_chunk_source_metadata(raw_json)
+    if not raw_metadata:
+        return {}
+
+    wanted_keys = {
+        "source",
+        "source_parser",
+        "source_type",
+        "marker_page_id",
+        "marker_text_extraction_method",
+        "marker_block_counts",
+    }
+    compact = {
+        key: value
+        for key, value in raw_metadata.items()
+        if key in wanted_keys and value is not None
+    }
+    return compact
+
+
 def _index_files_exist(index_dir: Path) -> bool:
     return (index_dir / "index.faiss").exists() and (index_dir / "index.pkl").exists()
 
@@ -83,17 +125,26 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
         _vectorstore = None
         return 0
 
-    documents = [
-        Document(
-            page_content=chunk.content,
-            metadata={
-                "document_id": chunk.document_id,
-                "chunk_id": chunk.id,
-                "chunk_index": chunk.chunk_index,
-            },
+    documents: list[Document] = []
+    for chunk in chunks:
+        metadata: dict[str, object] = {
+            "document_id": chunk.document_id,
+            "chunk_id": chunk.id,
+            "chunk_index": chunk.chunk_index,
+            "source_page": chunk.source_page,
+            "source_kind": chunk.source_kind,
+        }
+
+        source_metadata = _compact_source_metadata(chunk.source_metadata_json)
+        if source_metadata:
+            metadata["source_metadata"] = source_metadata
+
+        documents.append(
+            Document(
+                page_content=chunk.content,
+                metadata=metadata,
+            )
         )
-        for chunk in chunks
-    ]
 
     vectorstore = FAISS.from_documents(documents, get_embeddings())
     settings.index_dir.mkdir(parents=True, exist_ok=True)
@@ -130,15 +181,25 @@ def similarity_search(
 
 
 
-def build_sources(context_docs: list[Document]) -> list[dict[str, int | str | None]]:
+def build_sources(context_docs: list[Document]) -> list[dict[str, int | str | dict[str, object] | None]]:
     """Extract compact source payload from retrieved chunks."""
 
-    sources: list[dict[str, int | str | None]] = []
+    sources: list[dict[str, int | str | dict[str, object] | None]] = []
     for doc in context_docs:
         text = doc.page_content.strip().replace("\n", " ")
+
+        source_metadata = doc.metadata.get("source_metadata")
+        if not isinstance(source_metadata, dict):
+            source_metadata = None
+
         sources.append(
             {
                 "document_id": int(doc.metadata.get("document_id")) if doc.metadata.get("document_id") is not None else None,
+                "chunk_id": _to_int(doc.metadata.get("chunk_id")),
+                "chunk_index": _to_int(doc.metadata.get("chunk_index")),
+                "page": _to_int(doc.metadata.get("source_page")),
+                "source_kind": str(doc.metadata.get("source_kind")) if doc.metadata.get("source_kind") is not None else None,
+                "source_metadata": source_metadata,
                 "excerpt": text[:280],
             }
         )
@@ -185,7 +246,7 @@ def generate_answer(
 
 
 
-def parse_sources(raw_json: str | None) -> list[dict[str, int | str | None]]:
+def parse_sources(raw_json: str | None) -> list[dict[str, int | str | dict[str, object] | None]]:
     """Parse serialized sources from chat message payload."""
 
     if not raw_json:

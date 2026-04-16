@@ -38,6 +38,9 @@ class DocumentChunk(Base):
     document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    source_page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_kind: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     document: Mapped[Document] = relationship("Document", back_populates="chunks")

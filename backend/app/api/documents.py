@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import shutil
 import uuid
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import func
@@ -16,6 +18,65 @@ from ..services.document_processing import load_source_documents, split_source_d
 from ..services.rag_runtime import get_embeddings, rebuild_index_from_chunks
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+
+
+def _to_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(item) for item in value]
+    return str(value)
+
+
+def _extract_source_page(metadata: dict[str, Any]) -> int | None:
+    source_page = _to_int(metadata.get("source_page"))
+    if source_page is not None and source_page > 0:
+        return source_page
+
+    page_number = _to_int(metadata.get("page_number"))
+    if page_number is not None and page_number > 0:
+        return page_number
+
+    return None
+
+
+def _extract_source_kind(metadata: dict[str, Any], file_suffix: str) -> str:
+    source_parser = str(metadata.get("source_parser") or "legacy").lower()
+    source_type = str(metadata.get("source_type") or "").lower()
+
+    if not source_type:
+        source_type = "pdf" if file_suffix == ".pdf" else "text"
+
+    if source_type == "pdf" and source_parser == "marker":
+        return "pdf_marker_page"
+    if source_type == "pdf":
+        return "pdf_page"
+    if source_type == "text":
+        return "text_chunk"
+    return source_type
+
+
+def _serialize_source_metadata(metadata: dict[str, Any]) -> str | None:
+    if not metadata:
+        return None
+
+    safe_metadata = _json_safe_value(metadata)
+    if not isinstance(safe_metadata, dict):
+        return None
+    if not safe_metadata:
+        return None
+    return json.dumps(safe_metadata, ensure_ascii=False)
 
 
 
@@ -165,15 +226,20 @@ def embed_document(document_id: int, db: Session = Depends(get_db)) -> EmbedDocu
     db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete()
 
     new_chunks: list[DocumentChunk] = []
-    for index, item in enumerate(split_documents):
+    for item in split_documents:
         text = item.page_content.strip()
         if not text:
             continue
+
+        item_metadata = dict(item.metadata or {})
         new_chunks.append(
             DocumentChunk(
                 document_id=document_id,
-                chunk_index=index,
+                chunk_index=len(new_chunks),
                 content=text,
+                source_page=_extract_source_page(item_metadata),
+                source_kind=_extract_source_kind(item_metadata, file_path.suffix.lower()),
+                source_metadata_json=_serialize_source_metadata(item_metadata),
             )
         )
 

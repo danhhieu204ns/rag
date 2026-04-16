@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,6 +34,11 @@ class EmbedDocumentResponse(BaseModel):
 
 class SourceItem(BaseModel):
     document_id: int | None = None
+    chunk_id: int | None = None
+    chunk_index: int | None = None
+    page: int | None = Field(default=None, ge=1)
+    source_kind: str | None = None
+    source_metadata: dict[str, Any] | None = None
     excerpt: str
 
 
