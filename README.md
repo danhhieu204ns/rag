@@ -173,6 +173,7 @@ VITE_API_BASE_URL=http://localhost:8000/api
 		- `file` (required)
 		- `title` (optional)
 - `GET /api/documents/{document_id}`: chi tiết tài liệu
+- `GET /api/documents/{document_id}/chunks`: danh sách chunks + metadata (hỗ trợ query `offset`, `limit`)
 - `PUT /api/documents/{document_id}`: cập nhật tiêu đề
 - `DELETE /api/documents/{document_id}`: xóa tài liệu + rebuild index
 - `POST /api/documents/{document_id}/embed`: tạo chunks + rebuild index

@@ -6,14 +6,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..core.settings import settings
 from ..db import get_db
 from ..models import AdminUser, Document, DocumentChunk
-from ..schemas import DocumentRead, DocumentUpdate, EmbedDocumentResponse
+from ..schemas import DocumentChunkListResponse, DocumentChunkRead, DocumentRead, DocumentUpdate, EmbedDocumentResponse
 from ..services.document_processing import load_source_documents, split_source_documents
 from .auth import require_admin
 from ..services.rag_runtime import rebuild_index_from_chunks
@@ -80,6 +80,18 @@ def _serialize_source_metadata(metadata: dict[str, Any]) -> str | None:
     return json.dumps(safe_metadata, ensure_ascii=False)
 
 
+def _parse_source_metadata(raw_json: str | None) -> dict[str, Any] | None:
+    if not raw_json:
+        return None
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 
 def _to_document_read(document: Document, chunk_count: int) -> DocumentRead:
     return DocumentRead(
@@ -91,6 +103,19 @@ def _to_document_read(document: Document, chunk_count: int) -> DocumentRead:
         chunk_count=chunk_count,
         created_at=document.created_at,
         updated_at=document.updated_at,
+    )
+
+
+def _to_document_chunk_read(chunk: DocumentChunk) -> DocumentChunkRead:
+    return DocumentChunkRead(
+        id=chunk.id,
+        document_id=chunk.document_id,
+        chunk_index=chunk.chunk_index,
+        content=chunk.content,
+        source_page=chunk.source_page,
+        source_kind=chunk.source_kind,
+        source_metadata=_parse_source_metadata(chunk.source_metadata_json),
+        created_at=chunk.created_at,
     )
 
 
@@ -165,6 +190,45 @@ def get_document(
 
     document, chunk_count = row
     return _to_document_read(document, int(chunk_count))
+
+
+@router.get("/{document_id}/chunks", response_model=DocumentChunkListResponse)
+def list_document_chunks(
+    document_id: int,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=500),
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
+) -> DocumentChunkListResponse:
+    """Return paginated chunk list with full content and source metadata."""
+
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    total_chunks = (
+        db.query(func.count(DocumentChunk.id))
+        .filter(DocumentChunk.document_id == document_id)
+        .scalar()
+        or 0
+    )
+
+    chunks = (
+        db.query(DocumentChunk)
+        .filter(DocumentChunk.document_id == document_id)
+        .order_by(DocumentChunk.chunk_index.asc(), DocumentChunk.id.asc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    return DocumentChunkListResponse(
+        document_id=document_id,
+        total_chunks=int(total_chunks),
+        offset=offset,
+        limit=limit,
+        items=[_to_document_chunk_read(chunk) for chunk in chunks],
+    )
 
 
 @router.put("/{document_id}", response_model=DocumentRead)

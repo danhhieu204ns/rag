@@ -104,6 +104,7 @@ th {
 .row-actions {
   display: flex;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 input,
@@ -940,6 +941,90 @@ button.danger {
 .admin-docs-panel {
   max-width: 1280px;
   margin: 0 auto;
+}
+
+.chunk-inspector {
+  margin-top: 18px;
+  border-top: 1px dashed #cfd5e2;
+  padding-top: 16px;
+}
+
+.chunk-inspector-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.chunk-inspector-head h3 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.chunk-inspector-head p {
+  margin: 6px 0 0;
+}
+
+.chunk-inspector-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chunk-list {
+  display: grid;
+  gap: 10px;
+}
+
+.chunk-card {
+  border: 1px solid #dde3ef;
+  border-radius: 12px;
+  background: #f9fbff;
+  padding: 12px;
+}
+
+.chunk-card-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.chunk-pill {
+  font-size: 12px;
+  border: 1px solid #d0d8e8;
+  background: #f0f4fb;
+  border-radius: 999px;
+  padding: 3px 8px;
+  color: #33435f;
+}
+
+.chunk-card details {
+  margin-top: 8px;
+}
+
+.chunk-card summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #2d3a53;
+}
+
+.chunk-pre {
+  margin: 8px 0 0;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid #d7deec;
+  background: #fff;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow: auto;
 }
 
 /* Animation backdrop – đặt NGOÀI @media để tránh lỗi parse trên mobile browser cũ */

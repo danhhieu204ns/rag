@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,6 +24,8 @@ _MARKDOWN_HEADERS_TO_SPLIT_ON = [
     ("######", "h6"),
 ]
 _RECURSIVE_SEPARATORS = ["\n\n", "\n", ". ", ", ", " ", ""]
+_HEADER_SPLIT_SPANS_KEY = "_marker_page_spans"
+_HEADER_SPLIT_START_KEY = "_header_split_start_index"
 _marker_models: dict[str, Any] | None = None
 
 
@@ -52,6 +55,156 @@ def _extract_source_page(metadata: dict[str, Any]) -> int | None:
     if marker_page_id is not None and marker_page_id >= 0:
         return marker_page_id + 1
 
+    return None
+
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(item) for item in value]
+    return str(value)
+
+
+def _is_marker_pdf_documents(documents: list[Document]) -> bool:
+    if not documents:
+        return False
+
+    for item in documents:
+        metadata = item.metadata or {}
+        if str(metadata.get("source_parser") or "").lower() != "marker":
+            return False
+        if str(metadata.get("source_type") or "").lower() != "pdf":
+            return False
+
+    return True
+
+
+def _clean_marker_page_text(raw_text: str) -> str:
+    cleaned = re.sub(r"\n?\{\d+\}-+\n?", "\n", str(raw_text or ""))
+    return cleaned.strip()
+
+
+def _page_join_separator(previous_text: str, next_text: str) -> str:
+    previous_trimmed = previous_text.rstrip()
+    next_trimmed = next_text.lstrip()
+
+    if not previous_trimmed or not next_trimmed:
+        return "\n\n"
+
+    if previous_trimmed.endswith("-"):
+        return ""
+
+    previous_last_char = previous_trimmed[-1]
+    next_first_char = next_trimmed[0]
+    if previous_last_char.isalnum() and next_first_char.isalnum():
+        return " "
+
+    if previous_last_char not in ".!?;:\n" and next_first_char.isalpha():
+        return " "
+
+    return "\n\n"
+
+
+def _merge_marker_pdf_documents_for_header_split(documents: list[Document]) -> list[Document]:
+    if not documents:
+        return []
+
+    merged_parts: list[str] = []
+    page_spans: list[dict[str, Any]] = []
+    current_length = 0
+    previous_page_text = ""
+    first_metadata: dict[str, Any] = {}
+
+    for item in documents:
+        metadata = dict(item.metadata or {})
+        page_text = _clean_marker_page_text(str(item.page_content or ""))
+        if not page_text:
+            continue
+
+        if not first_metadata:
+            first_metadata = dict(metadata)
+
+        separator = ""
+        if merged_parts:
+            separator = _page_join_separator(previous_page_text, page_text)
+            merged_parts.append(separator)
+            current_length += len(separator)
+
+        page_start = current_length
+        merged_parts.append(page_text)
+        current_length += len(page_text)
+        page_end = current_length
+
+        page_spans.append(
+            {
+                "start": page_start,
+                "end": page_end,
+                "source_page": _extract_source_page(metadata),
+                "marker_page_id": _to_int(metadata.get("marker_page_id")),
+                "marker_text_extraction_method": metadata.get("marker_text_extraction_method"),
+                "marker_block_counts": metadata.get("marker_block_counts"),
+            }
+        )
+        previous_page_text = page_text
+
+    merged_text = "".join(merged_parts).strip()
+    if not merged_text:
+        return []
+
+    merged_metadata = dict(first_metadata)
+    merged_metadata.pop("source_page", None)
+    merged_metadata.pop("marker_page_id", None)
+    merged_metadata.pop("marker_text_extraction_method", None)
+    merged_metadata.pop("marker_block_counts", None)
+    merged_metadata[_HEADER_SPLIT_SPANS_KEY] = page_spans
+    merged_metadata["merged_marker_page_count"] = len(page_spans)
+
+    return [Document(page_content=merged_text, metadata=merged_metadata)]
+
+
+def _find_section_offset(text: str, section_text: str, cursor: int) -> int:
+    if not section_text:
+        return cursor
+
+    found_at = text.find(section_text, cursor)
+    if found_at >= 0:
+        return found_at
+
+    stripped = section_text.strip()
+    if stripped:
+        found_at = text.find(stripped, cursor)
+        if found_at >= 0:
+            return found_at
+
+        found_at = text.find(stripped)
+        if found_at >= 0:
+            return found_at
+
+    return cursor
+
+
+def _resolve_page_span_for_offset(spans: Any, offset: int) -> dict[str, Any] | None:
+    if not isinstance(spans, list) or not spans:
+        return None
+
+    for item in spans:
+        if not isinstance(item, dict):
+            continue
+
+        start = _to_int(item.get("start"))
+        end = _to_int(item.get("end"))
+        if start is None or end is None:
+            continue
+
+        if start <= offset < end:
+            return item
+
+    last_item = spans[-1]
+    if isinstance(last_item, dict):
+        return last_item
     return None
 
 
@@ -142,6 +295,86 @@ def _write_markdown_output_log(
         header_lines.append(f"page_count: {page_count}")
 
     payload = "\n".join(header_lines) + "\n\n" + markdown.strip() + "\n"
+
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file.write_text(payload, encoding="utf-8")
+        return str(log_file)
+    except OSError:
+        return None
+
+
+def _resolve_source_from_documents(documents: list[Document]) -> str | None:
+    for item in documents:
+        metadata = item.metadata or {}
+        source = metadata.get("source")
+        if source is None:
+            continue
+        source_text = str(source).strip()
+        if source_text:
+            return source_text
+    return None
+
+
+def _build_header_split_log_stem(source: str | None) -> str:
+    if source:
+        candidate = Path(source).stem.strip()
+        if candidate:
+            normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", candidate)
+            if normalized:
+                return normalized
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+    return f"header_split_{timestamp}"
+
+
+def _write_header_split_output_log(
+    input_documents: list[Document],
+    header_split_documents: list[Document],
+) -> str | None:
+    """Persist markdown-header split output to disk for manual review/debugging."""
+
+    if not header_split_documents:
+        return None
+
+    source = _resolve_source_from_documents(input_documents)
+    log_dir = settings.storage_dir / "markdown_logs" / "header_split"
+    log_file = log_dir / f"{_build_header_split_log_stem(source)}.md"
+
+    header_lines = [
+        "<!-- markdown header split output -->",
+        f"source_file: {source or 'unknown'}",
+        "split_stage: markdown_header_split",
+        f"generated_at_utc: {datetime.now(UTC).isoformat()}",
+        f"input_document_count: {len(input_documents)}",
+        f"section_count: {len(header_split_documents)}",
+    ]
+
+    section_lines: list[str] = []
+    for index, item in enumerate(header_split_documents, start=1):
+        metadata = dict(item.metadata or {})
+        visible_metadata = {
+            key: value
+            for key, value in metadata.items()
+            if not str(key).startswith("_")
+        }
+        safe_metadata = _json_safe_value(visible_metadata)
+        metadata_json = json.dumps(safe_metadata, ensure_ascii=False, indent=2)
+        section_lines.extend(
+            [
+                f"## Section {index}",
+                "",
+                "```json",
+                metadata_json,
+                "```",
+                "",
+                item.page_content.strip(),
+                "",
+                "---",
+                "",
+            ]
+        )
+
+    payload = "\n".join(header_lines) + "\n\n" + "\n".join(section_lines)
 
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -251,6 +484,7 @@ def _recursive_split(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=_RECURSIVE_SEPARATORS,
+        add_start_index=True,
     )
     return splitter.split_documents(documents)
 
@@ -269,19 +503,27 @@ def _markdown_header_split(documents: list[Document]) -> list[Document]:
             continue
 
         header_documents = splitter.split_text(text)
+        cursor = 0
         if not header_documents:
-            split_documents.append(Document(page_content=text, metadata=base_metadata))
+            fallback_metadata = dict(base_metadata)
+            fallback_metadata[_HEADER_SPLIT_START_KEY] = 0
+            split_documents.append(Document(page_content=text.strip(), metadata=fallback_metadata))
             continue
 
         for section in header_documents:
-            section_text = str(section.page_content or "").strip()
+            section_raw_text = str(section.page_content or "")
+            section_text = section_raw_text.strip()
             if not section_text:
                 continue
+
+            section_start = _find_section_offset(text, section_raw_text, cursor)
+            cursor = max(cursor, section_start + len(section_raw_text))
 
             section_metadata = dict(section.metadata or {})
             merged_metadata = dict(base_metadata)
             if section_metadata:
                 merged_metadata["markdown_headers"] = section_metadata
+            merged_metadata[_HEADER_SPLIT_START_KEY] = section_start
 
             split_documents.append(
                 Document(
@@ -316,8 +558,47 @@ def split_source_documents(
 ) -> list[Document]:
     """Split loaded documents into chunks for embedding."""
 
-    header_split_documents = _markdown_header_split(documents)
+    documents_for_header_split = documents
+    if _is_marker_pdf_documents(documents):
+        documents_for_header_split = _merge_marker_pdf_documents_for_header_split(documents)
+
+    header_split_documents = _markdown_header_split(documents_for_header_split)
     if not header_split_documents:
         return []
 
-    return _recursive_split(header_split_documents, chunk_size, chunk_overlap)
+    log_path = _write_header_split_output_log(documents_for_header_split, header_split_documents)
+    if log_path is not None:
+        for item in header_split_documents:
+            metadata = dict(item.metadata or {})
+            metadata["header_split_log_path"] = log_path
+            item.metadata = metadata
+
+    recursive_documents = _recursive_split(header_split_documents, chunk_size, chunk_overlap)
+    for item in recursive_documents:
+        metadata = dict(item.metadata or {})
+
+        section_start = _to_int(metadata.get(_HEADER_SPLIT_START_KEY))
+        chunk_start = _to_int(metadata.get("start_index"))
+        if section_start is not None and chunk_start is not None:
+            absolute_offset = section_start + chunk_start
+            span = _resolve_page_span_for_offset(metadata.get(_HEADER_SPLIT_SPANS_KEY), absolute_offset)
+            if span is not None:
+                source_page = _to_int(span.get("source_page"))
+                marker_page_id = _to_int(span.get("marker_page_id"))
+                if source_page is not None:
+                    metadata["source_page"] = source_page
+                if marker_page_id is not None:
+                    metadata["marker_page_id"] = marker_page_id
+
+                extraction_method = span.get("marker_text_extraction_method")
+                if extraction_method is not None:
+                    metadata["marker_text_extraction_method"] = str(extraction_method)
+
+                if span.get("marker_block_counts") is not None:
+                    metadata["marker_block_counts"] = span.get("marker_block_counts")
+
+        metadata.pop(_HEADER_SPLIT_SPANS_KEY, None)
+        metadata.pop(_HEADER_SPLIT_START_KEY, None)
+        item.metadata = metadata
+
+    return recursive_documents

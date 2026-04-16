@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import api from "../api";
 
+const CHUNK_PAGE_SIZE = 10;
+
 function DocumentsPage({ onAdminLogout }) {
   const [documents, setDocuments] = useState([]);
   const [titleDrafts, setTitleDrafts] = useState({});
@@ -10,10 +12,35 @@ function DocumentsPage({ onAdminLogout }) {
   const [isBusy, setIsBusy] = useState(false);
   const [error, setError] = useState("");
 
+  const [selectedChunkDocumentId, setSelectedChunkDocumentId] = useState(null);
+  const [chunks, setChunks] = useState([]);
+  const [chunkTotal, setChunkTotal] = useState(0);
+  const [chunkOffset, setChunkOffset] = useState(0);
+  const [isChunksBusy, setIsChunksBusy] = useState(false);
+  const [chunksError, setChunksError] = useState("");
+
   const totalChunks = useMemo(
     () => documents.reduce((sum, item) => sum + (item.chunk_count || 0), 0),
     [documents]
   );
+
+  const selectedChunkDocument = useMemo(
+    () => documents.find((item) => item.id === selectedChunkDocumentId) || null,
+    [documents, selectedChunkDocumentId]
+  );
+
+  const chunkRangeStart = chunkTotal === 0 ? 0 : chunkOffset + 1;
+  const chunkRangeEnd = Math.min(chunkOffset + CHUNK_PAGE_SIZE, chunkTotal);
+  const canGoChunkPrev = chunkOffset > 0;
+  const canGoChunkNext = chunkOffset + CHUNK_PAGE_SIZE < chunkTotal;
+
+  function closeChunksInspector() {
+    setSelectedChunkDocumentId(null);
+    setChunks([]);
+    setChunkTotal(0);
+    setChunkOffset(0);
+    setChunksError("");
+  }
 
   async function fetchDocuments() {
     const response = await api.get("/documents");
@@ -24,6 +51,34 @@ function DocumentsPage({ onAdminLogout }) {
       nextDrafts[item.id] = item.title;
     });
     setTitleDrafts(nextDrafts);
+
+    if (selectedChunkDocumentId && !response.data.some((item) => item.id === selectedChunkDocumentId)) {
+      closeChunksInspector();
+    }
+  }
+
+  async function fetchDocumentChunks(documentId, offset = 0) {
+    setIsChunksBusy(true);
+    setChunksError("");
+
+    try {
+      const response = await api.get(`/documents/${documentId}/chunks`, {
+        params: {
+          offset,
+          limit: CHUNK_PAGE_SIZE,
+        },
+      });
+
+      setSelectedChunkDocumentId(documentId);
+      setChunks(response.data.items || []);
+      setChunkTotal(response.data.total_chunks || 0);
+      setChunkOffset(response.data.offset || 0);
+    } catch (err) {
+      const detail = err?.response?.data?.detail;
+      setChunksError(typeof detail === "string" ? detail : "Khong the tai danh sach chunks.");
+    } finally {
+      setIsChunksBusy(false);
+    }
   }
 
   async function uploadDocument(event) {
@@ -47,7 +102,7 @@ function DocumentsPage({ onAdminLogout }) {
       await fetchDocuments();
     } catch (err) {
       const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Không thể upload tài liệu.");
+      setError(typeof detail === "string" ? detail : "Khong the upload tai lieu.");
     } finally {
       setIsBusy(false);
     }
@@ -64,7 +119,7 @@ function DocumentsPage({ onAdminLogout }) {
       await fetchDocuments();
     } catch (err) {
       const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Không thể cập nhật tiêu đề.");
+      setError(typeof detail === "string" ? detail : "Khong the cap nhat tieu de.");
     } finally {
       setIsBusy(false);
     }
@@ -76,9 +131,12 @@ function DocumentsPage({ onAdminLogout }) {
     try {
       await api.post(`/documents/${documentId}/embed`);
       await fetchDocuments();
+      if (selectedChunkDocumentId === documentId) {
+        await fetchDocumentChunks(documentId, 0);
+      }
     } catch (err) {
       const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Không thể embedding tài liệu.");
+      setError(typeof detail === "string" ? detail : "Khong the embed tai lieu.");
     } finally {
       setIsBusy(false);
     }
@@ -89,10 +147,13 @@ function DocumentsPage({ onAdminLogout }) {
     setError("");
     try {
       await api.delete(`/documents/${documentId}`);
+      if (selectedChunkDocumentId === documentId) {
+        closeChunksInspector();
+      }
       await fetchDocuments();
     } catch (err) {
       const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Không thể xóa tài liệu.");
+      setError(typeof detail === "string" ? detail : "Khong the xoa tai lieu.");
     } finally {
       setIsBusy(false);
     }
@@ -105,14 +166,31 @@ function DocumentsPage({ onAdminLogout }) {
       await api.post("/documents/reindex");
     } catch (err) {
       const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Không thể rebuild index.");
+      setError(typeof detail === "string" ? detail : "Khong the rebuild index.");
     } finally {
       setIsBusy(false);
     }
   }
 
+  function handleChunkToggle(doc) {
+    if (selectedChunkDocumentId === doc.id) {
+      closeChunksInspector();
+      return;
+    }
+    fetchDocumentChunks(doc.id, 0);
+  }
+
+  function formatChunkDate(value) {
+    if (!value) return "";
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+      return "";
+    }
+    return parsed.toLocaleString();
+  }
+
   useEffect(() => {
-    fetchDocuments().catch(() => setError("Không thể tải danh sách tài liệu."));
+    fetchDocuments().catch(() => setError("Khong the tai danh sach tai lieu."));
   }, []);
 
   return (
@@ -120,7 +198,7 @@ function DocumentsPage({ onAdminLogout }) {
       <header className="admin-docs-head">
         <div>
           <h1>Admin - Quan ly tai lieu</h1>
-          <p>Upload, embedding va cap nhat kho tri thuc cho chatbot user.</p>
+          <p>Upload, embed va xem chi tiet chunks/metadata cho kho tri thuc.</p>
         </div>
         <div className="admin-docs-top-actions">
           <Link to="/chat" className="ghost-link">
@@ -139,7 +217,7 @@ function DocumentsPage({ onAdminLogout }) {
             <span className="muted">Tai lieu: {documents.length}</span>
             <span className="muted">Tong chunks: {totalChunks}</span>
             <button onClick={rebuildIndex} disabled={isBusy}>
-            Rebuild index
+              Rebuild index
             </button>
           </div>
         </div>
@@ -195,6 +273,9 @@ function DocumentsPage({ onAdminLogout }) {
                     <button onClick={() => embedDocument(doc.id)} disabled={isBusy}>
                       Embed
                     </button>
+                    <button onClick={() => handleChunkToggle(doc)} disabled={isBusy || isChunksBusy}>
+                      {selectedChunkDocumentId === doc.id ? "Hide chunks" : "View chunks"}
+                    </button>
                     <button className="danger" onClick={() => deleteDocument(doc.id)} disabled={isBusy}>
                       Delete
                     </button>
@@ -204,6 +285,86 @@ function DocumentsPage({ onAdminLogout }) {
             </tbody>
           </table>
         </div>
+
+        {selectedChunkDocumentId ? (
+          <section className="chunk-inspector">
+            <div className="chunk-inspector-head">
+              <div>
+                <h3>
+                  Chunks - Document #{selectedChunkDocumentId}
+                  {selectedChunkDocument ? `: ${selectedChunkDocument.title}` : ""}
+                </h3>
+                <p className="muted">
+                  Total: {chunkTotal}
+                  {chunkTotal > 0 ? ` | Showing ${chunkRangeStart}-${chunkRangeEnd}` : ""}
+                </p>
+              </div>
+              <div className="chunk-inspector-actions">
+                <button
+                  onClick={() =>
+                    fetchDocumentChunks(
+                      selectedChunkDocumentId,
+                      Math.max(0, chunkOffset - CHUNK_PAGE_SIZE)
+                    )
+                  }
+                  disabled={!canGoChunkPrev || isChunksBusy}
+                >
+                  Prev
+                </button>
+                <button
+                  onClick={() =>
+                    fetchDocumentChunks(selectedChunkDocumentId, chunkOffset + CHUNK_PAGE_SIZE)
+                  }
+                  disabled={!canGoChunkNext || isChunksBusy}
+                >
+                  Next
+                </button>
+                <button className="danger" onClick={closeChunksInspector}>
+                  Close
+                </button>
+              </div>
+            </div>
+
+            {isChunksBusy ? <p className="muted">Dang tai chunks...</p> : null}
+            {chunksError ? <p className="error-text">{chunksError}</p> : null}
+            {!isChunksBusy && !chunksError && chunks.length === 0 ? (
+              <p className="muted">Tai lieu nay chua co chunk. Bam Embed de tao chunks.</p>
+            ) : null}
+
+            <div className="chunk-list">
+              {chunks.map((chunk) => {
+                const metadata = chunk.source_metadata || {};
+                const hasMetadata = Object.keys(metadata).length > 0;
+
+                return (
+                  <article className="chunk-card" key={chunk.id}>
+                    <div className="chunk-card-head">
+                      <strong>Chunk #{chunk.chunk_index}</strong>
+                      <span className="chunk-pill">id {chunk.id}</span>
+                      {chunk.source_page ? <span className="chunk-pill">page {chunk.source_page}</span> : null}
+                      {chunk.source_kind ? <span className="chunk-pill">{chunk.source_kind}</span> : null}
+                      {chunk.created_at ? (
+                        <span className="chunk-pill">{formatChunkDate(chunk.created_at)}</span>
+                      ) : null}
+                    </div>
+
+                    <details open>
+                      <summary>Content</summary>
+                      <pre className="chunk-pre">{chunk.content}</pre>
+                    </details>
+
+                    <details>
+                      <summary>Metadata</summary>
+                      <pre className="chunk-pre">
+                        {hasMetadata ? JSON.stringify(metadata, null, 2) : "{}"}
+                      </pre>
+                    </details>
+                  </article>
+                );
+              })}
+            </div>
+          </section>
+        ) : null}
 
         {error ? <p className="error-text">{error}</p> : null}
       </div>

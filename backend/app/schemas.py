@@ -50,6 +50,25 @@ class EmbedDocumentResponse(BaseModel):
     indexed_chunks: int
 
 
+class DocumentChunkRead(BaseModel):
+    id: int
+    document_id: int
+    chunk_index: int
+    content: str
+    source_page: int | None = Field(default=None, ge=1)
+    source_kind: str | None = None
+    source_metadata: dict[str, Any] | None = None
+    created_at: datetime
+
+
+class DocumentChunkListResponse(BaseModel):
+    document_id: int
+    total_chunks: int
+    offset: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    items: list[DocumentChunkRead]
+
+
 class SourceItem(BaseModel):
     document_id: int | None = None
     chunk_id: int | None = None
