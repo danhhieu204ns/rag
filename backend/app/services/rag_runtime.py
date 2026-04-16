@@ -755,6 +755,7 @@ def get_embeddings() -> Embeddings:
         _embeddings = OllamaEmbeddings(
             model=settings.embedding_model_name,
             base_url=settings.ollama_base_url,
+            num_thread=settings.ollama_num_thread,
             client_kwargs={"timeout": 180},
         )
 
@@ -772,6 +773,7 @@ def get_llm() -> ChatOllama:
             model=settings.llm_model,
             base_url=settings.ollama_base_url,
             temperature=settings.llm_temperature,
+            num_thread=settings.ollama_num_thread,
         )
     return _llm
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import shutil
@@ -341,17 +342,31 @@ def embed_document(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    new_chunks: list[DocumentChunk] = []
-    total_split_chunks = len(split_documents)
-    for chunk_position, item in enumerate(split_documents, start=1):
+    candidates: list[tuple[int, str, dict[str, Any], int | None, str]] = []
+    for item in split_documents:
         text = item.page_content.strip()
         if not text:
             continue
 
         item_metadata = dict(item.metadata or {})
-        chunk_index = len(new_chunks)
         source_page = _extract_source_page(item_metadata)
         source_kind = _extract_source_kind(item_metadata, file_path.suffix.lower())
+        candidates.append((len(candidates), text, item_metadata, source_page, source_kind))
+
+    metadata_workers = max(1, settings.metadata_max_workers)
+    _emit_progress(
+        "[embed_document] Preparing metadata for %d chunks with workers=%d (document_id=%s)",
+        len(candidates),
+        metadata_workers,
+        document_id,
+    )
+
+    prepared_rows: list[tuple[str, int | None, str, dict[str, Any]] | None] = [None] * len(candidates)
+
+    def _build_metadata_row(
+        candidate: tuple[int, str, dict[str, Any], int | None, str],
+    ) -> tuple[int, tuple[str, int | None, str, dict[str, Any]]]:
+        chunk_index, text, item_metadata, source_page, source_kind = candidate
         structured_metadata = build_structured_chunk_metadata(
             document_id=document_id,
             chunk_index=chunk_index,
@@ -360,7 +375,49 @@ def embed_document(
             raw_metadata=item_metadata,
             chunk_text=text,
         )
+        return chunk_index, (text, source_page, source_kind, structured_metadata)
 
+    if metadata_workers <= 1 or len(candidates) <= 1:
+        for processed_count, candidate in enumerate(candidates, start=1):
+            chunk_index, payload = _build_metadata_row(candidate)
+            prepared_rows[chunk_index] = payload
+            if processed_count % 20 == 0 or processed_count == len(candidates):
+                _emit_progress(
+                    "[embed_document] Prepared chunk metadata %d/%d for document_id=%s",
+                    processed_count,
+                    len(candidates),
+                    document_id,
+                )
+    else:
+        with ThreadPoolExecutor(max_workers=metadata_workers) as executor:
+            futures = [executor.submit(_build_metadata_row, candidate) for candidate in candidates]
+            processed_count = 0
+
+            for future in as_completed(futures):
+                chunk_index, payload = future.result()
+                prepared_rows[chunk_index] = payload
+                processed_count += 1
+
+                if processed_count % 20 == 0 or processed_count == len(candidates):
+                    _emit_progress(
+                        "[embed_document] Prepared chunk metadata %d/%d for document_id=%s",
+                        processed_count,
+                        len(candidates),
+                        document_id,
+                    )
+
+    if any(item is None for item in prepared_rows):
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to build chunk metadata for all chunks.",
+        )
+
+    new_chunks: list[DocumentChunk] = []
+    for chunk_index, payload in enumerate(prepared_rows):
+        if payload is None:
+            continue
+
+        text, source_page, source_kind, structured_metadata = payload
         new_chunks.append(
             DocumentChunk(
                 document_id=document_id,
@@ -371,14 +428,6 @@ def embed_document(
                 source_metadata_json=_serialize_source_metadata(structured_metadata),
             )
         )
-
-        if chunk_position % 20 == 0 or chunk_position == total_split_chunks:
-            _emit_progress(
-                "[embed_document] Prepared chunk metadata %d/%d for document_id=%s",
-                chunk_position,
-                total_split_chunks,
-                document_id,
-            )
 
     write_attempts = 3
     for attempt in range(write_attempts):

@@ -47,9 +47,14 @@ Optional tuning:
 - `RETRIEVER_K`
 - `LLM_MODEL` (default: `llama3.1:8b`)
 - `LLM_TEMPERATURE`
+- `OLLAMA_NUM_THREAD` (default: `8`)
 - `HYQ_ENABLED` (default: `true`)
 - `HYQ_USE_LLM` (default: `false`)
-- `HYQ_MODEL` (default: fallback to `LLM_MODEL`)
+- `HYQ_MODEL` (default: fallback to `METADATA_MODEL`, then `LLM_MODEL`)
+- `METADATA_USE_LLM` (default: fallback to `HYQ_USE_LLM`)
+- `METADATA_MODEL` (default: fallback to `HYQ_MODEL`, then `LLM_MODEL`)
+- `METADATA_OLLAMA_NUM_THREAD` (default: fallback to `OLLAMA_NUM_THREAD`)
+- `METADATA_OLLAMA_NUM_PREDICT` (default: `256`)
 - `HYQ_SUMMARY_WORDS` (default: `50`)
 - `HYQ_QUESTIONS_PER_CHUNK` (default: `3`)
 - `HYBRID_VECTOR_RRF_WEIGHT` (default: `1.0`)
@@ -57,7 +62,7 @@ Optional tuning:
 - `HYBRID_RRF_K` (default: `60`)
 - `HYBRID_PROBE_MULTIPLIER` (default: `4`)
 
-If `HYQ_USE_LLM=true`, ensure the selected HyQ model is available in Ollama.
+If `HYQ_USE_LLM=true` or `METADATA_USE_LLM=true`, ensure the selected model is available in Ollama.
 
 If `QDRANT_URL` is empty, backend uses local embedded Qdrant persisted at:
 
@@ -85,7 +90,19 @@ ollama pull bge-m3
 Optional if HyQ LLM generation is enabled:
 
 ```bash
-ollama pull llama3.1:8b
+ollama pull llama3.2:3b
+```
+
+Recommended setup for lower VRAM/CPU load on metadata tasks (keyword extraction, summary, hypothetical questions):
+
+```env
+HYQ_USE_LLM=true
+HYQ_MODEL=llama3.2:3b
+METADATA_USE_LLM=true
+METADATA_MODEL=llama3.2:3b
+OLLAMA_NUM_THREAD=8
+METADATA_OLLAMA_NUM_THREAD=8
+METADATA_OLLAMA_NUM_PREDICT=192
 ```
 
 Embedding model is served via Ollama using `langchain-ollama`.

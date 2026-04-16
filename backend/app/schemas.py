@@ -62,6 +62,7 @@ class ChunkContextMetadata(BaseModel):
 
 
 class ChunkSearchOptimization(BaseModel):
+    keywords: list[str] = Field(default_factory=list)
     entities: list[str] = Field(default_factory=list)
     organizations: list[str] = Field(default_factory=list)
     dates: list[str] = Field(default_factory=list)

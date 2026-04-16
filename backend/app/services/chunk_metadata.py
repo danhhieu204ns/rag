@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,6 +41,15 @@ class HyQResult:
     questions: list[str]
 
 
+_SEARCH_OPT_LIMITS: dict[str, int] = {
+    "keywords": 20,
+    "entities": 15,
+    "organizations": 15,
+    "dates": 15,
+    "document_codes": 15,
+}
+
+
 def _normalize_spaces(text: str) -> str:
     return " ".join(str(text or "").split())
 
@@ -73,6 +83,113 @@ def _dedupe_keep_order(items: list[str], limit: int) -> list[str]:
             break
 
     return output
+
+
+def _extract_json_payload(raw_output: str) -> dict[str, Any] | None:
+    start = raw_output.find("{")
+    end = raw_output.rfind("}")
+    if start < 0 or end <= start:
+        return None
+
+    try:
+        payload = json.loads(raw_output[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    return payload
+
+
+def _payload_list(payload: dict[str, Any], key: str, limit: int) -> list[str]:
+    value = payload.get(key)
+    if not isinstance(value, list):
+        return []
+    return _dedupe_keep_order([str(item) for item in value if str(item).strip()], limit=limit)
+
+
+def _build_fallback_keywords(
+    *,
+    entities: list[str],
+    organizations: list[str],
+    dates: list[str],
+    document_codes: list[str],
+) -> list[str]:
+    combined = [
+        *document_codes,
+        *organizations,
+        *entities,
+        *dates,
+    ]
+    return _dedupe_keep_order(combined, limit=_SEARCH_OPT_LIMITS["keywords"])
+
+
+def _merge_search_optimization(
+    primary: dict[str, list[str]],
+    fallback: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    merged: dict[str, list[str]] = {}
+
+    for key, limit in _SEARCH_OPT_LIMITS.items():
+        merged[key] = _dedupe_keep_order(
+            [*primary.get(key, []), *fallback.get(key, [])],
+            limit=limit,
+        )
+
+    return merged
+
+
+def _parse_search_optimization_payload(payload: dict[str, Any]) -> dict[str, list[str]]:
+    entities = _payload_list(payload, "entities", limit=_SEARCH_OPT_LIMITS["entities"])
+    organizations = _payload_list(payload, "organizations", limit=_SEARCH_OPT_LIMITS["organizations"])
+    dates = _payload_list(payload, "dates", limit=_SEARCH_OPT_LIMITS["dates"])
+
+    raw_codes = _payload_list(payload, "document_codes", limit=30)
+    parsed_codes: list[str] = []
+    for item in raw_codes:
+        parsed_codes.extend(extract_document_codes(item, limit=5))
+    document_codes = _dedupe_keep_order(parsed_codes, limit=_SEARCH_OPT_LIMITS["document_codes"])
+
+    keywords = _payload_list(payload, "keywords", limit=_SEARCH_OPT_LIMITS["keywords"])
+    if not keywords:
+        keywords = _build_fallback_keywords(
+            entities=entities,
+            organizations=organizations,
+            dates=dates,
+            document_codes=document_codes,
+        )
+
+    return {
+        "keywords": keywords,
+        "entities": entities,
+        "organizations": organizations,
+        "dates": dates,
+        "document_codes": document_codes,
+    }
+
+
+def _parse_hyq_payload(
+    payload: dict[str, Any],
+    *,
+    summary_words: int,
+    question_count: int,
+) -> HyQResult | None:
+    summary = _word_limited_text(str(payload.get("summary") or ""), summary_words)
+    raw_questions = payload.get("questions")
+    if not isinstance(raw_questions, list):
+        return None
+
+    cleaned_questions = [str(item) for item in raw_questions if str(item).strip()]
+    deduped = _dedupe_keep_order(cleaned_questions, limit=question_count)
+    if not summary or not deduped:
+        return None
+
+    while len(deduped) < question_count:
+        deduped.append(f"Thông tin chính của đoạn này là gì? ({len(deduped) + 1})")
+
+    normalized_questions = [question if question.endswith("?") else f"{question}?" for question in deduped]
+    return HyQResult(summary=summary, questions=normalized_questions)
 
 
 def extract_document_codes(text: str, limit: int = 20) -> list[str]:
@@ -245,147 +362,166 @@ def _fallback_hyq(
     return HyQResult(summary=summary, questions=normalized_questions)
 
 
-class HyQGenerator:
+def _fallback_search_optimization(chunk_text: str) -> dict[str, list[str]]:
+    entities, organizations = _split_named_phrases(chunk_text)
+    dates = _extract_dates(chunk_text)
+    document_codes = extract_document_codes(chunk_text)
+    keywords = _build_fallback_keywords(
+        entities=entities,
+        organizations=organizations,
+        dates=dates,
+        document_codes=document_codes,
+    )
+
+    return {
+        "keywords": keywords,
+        "entities": entities[:15],
+        "organizations": organizations[:15],
+        "dates": dates[:15],
+        "document_codes": document_codes[:15],
+    }
+
+
+class MetadataBundleGenerator:
     def __init__(self) -> None:
         self.summary_words = max(20, settings.hyq_summary_words)
         self.question_count = max(1, settings.hyq_questions_per_chunk)
-        self.use_llm = bool(settings.hyq_use_llm)
-        self.model_name = settings.hyq_model or settings.llm_model
+        self.use_llm = bool(settings.metadata_use_llm or settings.hyq_use_llm)
+        self.model_name = settings.metadata_model or settings.hyq_model or settings.llm_model
         self.base_url = settings.ollama_base_url
-        self._llm: ChatOllama | None = None
+        self.num_thread = max(1, settings.metadata_ollama_num_thread)
+        self.num_predict = max(64, settings.metadata_ollama_num_predict)
+        self._thread_local = threading.local()
         self._llm_disabled = not self.use_llm
 
     def _get_llm(self) -> ChatOllama | None:
         if self._llm_disabled:
             return None
 
-        if self._llm is None:
+        llm = getattr(self._thread_local, "llm", None)
+        if llm is None:
             if not self.model_name:
                 self._llm_disabled = True
                 return None
-            self._llm = ChatOllama(
+
+            llm = ChatOllama(
                 model=self.model_name,
                 base_url=self.base_url,
                 temperature=0.0,
+                num_thread=self.num_thread,
+                num_predict=self.num_predict,
             )
+            self._thread_local.llm = llm
 
-        return self._llm
+        return llm
 
-    def _parse_llm_json(self, raw_output: str) -> HyQResult | None:
-        start = raw_output.find("{")
-        end = raw_output.rfind("}")
-        if start < 0 or end <= start:
-            return None
+    def _parse_llm_json(self, raw_output: str) -> tuple[dict[str, list[str]] | None, HyQResult | None]:
+        payload = _extract_json_payload(raw_output)
+        if payload is None:
+            return None, None
 
-        try:
-            payload = json.loads(raw_output[start : end + 1])
-        except json.JSONDecodeError:
-            return None
+        search_payload: dict[str, Any] | None = None
+        hyq_payload: dict[str, Any] | None = None
 
-        if not isinstance(payload, dict):
-            return None
+        nested_search = payload.get("search_optimization")
+        if isinstance(nested_search, dict):
+            search_payload = nested_search
+        elif any(key in payload for key in ("keywords", "entities", "organizations", "dates", "document_codes")):
+            search_payload = payload
 
-        summary = _word_limited_text(str(payload.get("summary") or ""), self.summary_words)
-        raw_questions = payload.get("questions")
-        if not isinstance(raw_questions, list):
-            return None
+        nested_hyq = payload.get("hyq")
+        if isinstance(nested_hyq, dict):
+            hyq_payload = nested_hyq
+        elif any(key in payload for key in ("summary", "questions")):
+            hyq_payload = payload
 
-        cleaned_questions = [str(item) for item in raw_questions if str(item).strip()]
-        deduped = _dedupe_keep_order(cleaned_questions, limit=self.question_count)
-        if not summary or not deduped:
-            return None
+        parsed_search = (
+            _parse_search_optimization_payload(search_payload)
+            if isinstance(search_payload, dict)
+            else None
+        )
+        parsed_hyq = (
+            _parse_hyq_payload(
+                hyq_payload,
+                summary_words=self.summary_words,
+                question_count=self.question_count,
+            )
+            if isinstance(hyq_payload, dict)
+            else None
+        )
 
-        while len(deduped) < self.question_count:
-            deduped.append(f"Thông tin chính của đoạn này là gì? ({len(deduped) + 1})")
-
-        normalized_questions = [question if question.endswith("?") else f"{question}?" for question in deduped]
-        return HyQResult(summary=summary, questions=normalized_questions)
+        return parsed_search, parsed_hyq
 
     def _generate_with_llm(
         self,
         *,
         chunk_text: str,
         context: dict[str, str | None],
-        search_optimization: dict[str, list[str]],
-    ) -> HyQResult | None:
+        fallback_search: dict[str, list[str]],
+    ) -> tuple[dict[str, list[str]] | None, HyQResult | None]:
         llm = self._get_llm()
         if llm is None:
-            return None
+            return None, None
 
         try:
             prompt = (
-                "Bạn đang chuẩn bị child chunks cho truy xuất hybrid RAG. "
-                "Chỉ trả về DUY NHẤT một đối tượng JSON với các trường: summary (string) và questions (array). "
-                f"summary phải <= {self.summary_words} từ. "
-                f"questions phải chứa chính xác {self.question_count} câu hỏi tiếng Việt có dấu. "
+                "Bạn đang chuẩn bị metadata cho hybrid RAG. "
+                "Chỉ trả về DUY NHẤT một đối tượng JSON có 2 trường: "
+                "search_optimization (object) và hyq (object). "
+                "search_optimization phải gồm: keywords, entities, organizations, dates, document_codes (đều là array string). "
+                f"hyq.summary phải <= {self.summary_words} từ. "
+                f"hyq.questions phải chứa chính xác {self.question_count} câu hỏi tiếng Việt có dấu. "
                 "Không dùng markdown fences.\n\n"
                 f"h2: {context.get('h2') or ''}\n"
                 f"h3: {context.get('h3') or ''}\n"
-                f"document_codes: {', '.join(search_optimization.get('document_codes') or [])}\n"
-                f"organizations: {', '.join(search_optimization.get('organizations') or [])}\n"
-                f"entities: {', '.join(search_optimization.get('entities') or [])}\n"
-                f"dates: {', '.join(search_optimization.get('dates') or [])}\n\n"
+                f"seed_keywords: {', '.join(fallback_search.get('keywords') or [])}\n"
+                f"seed_document_codes: {', '.join(fallback_search.get('document_codes') or [])}\n"
+                f"seed_organizations: {', '.join(fallback_search.get('organizations') or [])}\n"
+                f"seed_entities: {', '.join(fallback_search.get('entities') or [])}\n"
+                f"seed_dates: {', '.join(fallback_search.get('dates') or [])}\n\n"
                 f"chunk_text:\n{chunk_text}"
             )
             response = llm.invoke(prompt)
         except Exception:
             self._llm_disabled = True
-            return None
+            return None, None
 
         raw_output = str(getattr(response, "content", response) or "")
-        parsed = self._parse_llm_json(raw_output)
-        if parsed is None:
-            return None
-        return parsed
+        return self._parse_llm_json(raw_output)
 
     def generate(
         self,
         *,
         chunk_text: str,
         context: dict[str, str | None],
-        search_optimization: dict[str, list[str]],
-    ) -> HyQResult:
-        if self.use_llm:
-            llm_result = self._generate_with_llm(
-                chunk_text=chunk_text,
-                context=context,
-                search_optimization=search_optimization,
-            )
-            if llm_result is not None:
-                return llm_result
+        fallback_search: dict[str, list[str]],
+    ) -> tuple[dict[str, list[str]], HyQResult | None]:
+        if not self.use_llm:
+            return fallback_search, None
 
-        return _fallback_hyq(
+        llm_search, llm_hyq = self._generate_with_llm(
             chunk_text=chunk_text,
             context=context,
-            search_optimization=search_optimization,
-            summary_words=self.summary_words,
-            question_count=self.question_count,
+            fallback_search=fallback_search,
         )
 
+        if llm_search is None:
+            return fallback_search, llm_hyq
 
-_hyq_generator: HyQGenerator | None = None
-
-
-def _get_hyq_generator() -> HyQGenerator:
-    global _hyq_generator
-
-    if _hyq_generator is None:
-        _hyq_generator = HyQGenerator()
-
-    return _hyq_generator
+        merged_search = _merge_search_optimization(llm_search, fallback_search)
+        return merged_search, llm_hyq
 
 
-def _extract_search_optimization(chunk_text: str) -> dict[str, list[str]]:
-    entities, organizations = _split_named_phrases(chunk_text)
-    dates = _extract_dates(chunk_text)
-    document_codes = extract_document_codes(chunk_text)
+_metadata_bundle_generator: MetadataBundleGenerator | None = None
 
-    return {
-        "entities": entities[:15],
-        "organizations": organizations[:15],
-        "dates": dates[:15],
-        "document_codes": document_codes[:15],
-    }
+
+def _get_metadata_bundle_generator() -> MetadataBundleGenerator:
+    global _metadata_bundle_generator
+
+    if _metadata_bundle_generator is None:
+        _metadata_bundle_generator = MetadataBundleGenerator()
+
+    return _metadata_bundle_generator
 
 
 def build_structured_chunk_metadata(
@@ -398,15 +534,25 @@ def build_structured_chunk_metadata(
     chunk_text: str,
 ) -> dict[str, Any]:
     context = _extract_context(raw_metadata)
-    search_optimization = _extract_search_optimization(chunk_text)
+    fallback_search = _fallback_search_optimization(chunk_text)
+    search_optimization, llm_hyq = _get_metadata_bundle_generator().generate(
+        chunk_text=chunk_text,
+        context=context,
+        fallback_search=fallback_search,
+    )
 
     hyq_result = HyQResult(summary="", questions=[])
     if settings.hyq_enabled:
-        hyq_result = _get_hyq_generator().generate(
-            chunk_text=chunk_text,
-            context=context,
-            search_optimization=search_optimization,
-        )
+        if llm_hyq is not None:
+            hyq_result = llm_hyq
+        else:
+            hyq_result = _fallback_hyq(
+                chunk_text=chunk_text,
+                context=context,
+                search_optimization=search_optimization,
+                summary_words=settings.hyq_summary_words,
+                question_count=settings.hyq_questions_per_chunk,
+            )
 
     structured_metadata: dict[str, Any] = {
         "chunk_id": f"doc_{document_id:02d}_chunk_{chunk_index:04d}",
@@ -475,7 +621,7 @@ def build_keyword_blob(metadata: dict[str, Any], content: str) -> str:
 
     search_optimization = metadata.get("search_optimization")
     if isinstance(search_optimization, dict):
-        for key in ("entities", "organizations", "dates", "document_codes"):
+        for key in ("keywords", "entities", "organizations", "dates", "document_codes"):
             value = search_optimization.get(key)
             if isinstance(value, list):
                 parts.extend(str(item) for item in value)

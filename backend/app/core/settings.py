@@ -27,9 +27,15 @@ class Settings:
     retriever_k: int
     llm_model: str
     llm_temperature: float
+    ollama_num_thread: int
     hyq_enabled: bool
     hyq_use_llm: bool
     hyq_model: str
+    metadata_use_llm: bool
+    metadata_model: str
+    metadata_ollama_num_thread: int
+    metadata_ollama_num_predict: int
+    metadata_max_workers: int
     hyq_summary_words: int
     hyq_questions_per_chunk: int
     hybrid_vector_rrf_weight: float
@@ -103,6 +109,13 @@ def get_settings() -> Settings:
 
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
 
+    hyq_use_llm = _bool_env("HYQ_USE_LLM", False)
+    hyq_model = _string_env("HYQ_MODEL", "")
+    ollama_num_thread = max(1, _int_env("OLLAMA_NUM_THREAD", 8))
+    metadata_ollama_num_thread = max(1, _int_env("METADATA_OLLAMA_NUM_THREAD", ollama_num_thread))
+    metadata_ollama_num_predict = max(64, _int_env("METADATA_OLLAMA_NUM_PREDICT", 256))
+    metadata_max_workers = max(1, _int_env("METADATA_MAX_WORKERS", 4))
+
     return Settings(
         app_name=os.getenv("APP_NAME", "RAG App Backend"),
         app_env=os.getenv("APP_ENV", "development"),
@@ -122,9 +135,15 @@ def get_settings() -> Settings:
         retriever_k=_int_env("RETRIEVER_K", 4),
         llm_model=_string_env("LLM_MODEL", "llama3.1:8b"),
         llm_temperature=_float_env("LLM_TEMPERATURE", 0.0),
+        ollama_num_thread=ollama_num_thread,
         hyq_enabled=_bool_env("HYQ_ENABLED", True),
-        hyq_use_llm=_bool_env("HYQ_USE_LLM", False),
-        hyq_model=_string_env("HYQ_MODEL", ""),
+        hyq_use_llm=hyq_use_llm,
+        hyq_model=hyq_model,
+        metadata_use_llm=_bool_env("METADATA_USE_LLM", hyq_use_llm),
+        metadata_model=_string_env("METADATA_MODEL", hyq_model),
+        metadata_ollama_num_thread=metadata_ollama_num_thread,
+        metadata_ollama_num_predict=metadata_ollama_num_predict,
+        metadata_max_workers=metadata_max_workers,
         hyq_summary_words=_int_env("HYQ_SUMMARY_WORDS", 50),
         hyq_questions_per_chunk=_int_env("HYQ_QUESTIONS_PER_CHUNK", 3),
         hybrid_vector_rrf_weight=_float_env("HYBRID_VECTOR_RRF_WEIGHT", 1.0),
