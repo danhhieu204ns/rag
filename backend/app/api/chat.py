@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -25,6 +26,20 @@ from ..services.rag_runtime import (
 )
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+logger = logging.getLogger(__name__)
+
+
+def _emit_query_progress(message: str, *args: object) -> None:
+    text = message % args if args else message
+    logger.info(text)
+    print(text, flush=True)
+
+
+def _preview_text(value: str, limit: int = 120) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 
 def _build_title_from_first_question(message: str) -> str:
@@ -111,6 +126,15 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
     """Run one RAG query, save both user and assistant messages."""
 
     user_text = payload.message.strip()
+    top_k = payload.top_k or settings.retriever_k
+
+    _emit_query_progress(
+        "[chat.query] Start request: session_id=%s, top_k=%d, document_filter=%s, message='%s'",
+        payload.session_id,
+        top_k,
+        payload.document_ids or [],
+        _preview_text(user_text),
+    )
 
     session: ChatSession | None = None
     if payload.session_id is not None:
@@ -125,6 +149,7 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
         db.add(session)
         db.commit()
         db.refresh(session)
+        _emit_query_progress("[chat.query] Created new session: session_id=%d", session.id)
     else:
         first_user_message_exists = (
             db.query(ChatMessage.id)
@@ -138,6 +163,8 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
             db.commit()
             db.refresh(session)
 
+        _emit_query_progress("[chat.query] Use existing session: session_id=%d", session.id)
+
     user_message = ChatMessage(
         session_id=session.id,
         role="user",
@@ -146,6 +173,7 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
     )
     db.add(user_message)
     db.commit()
+    _emit_query_progress("[chat.query] Saved user message: session_id=%d", session.id)
 
     history = (
         db.query(ChatMessage)
@@ -153,14 +181,15 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
         .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
         .all()
     )
+    _emit_query_progress("[chat.query] Loaded history messages: count=%d", len(history))
 
-    top_k = payload.top_k or settings.retriever_k
     retrieved_docs = similarity_search(
         user_text,
         top_k=top_k,
         db=db,
         document_ids=payload.document_ids,
     )
+    _emit_query_progress("[chat.query] Retrieved context docs: count=%d", len(retrieved_docs))
 
     try:
         answer = generate_answer(
@@ -168,10 +197,14 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
             context_docs=retrieved_docs,
             history_messages=history,
         )
+        _emit_query_progress("[chat.query] Generated answer: length=%d chars", len(answer))
     except Exception as exc:  # pragma: no cover - external API/network failure
+        _emit_query_progress("[chat.query] Generate answer failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     sources = build_sources(retrieved_docs)
+    _emit_query_progress("[chat.query] Built sources payload: count=%d", len(sources))
+
     assistant_message = ChatMessage(
         session_id=session.id,
         role="assistant",
@@ -183,6 +216,7 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
     session.updated_at = datetime.utcnow()
     db.add(session)
     db.commit()
+    _emit_query_progress("[chat.query] Completed request: session_id=%d", session.id)
 
     return ChatQueryResponse(
         session_id=session.id,

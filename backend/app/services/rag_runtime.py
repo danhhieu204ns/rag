@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
+from datetime import UTC, datetime
 import json
 import logging
+from pathlib import Path
 import re
 import time
 import unicodedata
+from uuid import uuid4
 from collections import defaultdict
 from typing import Any
 
@@ -21,10 +25,135 @@ from .chunk_metadata import build_hyq_children, build_keyword_blob, extract_docu
 
 logger = logging.getLogger(__name__)
 _EMBED_BATCH_SIZE = 16
+_QUERY_LOG_FILE_NAME = "query_trace.json"
+_LEGACY_QUERY_LOG_FILE_NAME = "query_trace.jsonl"
 
 _embeddings: Embeddings | None = None
 _qdrant_client: QdrantClient | None = None
 _llm: ChatOllama | None = None
+_query_trace_id_ctx: ContextVar[str] = ContextVar("query_trace_id", default="-")
+
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(item) for item in value]
+    return str(value)
+
+
+def _query_log_file_path() -> Path:
+    log_dir = settings.storage_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / _QUERY_LOG_FILE_NAME
+
+
+def _legacy_query_log_file_path() -> Path:
+    log_dir = settings.storage_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / _LEGACY_QUERY_LOG_FILE_NAME
+
+
+def _load_query_log_entries(log_file: Path) -> list[dict[str, Any]]:
+    if log_file.exists():
+        try:
+            raw = log_file.read_text(encoding="utf-8").strip()
+            if not raw:
+                return []
+
+            payload = json.loads(raw)
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+            if isinstance(payload, dict):
+                entries = payload.get("entries")
+                if isinstance(entries, list):
+                    return [item for item in entries if isinstance(item, dict)]
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    legacy_log_file = _legacy_query_log_file_path()
+    if not legacy_log_file.exists():
+        return []
+
+    migrated_entries: list[dict[str, Any]] = []
+    try:
+        for raw_line in legacy_log_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                migrated_entries.append(row)
+    except OSError:
+        return []
+
+    return migrated_entries
+
+
+def _append_query_log_entry(event: str, details: dict[str, Any] | None = None) -> None:
+    trace_id = _query_trace_id_ctx.get()
+    payload: dict[str, Any] = {
+        "ts_utc": datetime.now(UTC).isoformat(),
+        "trace_id": trace_id,
+        "event": event,
+    }
+
+    if details:
+        payload["details"] = _json_safe_value(details)
+
+    try:
+        log_file = _query_log_file_path()
+        entries = _load_query_log_entries(log_file)
+        entries.append(payload)
+        log_file.write_text(
+            json.dumps({"entries": entries}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning("[query][file-log] Failed to write query log file: %s", exc)
+
+
+def _emit_query_progress(
+    message: str,
+    *args: object,
+    event: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    raw_text = message % args if args else message
+    trace_id = _query_trace_id_ctx.get()
+
+    text = raw_text
+    if trace_id and trace_id != "-":
+        text = f"[trace={trace_id}] {raw_text}"
+
+    logger.info(text)
+    print(text, flush=True)
+
+    _append_query_log_entry(
+        event=event or "progress",
+        details={
+            "message": raw_text,
+            **(details or {}),
+        },
+    )
+
+
+def _preview_text(value: str, limit: int = 120) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _preview_ids(values: list[int], limit: int = 8) -> list[int | str]:
+    if len(values) <= limit:
+        return values
+    return [*values[:limit], f"+{len(values) - limit} more"]
 
 
 def _to_int(value: object) -> int | None:
@@ -134,21 +263,66 @@ def _serialize_qdrant_payload(metadata: dict[str, object], child_text: str) -> d
 
 def _search_qdrant_children(query: str, limit: int) -> list[Document]:
     if limit <= 0:
+        _emit_query_progress(
+            "[query][qdrant] Skip child search because limit=%d",
+            limit,
+            event="qdrant_child_search_skip",
+            details={"limit": limit},
+        )
         return []
 
     client = _get_qdrant_client()
     if not _qdrant_collection_exists(client):
+        _emit_query_progress(
+            "[query][qdrant] Collection '%s' not found. Returning 0 child hits.",
+            settings.qdrant_collection_name,
+            event="qdrant_collection_missing",
+            details={"collection": settings.qdrant_collection_name},
+        )
         return []
 
-    query_vector = get_embeddings().embed_query(query)
-    points = client.search(
-        collection_name=settings.qdrant_collection_name,
-        query_vector=query_vector,
-        limit=limit,
-        with_payload=True,
+    _emit_query_progress(
+        "[query][qdrant] Start child search: limit=%d, query='%s'",
+        limit,
+        _preview_text(query),
+        event="qdrant_child_search_start",
+        details={
+            "collection": settings.qdrant_collection_name,
+            "limit": limit,
+            "query_preview": _preview_text(query),
+        },
     )
 
+    query_vector = get_embeddings().embed_query(query)
+    _emit_query_progress(
+        "[query][qdrant] Query vector dimension=%d",
+        len(query_vector),
+        event="qdrant_query_vector",
+        details={"vector_dim": len(query_vector)},
+    )
+
+    points: list[object]
+    if hasattr(client, "query_points"):
+        query_response = client.query_points(
+            collection_name=settings.qdrant_collection_name,
+            query=query_vector,
+            limit=limit,
+            with_payload=True,
+        )
+        points = list(getattr(query_response, "points", []) or [])
+    else:
+        # Backward compatibility for older qdrant-client versions.
+        points = list(
+            client.search(
+                collection_name=settings.qdrant_collection_name,
+                query_vector=query_vector,
+                limit=limit,
+                with_payload=True,
+            )
+        )
+
     documents: list[Document] = []
+    point_summaries: list[dict[str, object]] = []
     for point in points:
         payload = point.payload if isinstance(point.payload, dict) else {}
         child_text = str(payload.get("child_text") or "")
@@ -158,6 +332,26 @@ def _search_qdrant_children(query: str, limit: int) -> list[Document]:
             if key != "child_text"
         }
         documents.append(Document(page_content=child_text, metadata=metadata))
+
+        point_summaries.append(
+            {
+                "score": _to_float(getattr(point, "score", None)),
+                "parent_chunk_id": _to_int(metadata.get("parent_chunk_id")),
+                "document_id": _to_int(metadata.get("document_id")),
+                "child_type": str(metadata.get("child_type") or ""),
+            }
+        )
+
+    _emit_query_progress(
+        "[query][qdrant] Child search done: hits=%d, preview=%s",
+        len(documents),
+        point_summaries[:5],
+        event="qdrant_child_search_done",
+        details={
+            "hit_count": len(documents),
+            "points_preview": point_summaries[:5],
+        },
+    )
 
     return documents
 
@@ -269,16 +463,59 @@ def _chunk_to_context_document(
     return Document(page_content=chunk.content, metadata=metadata)
 
 
+def _chunk_to_debug_payload(
+    chunk: DocumentChunk,
+    *,
+    rank: int | None = None,
+    score: float | None = None,
+    retrieval_mode: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "chunk_id": chunk.id,
+        "document_id": chunk.document_id,
+        "chunk_index": chunk.chunk_index,
+        "source_page": chunk.source_page,
+        "source_kind": chunk.source_kind,
+        "content": chunk.content,
+        "source_metadata": _compact_source_metadata(chunk.source_metadata_json),
+    }
+    if rank is not None:
+        payload["rank"] = rank
+    if score is not None:
+        payload["score"] = score
+    if retrieval_mode is not None:
+        payload["retrieval_mode"] = retrieval_mode
+    return payload
+
+
 def _vector_parent_candidates(
     query: str,
     top_k: int,
     document_ids: list[int] | None,
 ) -> tuple[list[int], dict[int, str]]:
     if not load_index_if_available():
+        _emit_query_progress(
+            "[query][vector] Skip vector candidates because index is unavailable",
+            event="semantic_candidates_skip",
+            details={"reason": "index_unavailable"},
+        )
         return [], {}
 
     probe_multiplier = max(1, settings.hybrid_probe_multiplier)
     probe_k = max(top_k * probe_multiplier, top_k)
+    _emit_query_progress(
+        "[query][vector] Build vector candidates: top_k=%d, probe_k=%d, document_filter=%s",
+        top_k,
+        probe_k,
+        document_ids or [],
+        event="semantic_candidates_start",
+        details={
+            "top_k": top_k,
+            "probe_k": probe_k,
+            "document_filter": document_ids or [],
+        },
+    )
+
     children = _search_qdrant_children(query, limit=probe_k)
 
     wanted_docs = {int(doc_id) for doc_id in document_ids} if document_ids else None
@@ -307,6 +544,19 @@ def _vector_parent_candidates(
 
         if len(parent_ids) >= probe_k:
             break
+
+    _emit_query_progress(
+        "[query][vector] Parent candidates done: count=%d, ids=%s, child_type_preview=%s",
+        len(parent_ids),
+        _preview_ids(parent_ids),
+        dict(list(parent_child_type.items())[:5]),
+        event="semantic_candidates_done",
+        details={
+            "semantic_parent_count": len(parent_ids),
+            "semantic_parent_ids": parent_ids,
+            "semantic_child_type_preview": dict(list(parent_child_type.items())[:5]),
+        },
+    )
 
     return parent_ids, parent_child_type
 
@@ -363,7 +613,29 @@ def _keyword_parent_candidates(
 ) -> list[int]:
     query_terms = _lookup_terms(query)
     query_codes = [code.upper() for code in extract_document_codes(query)]
+    _emit_query_progress(
+        "[query][keyword] Start keyword candidates: terms=%d, codes=%d, top_k=%d, document_filter=%s",
+        len(query_terms),
+        len(query_codes),
+        top_k,
+        document_ids or [],
+        event="keyword_candidates_start",
+        details={
+            "term_count": len(query_terms),
+            "code_count": len(query_codes),
+            "query_terms": query_terms[:20],
+            "query_codes": query_codes[:20],
+            "top_k": top_k,
+            "document_filter": document_ids or [],
+        },
+    )
+
     if not query_terms and not query_codes:
+        _emit_query_progress(
+            "[query][keyword] Skip keyword candidates because query has no lookup terms/codes",
+            event="keyword_candidates_skip",
+            details={"reason": "no_terms_or_codes"},
+        )
         return []
 
     chunk_query = db.query(DocumentChunk)
@@ -372,6 +644,7 @@ def _keyword_parent_candidates(
     candidates = chunk_query.order_by(DocumentChunk.id.asc()).all()
 
     scored: list[tuple[int, float]] = []
+    scored_chunks: dict[int, DocumentChunk] = {}
     for candidate in candidates:
         metadata = _compact_source_metadata(candidate.source_metadata_json)
         score = _keyword_match_score(
@@ -384,12 +657,48 @@ def _keyword_parent_candidates(
             continue
 
         scored.append((candidate.id, score))
+        scored_chunks[candidate.id] = candidate
 
     scored.sort(key=lambda item: (item[1], -item[0]), reverse=True)
 
     probe_multiplier = max(1, settings.hybrid_probe_multiplier)
     probe_k = max(top_k * probe_multiplier, top_k)
-    return [chunk_id for chunk_id, _ in scored[:probe_k]]
+    selected = [chunk_id for chunk_id, _ in scored[:probe_k]]
+    selected_details: list[dict[str, Any]] = []
+    for rank, (chunk_id, score) in enumerate(scored[:probe_k], start=1):
+        chunk = scored_chunks.get(chunk_id)
+        if chunk is None:
+            continue
+        selected_details.append(
+            _chunk_to_debug_payload(
+                chunk,
+                rank=rank,
+                score=score,
+                retrieval_mode="keyword",
+            )
+        )
+
+    _emit_query_progress(
+        "[query][keyword] Parent candidates done: matched=%d, selected=%d, top_preview=%s",
+        len(scored),
+        len(selected),
+        scored[:5],
+        event="keyword_candidates_done",
+        details={
+            "keyword_matched_count": len(scored),
+            "keyword_selected_count": len(selected),
+            "keyword_selected_parent_ids": selected,
+            "keyword_top_scores": [
+                {
+                    "score": score,
+                    "content": (scored_chunks.get(chunk_id).content if scored_chunks.get(chunk_id) else ""),
+                }
+                for chunk_id, score in scored[:20]
+            ],
+            "keyword_selected_chunks": selected_details,
+        },
+    )
+    return selected
 
 
 def _rrf_merge(
@@ -398,6 +707,11 @@ def _rrf_merge(
     top_k: int,
 ) -> tuple[list[int], dict[int, float]]:
     if not vector_ids and not keyword_ids:
+        _emit_query_progress(
+            "[query][rrf] Skip merge because vector_ids and keyword_ids are empty",
+            event="rrf_merge_skip",
+            details={"reason": "empty_inputs"},
+        )
         return [], {}
 
     rrf_k = max(1, settings.hybrid_rrf_k)
@@ -411,6 +725,23 @@ def _rrf_merge(
 
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     merged_ids = [chunk_id for chunk_id, _ in ranked[:top_k]]
+    _emit_query_progress(
+        "[query][rrf] Merge done: vector_count=%d, keyword_count=%d, merged=%s, score_preview=%s",
+        len(vector_ids),
+        len(keyword_ids),
+        _preview_ids(merged_ids),
+        ranked[:5],
+        event="rrf_merge_done",
+        details={
+            "semantic_parent_ids": vector_ids,
+            "keyword_parent_ids": keyword_ids,
+            "rrf_merged_parent_ids": merged_ids,
+            "rrf_score_preview": [
+                {"chunk_id": chunk_id, "score": score}
+                for chunk_id, score in ranked[:20]
+            ],
+        },
+    )
     return merged_ids, scores
 
 
@@ -527,51 +858,186 @@ def similarity_search(
 ) -> list[Document]:
     """Search relevant parent chunks using hybrid (vector + keyword) retrieval."""
 
-    if not load_index_if_available():
-        return []
-
-    if db is None:
-        return _search_qdrant_children(query, limit=top_k)
-
-    vector_parent_ids, parent_child_type = _vector_parent_candidates(
-        query,
-        top_k,
-        document_ids,
-    )
-    keyword_parent_ids = _keyword_parent_candidates(
-        query,
-        top_k,
-        db,
-        document_ids,
-    )
-
-    merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, top_k)
-    if not merged_parent_ids:
-        return []
-
-    chunks = _load_chunks_by_ids(db, merged_parent_ids)
-    vector_set = set(vector_parent_ids)
-    keyword_set = set(keyword_parent_ids)
-
-    results: list[Document] = []
-    for chunk in chunks:
-        if chunk.id in vector_set and chunk.id in keyword_set:
-            retrieval_mode = "hybrid"
-        elif chunk.id in keyword_set:
-            retrieval_mode = "keyword"
-        else:
-            retrieval_mode = "vector"
-
-        results.append(
-            _chunk_to_context_document(
-                chunk,
-                retrieval_mode=retrieval_mode,
-                retrieval_score=scores.get(chunk.id),
-                child_type=parent_child_type.get(chunk.id),
-            )
+    trace_id = f"q-{int(time.time() * 1000)}-{uuid4().hex[:8]}"
+    token = _query_trace_id_ctx.set(trace_id)
+    try:
+        _emit_query_progress(
+            "[query] Start similarity_search: top_k=%d, db_mode=%s, document_filter=%s, query='%s'",
+            top_k,
+            "hybrid" if db is not None else "vector_only",
+            document_ids or [],
+            _preview_text(query),
+            event="similarity_search_start",
+            details={
+                "top_k": top_k,
+                "db_mode": "hybrid" if db is not None else "vector_only",
+                "document_filter": document_ids or [],
+                "query_preview": _preview_text(query),
+            },
         )
 
-    return results[:top_k]
+        if not load_index_if_available():
+            _emit_query_progress(
+                "[query] similarity_search stop: index not available",
+                event="similarity_search_stop",
+                details={"reason": "index_unavailable"},
+            )
+            return []
+
+        if db is None:
+            vector_only_results = _search_qdrant_children(query, limit=top_k)
+            _emit_query_progress(
+                "[query] similarity_search done (vector_only): result_count=%d",
+                len(vector_only_results),
+                event="similarity_search_done_vector_only",
+                details={
+                    "result_count": len(vector_only_results),
+                    "result_preview": [
+                        {
+                            "parent_chunk_id": _to_int(item.metadata.get("parent_chunk_id")),
+                            "document_id": _to_int(item.metadata.get("document_id")),
+                            "child_type": str(item.metadata.get("child_type") or ""),
+                        }
+                        for item in vector_only_results[:20]
+                    ],
+                },
+            )
+            return vector_only_results
+
+        vector_parent_ids, parent_child_type = _vector_parent_candidates(
+            query,
+            top_k,
+            document_ids,
+        )
+        keyword_parent_ids = _keyword_parent_candidates(
+            query,
+            top_k,
+            db,
+            document_ids,
+        )
+
+        semantic_chunk_rows = _load_chunks_by_ids(db, vector_parent_ids)
+        keyword_chunk_rows = _load_chunks_by_ids(db, keyword_parent_ids)
+        semantic_chunk_by_id = {item.id: item for item in semantic_chunk_rows}
+        keyword_chunk_by_id = {item.id: item for item in keyword_chunk_rows}
+
+        semantic_chunk_details: list[dict[str, Any]] = []
+        for rank, chunk_id in enumerate(vector_parent_ids, start=1):
+            chunk = semantic_chunk_by_id.get(chunk_id)
+            if chunk is None:
+                continue
+            semantic_chunk_details.append(
+                _chunk_to_debug_payload(
+                    chunk,
+                    rank=rank,
+                    retrieval_mode="semantic",
+                )
+            )
+
+        keyword_chunk_details: list[dict[str, Any]] = []
+        for rank, chunk_id in enumerate(keyword_parent_ids, start=1):
+            chunk = keyword_chunk_by_id.get(chunk_id)
+            if chunk is None:
+                continue
+            keyword_chunk_details.append(
+                _chunk_to_debug_payload(
+                    chunk,
+                    rank=rank,
+                    retrieval_mode="keyword",
+                )
+            )
+
+        _emit_query_progress(
+            "[query] Candidate chunk details: semantic=%d, keyword=%d",
+            len(semantic_chunk_details),
+            len(keyword_chunk_details),
+            event="candidate_chunk_details",
+            details={
+                "semantic_chunks": semantic_chunk_details,
+                "keyword_chunks": keyword_chunk_details,
+            },
+        )
+
+        merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, top_k)
+        if not merged_parent_ids:
+            _emit_query_progress(
+                "[query] similarity_search stop: no merged parent ids",
+                event="similarity_search_stop",
+                details={"reason": "no_merged_parent_ids"},
+            )
+            return []
+
+        chunks = _load_chunks_by_ids(db, merged_parent_ids)
+        vector_set = set(vector_parent_ids)
+        keyword_set = set(keyword_parent_ids)
+
+        results: list[Document] = []
+        for chunk in chunks:
+            if chunk.id in vector_set and chunk.id in keyword_set:
+                retrieval_mode = "hybrid"
+            elif chunk.id in keyword_set:
+                retrieval_mode = "keyword"
+            else:
+                retrieval_mode = "vector"
+
+            results.append(
+                _chunk_to_context_document(
+                    chunk,
+                    retrieval_mode=retrieval_mode,
+                    retrieval_score=scores.get(chunk.id),
+                    child_type=parent_child_type.get(chunk.id),
+                )
+            )
+
+        final_results = results[:top_k]
+        mode_counts: dict[str, int] = defaultdict(int)
+        for item in final_results:
+            mode = str(item.metadata.get("retrieval_mode") or "unknown")
+            mode_counts[mode] += 1
+
+        final_chunk_ids = [
+            _to_int(item.metadata.get("chunk_id")) or -1
+            for item in final_results
+        ]
+        final_chunk_details: list[dict[str, Any]] = []
+        for rank, item in enumerate(final_results, start=1):
+            final_chunk_details.append(
+                {
+                    "rank": rank,
+                    "chunk_id": _to_int(item.metadata.get("chunk_id")),
+                    "document_id": _to_int(item.metadata.get("document_id")),
+                    "chunk_index": _to_int(item.metadata.get("chunk_index")),
+                    "source_page": _to_int(item.metadata.get("source_page")),
+                    "source_kind": str(item.metadata.get("source_kind") or ""),
+                    "retrieval_mode": str(item.metadata.get("retrieval_mode") or ""),
+                    "retrieval_score": _to_float(item.metadata.get("retrieval_score")),
+                    "child_type": str(item.metadata.get("child_type") or ""),
+                    "source_metadata": item.metadata.get("source_metadata"),
+                    "content": item.page_content,
+                }
+            )
+
+        _emit_query_progress(
+            "[query] similarity_search done: parent_chunks=%d, final_results=%d, modes=%s, chunk_ids=%s",
+            len(chunks),
+            len(final_results),
+            dict(mode_counts),
+            _preview_ids(final_chunk_ids),
+            event="similarity_search_done",
+            details={
+                "semantic_parent_ids": vector_parent_ids,
+                "keyword_parent_ids": keyword_parent_ids,
+                "final_parent_count": len(chunks),
+                "final_result_count": len(final_results),
+                "final_modes": dict(mode_counts),
+                "final_chunk_ids": final_chunk_ids,
+                "final_chunks": final_chunk_details,
+            },
+        )
+
+        return final_results
+    finally:
+        _query_trace_id_ctx.reset(token)
 
 
 
