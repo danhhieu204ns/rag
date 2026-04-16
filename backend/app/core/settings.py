@@ -19,7 +19,6 @@ class Settings:
     ollama_base_url: str
     embedding_model_name: str
     pdf_parser_mode: str
-    chunking_method: str
     chunk_size: int
     chunk_overlap: int
     retriever_k: int
@@ -56,14 +55,6 @@ def _string_env(name: str, default: str) -> str:
     return cleaned or default
 
 
-def _chunking_method_env(default: str = "recursive") -> str:
-    raw_value = _string_env("CHUNKING_METHOD", default).lower()
-    allowed = {"recursive", "semantic"}
-    if raw_value not in allowed:
-        return default
-    return raw_value
-
-
 def _pdf_parser_mode_env(default: str = "legacy") -> str:
     raw_value = _string_env("PDF_PARSER_MODE", default).lower()
     allowed = {"legacy", "marker"}
@@ -98,7 +89,6 @@ def get_settings() -> Settings:
         ollama_base_url=ollama_base_url,
         embedding_model_name=_string_env("EMBEDDING_MODEL_NAME", "bge-m3"),
         pdf_parser_mode=_pdf_parser_mode_env(),
-        chunking_method=_chunking_method_env(),
         chunk_size=_int_env("CHUNK_SIZE", 500),
         chunk_overlap=_int_env("CHUNK_OVERLAP", 50),
         retriever_k=_int_env("RETRIEVER_K", 4),

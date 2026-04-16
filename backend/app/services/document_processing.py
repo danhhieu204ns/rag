@@ -3,19 +3,26 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
-from langchain_experimental.text_splitter import SemanticChunker
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 from ..core.settings import settings
 
 
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md"}
 _MARKER_PAGE_BREAK_PATTERN = re.compile(r"\n\n\{(?P<page_id>\d+)\}-+\n\n")
+_MARKDOWN_HEADERS_TO_SPLIT_ON = [
+    ("#", "h1"),
+    ("##", "h2"),
+    ("###", "h3"),
+    ("####", "h4"),
+    ("#####", "h5"),
+    ("######", "h6"),
+]
+_RECURSIVE_SEPARATORS = ["\n\n", "\n", ". ", ", ", " ", ""]
 _marker_models: dict[str, Any] | None = None
 
 
@@ -243,27 +250,47 @@ def _recursive_split(
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
+        separators=_RECURSIVE_SEPARATORS,
     )
     return splitter.split_documents(documents)
 
 
-def _semantic_split(
-    documents: list[Document],
-    chunk_size: int,
-    chunk_overlap: int,
-    embeddings: Embeddings,
-) -> list[Document]:
-    semantic_splitter = SemanticChunker(
-        embeddings,
-        breakpoint_threshold_type="percentile",
+def _markdown_header_split(documents: list[Document]) -> list[Document]:
+    splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=_MARKDOWN_HEADERS_TO_SPLIT_ON,
+        strip_headers=False,
     )
-    semantic_chunks = semantic_splitter.split_documents(documents)
 
-    if not semantic_chunks:
-        return _recursive_split(documents, chunk_size, chunk_overlap)
+    split_documents: list[Document] = []
+    for item in documents:
+        base_metadata = dict(item.metadata or {})
+        text = str(item.page_content or "")
+        if not text.strip():
+            continue
 
-    # Optional post-split cap keeps chunks bounded for vector indexing.
-    return _recursive_split(semantic_chunks, chunk_size, chunk_overlap)
+        header_documents = splitter.split_text(text)
+        if not header_documents:
+            split_documents.append(Document(page_content=text, metadata=base_metadata))
+            continue
+
+        for section in header_documents:
+            section_text = str(section.page_content or "").strip()
+            if not section_text:
+                continue
+
+            section_metadata = dict(section.metadata or {})
+            merged_metadata = dict(base_metadata)
+            if section_metadata:
+                merged_metadata["markdown_headers"] = section_metadata
+
+            split_documents.append(
+                Document(
+                    page_content=section_text,
+                    metadata=merged_metadata,
+                )
+            )
+
+    return split_documents
 
 
 def load_source_documents(file_path: Path) -> list[Document]:
@@ -286,15 +313,11 @@ def split_source_documents(
     documents: list[Document],
     chunk_size: int,
     chunk_overlap: int,
-    chunking_method: Literal["recursive", "semantic"] = "recursive",
-    embeddings: Embeddings | None = None,
 ) -> list[Document]:
-    """
-        Split loaded documents into chunks for embedding.
-    """
-    if chunking_method == "semantic":
-        if embeddings is None:
-            raise ValueError("Semantic chunking requires an embeddings instance.")
-        return _semantic_split(documents, chunk_size, chunk_overlap, embeddings)
+    """Split loaded documents into chunks for embedding."""
 
-    return _recursive_split(documents, chunk_size, chunk_overlap)
+    header_split_documents = _markdown_header_split(documents)
+    if not header_split_documents:
+        return []
+
+    return _recursive_split(header_split_documents, chunk_size, chunk_overlap)
