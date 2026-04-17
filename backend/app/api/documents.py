@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import hashlib
 import json
 import logging
 import shutil
@@ -16,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from ..core.settings import settings
 from ..db import get_db
-from ..models import AdminUser, Document, DocumentChunk
+from ..models import AdminUser, Document, DocumentChunk, DocumentIndexState
 from ..schemas import DocumentChunkListResponse, DocumentChunkRead, DocumentRead, DocumentUpdate, EmbedDocumentResponse
 from ..services.chunk_metadata import build_structured_chunk_metadata
 from ..services.document_processing import load_source_documents, split_source_documents
@@ -102,6 +104,17 @@ def _parse_source_metadata(raw_json: str | None) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     return payload
+
+
+def _compute_file_hash(file_path: Path) -> str:
+    digest = hashlib.sha256()
+    with file_path.open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 
@@ -315,7 +328,7 @@ def embed_document(
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
 ) -> EmbedDocumentResponse:
-    """Create chunks for one document and rebuild global Qdrant index."""
+    """Create chunks for one document and incrementally upsert vectors for that document."""
 
     document = db.get(Document, document_id)
     if document is None:
@@ -335,6 +348,29 @@ def embed_document(
     file_path = settings.uploads_dir / stored_filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Stored file does not exist.")
+
+    file_hash = _compute_file_hash(file_path)
+    existing_index_state = db.get(DocumentIndexState, document_id)
+    if (
+        existing_index_state is not None
+        and existing_index_state.file_hash == file_hash
+        and document.status == "embedded"
+    ):
+        parent_chunk_count = (
+            db.query(func.count(DocumentChunk.id))
+            .filter(DocumentChunk.document_id == document_id)
+            .scalar()
+            or 0
+        )
+        _emit_progress(
+            "[embed_document] Skip document_id=%s because file_hash is unchanged and already indexed.",
+            document_id,
+        )
+        return EmbedDocumentResponse(
+            document_id=document_id,
+            chunks_created=int(parent_chunk_count),
+            indexed_chunks=int(existing_index_state.indexed_child_chunks),
+        )
 
     try:
         loaded_documents = load_source_documents(file_path)
@@ -487,16 +523,25 @@ def embed_document(
                 ) from exc
             time.sleep(0.4 * (attempt + 1))
 
-    all_chunks = db.query(DocumentChunk).order_by(DocumentChunk.id.asc()).all()
+    document_chunks = (
+        db.query(DocumentChunk)
+        .filter(DocumentChunk.document_id == document_id)
+        .order_by(DocumentChunk.id.asc())
+        .all()
+    )
     _emit_progress(
-        "[embed_document] Rebuilding Qdrant from %d parent chunks after embedding document_id=%s",
-        len(all_chunks),
+        "[embed_document] Incremental upsert from %d parent chunks for document_id=%s",
+        len(document_chunks),
         document_id,
     )
     db.expunge_all()
     db.rollback()
     try:
-        indexed_count = rebuild_index_from_chunks(all_chunks)
+        if document_chunks:
+            indexed_count = rebuild_index_from_chunks(document_chunks)
+        else:
+            delete_vectors_by_document_id(document_id)
+            indexed_count = 0
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -508,6 +553,35 @@ def embed_document(
                 f"Root cause: {exc}"
             ),
         ) from exc
+
+    write_attempts = 3
+    for attempt in range(write_attempts):
+        try:
+            index_state = db.get(DocumentIndexState, document_id)
+            if index_state is None:
+                index_state = DocumentIndexState(
+                    document_id=document_id,
+                    file_hash=file_hash,
+                )
+
+            index_state.file_hash = file_hash
+            index_state.indexed_parent_chunks = len(document_chunks)
+            index_state.indexed_child_chunks = indexed_count
+            index_state.indexed_at = datetime.utcnow()
+            db.add(index_state)
+            db.commit()
+            break
+        except OperationalError as exc:
+            db.rollback()
+            if "database is locked" not in str(exc).lower() or attempt == write_attempts - 1:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Database is busy while saving index state. "
+                        "Please retry after a few seconds."
+                    ),
+                ) from exc
+            time.sleep(0.4 * (attempt + 1))
 
     elapsed = time.perf_counter() - started_at
     _emit_progress(
@@ -530,30 +604,85 @@ def rebuild_global_index(
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
 ) -> EmbedDocumentResponse:
-    """Rebuild global vector index from all saved chunks."""
+    """Incrementally index only pending documents (new or changed file_hash)."""
 
-    all_chunks = db.query(DocumentChunk).order_by(DocumentChunk.id.asc()).all()
+    documents = db.query(Document).order_by(Document.id.asc()).all()
+    indexed_state_rows = db.query(DocumentIndexState).all()
+    state_by_document_id = {row.document_id: row for row in indexed_state_rows}
+
+    pending: list[tuple[int, str]] = []
+    for document in documents:
+        file_path = settings.uploads_dir / document.stored_filename
+        if not file_path.exists():
+            continue
+
+        current_hash = _compute_file_hash(file_path)
+        tracked = state_by_document_id.get(document.id)
+        if tracked is not None and tracked.file_hash == current_hash and document.status == "embedded":
+            continue
+        pending.append((document.id, current_hash))
+
     _emit_progress(
-        "[rebuild_global_index] Triggered with %d parent chunks.",
-        len(all_chunks),
+        "[rebuild_global_index] Pending documents for incremental indexing: %d",
+        len(pending),
     )
-    db.expunge_all()
-    db.rollback()
-    try:
-        indexed_count = rebuild_index_from_chunks(all_chunks)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Failed to rebuild Qdrant collection using Ollama embeddings. "
-                f"base_url={settings.ollama_base_url}, embedding_model={settings.embedding_model_name}. "
-                f"Root cause: {exc}"
-            ),
-        ) from exc
+
+    if not pending:
+        return EmbedDocumentResponse(
+            document_id=0,
+            chunks_created=0,
+            indexed_chunks=0,
+        )
+
+    total_indexed_children = 0
+    processed_parent_chunks = 0
+
+    for document_id, file_hash in pending:
+        chunks = (
+            db.query(DocumentChunk)
+            .filter(DocumentChunk.document_id == document_id)
+            .order_by(DocumentChunk.id.asc())
+            .all()
+        )
+
+        db.expunge_all()
+        db.rollback()
+
+        try:
+            if chunks:
+                indexed_children = rebuild_index_from_chunks(chunks)
+            else:
+                delete_vectors_by_document_id(document_id)
+                indexed_children = 0
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Failed to incrementally index documents using Ollama embeddings. "
+                    f"base_url={settings.ollama_base_url}, embedding_model={settings.embedding_model_name}. "
+                    f"Root cause: {exc}"
+                ),
+            ) from exc
+
+        tracked = db.get(DocumentIndexState, document_id)
+        if tracked is None:
+            tracked = DocumentIndexState(document_id=document_id, file_hash=file_hash)
+
+        tracked.file_hash = file_hash
+        tracked.indexed_parent_chunks = len(chunks)
+        tracked.indexed_child_chunks = indexed_children
+        tracked.indexed_at = datetime.utcnow()
+        db.add(tracked)
+
+        total_indexed_children += indexed_children
+        processed_parent_chunks += len(chunks)
+
+    db.commit()
+
     return EmbedDocumentResponse(
         document_id=0,
-        chunks_created=indexed_count,
-        indexed_chunks=indexed_count,
+        chunks_created=processed_parent_chunks,
+        indexed_chunks=total_indexed_children,
     )

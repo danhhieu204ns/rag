@@ -39,6 +39,12 @@ class Document(Base):
         back_populates="document",
         cascade="all, delete-orphan",
     )
+    index_state: Mapped[DocumentIndexState | None] = relationship(
+        "DocumentIndexState",
+        back_populates="document",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
 
 class DocumentChunk(Base):
@@ -54,6 +60,27 @@ class DocumentChunk(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     document: Mapped[Document] = relationship("Document", back_populates="chunks")
+
+
+class DocumentIndexState(Base):
+    __tablename__ = "document_index_states"
+
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    indexed_parent_chunks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    indexed_child_chunks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    indexed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    document: Mapped[Document] = relationship("Document", back_populates="index_state")
 
 
 class ChatSession(Base):
