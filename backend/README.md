@@ -55,6 +55,7 @@ Optional tuning:
 - `METADATA_MODEL` (default: fallback to `HYQ_MODEL`, then `LLM_MODEL`)
 - `METADATA_OLLAMA_NUM_THREAD` (default: fallback to `OLLAMA_NUM_THREAD`)
 - `METADATA_OLLAMA_NUM_PREDICT` (default: `256`)
+- `VECTOR_BATCH_SIZE` (default: `64`, can increase to `128` if RAM allows)
 - `HYQ_SUMMARY_WORDS` (default: `50`)
 - `HYQ_QUESTIONS_PER_CHUNK` (default: `3`)
 - `HYBRID_VECTOR_RRF_WEIGHT` (default: `1.0`)
@@ -106,6 +107,13 @@ METADATA_OLLAMA_NUM_PREDICT=192
 ```
 
 Embedding model is served via Ollama using `langchain-ollama`.
+
+## Async Indexing Behavior
+
+- `POST /api/documents/{document_id}/embed` now queues background indexing and returns `202 Accepted` immediately.
+- `POST /api/documents/reindex` now queues pending documents in background instead of blocking request time.
+- Document `status` transitions: `uploaded` -> `indexing` -> `embedded` (or `index_failed` when background task fails).
+- Qdrant upsert is executed with async write mode (`wait=false`) for faster ingestion throughput.
 
 ## Optimizations Applied for Indexing
 

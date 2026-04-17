@@ -25,7 +25,6 @@ from ..models import ChatMessage, DocumentChunk
 from .chunk_metadata import build_hyq_children, build_keyword_blob, extract_document_codes
 
 logger = logging.getLogger(__name__)
-_EMBED_BATCH_SIZE = 16
 _QUERY_LOG_FILE_NAME = "query_trace.json"
 _LEGACY_QUERY_LOG_FILE_NAME = "query_trace.jsonl"
 
@@ -433,7 +432,7 @@ def _upsert_qdrant_collection_with_batch_embeddings(
     embeddings_client = get_embeddings()
 
     total = len(texts)
-    batch_size = max(1, _EMBED_BATCH_SIZE)
+    batch_size = max(1, settings.vector_batch_size)
     batch_count = (total + batch_size - 1) // batch_size
 
     all_vectors: list[list[float]] = []
@@ -470,7 +469,7 @@ def _upsert_qdrant_collection_with_batch_embeddings(
             vector_size,
         )
 
-    upsert_batch_size = max(1, _EMBED_BATCH_SIZE)
+    upsert_batch_size = max(1, settings.vector_batch_size)
     upsert_batch_count = (total + upsert_batch_size - 1) // upsert_batch_size
     for batch_index, start in enumerate(range(0, total, upsert_batch_size), start=1):
         end = min(start + upsert_batch_size, total)
@@ -488,7 +487,7 @@ def _upsert_qdrant_collection_with_batch_embeddings(
         client.upsert(
             collection_name=settings.qdrant_collection_name,
             points=points,
-            wait=True,
+            wait=False,
         )
         _emit_reindex_progress(
             "[reindex] Upserted child docs %d/%d (batch %d/%d)",
