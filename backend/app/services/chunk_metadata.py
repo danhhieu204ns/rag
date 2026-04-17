@@ -387,6 +387,16 @@ class HyQResultModel(BaseModel):
     summary: str = Field(description="Tóm tắt nội dung chính ngắn gọn")
     questions: list[str] = Field(description="Danh sách câu hỏi tiếng Việt có dấu")
 
+
+class HyQBatchItemModel(BaseModel):
+    index: int = Field(description="Index của đoạn trong batch")
+    summary: str = Field(description="Tóm tắt nội dung chính ngắn gọn")
+    questions: list[str] = Field(description="Danh sách câu hỏi tiếng Việt có dấu")
+
+
+class HyQBatchResultModel(BaseModel):
+    items: list[HyQBatchItemModel] = Field(default_factory=list)
+
 class MetadataBundleGenerator:
     def __init__(self) -> None:
         self.summary_words = max(20, settings.hyq_summary_words)
@@ -396,14 +406,16 @@ class MetadataBundleGenerator:
         self.base_url = settings.ollama_base_url
         self.num_thread = max(1, settings.metadata_ollama_num_thread)
         self.num_predict = max(128, settings.metadata_ollama_num_predict)
+        self.batch_size = max(1, settings.metadata_llm_batch_size)
+        self.batch_max_chars = max(2000, settings.metadata_llm_batch_max_chars)
         self._thread_local = threading.local()
         self._llm_disabled = not self.use_llm
 
-    def _get_llm(self) -> ChatOllama | None:
+    def _get_batch_llm(self) -> ChatOllama | None:
         if self._llm_disabled:
             return None
 
-        llm = getattr(self._thread_local, "llm", None)
+        llm = getattr(self._thread_local, "llm_batch", None)
         if llm is None:
             if not self.model_name:
                 self._llm_disabled = True
@@ -417,39 +429,106 @@ class MetadataBundleGenerator:
                 num_predict=self.num_predict,
                 format="json",
             )
-            llm = base_llm.with_structured_output(HyQResultModel)
-            self._thread_local.llm = llm
+            llm = base_llm.with_structured_output(HyQBatchResultModel)
+            self._thread_local.llm_batch = llm
 
         return llm
 
-    def _generate_with_llm(
+    def _build_batch_prompt(
+        self,
+        batch_items: list[tuple[int, str, dict[str, str | None]]],
+    ) -> str:
+        sections: list[str] = []
+        for index, chunk_text, context in batch_items:
+            sections.extend(
+                [
+                    f"### ITEM {index}",
+                    f"H2: {context.get('h2') or ''}",
+                    f"H3: {context.get('h3') or ''}",
+                    "CONTENT:",
+                    chunk_text,
+                    "",
+                ]
+            )
+
+        return (
+            "Bạn là hệ thống tạo metadata cho RAG. "
+            f"Với mỗi ITEM, hãy sinh tóm tắt dưới {self.summary_words} từ và đúng {self.question_count} câu hỏi tiếng Việt. "
+            "Trả về DUY NHẤT JSON theo schema: "
+            '{"items":[{"index":<int>,"summary":"...","questions":["...?"]}]}. '
+            "Không thêm text ngoài JSON.\n\n"
+            + "\n".join(sections)
+        )
+
+    def _iter_batch_indexes(
+        self,
+        chunk_texts: list[str],
+    ) -> list[list[int]]:
+        batches: list[list[int]] = []
+        current: list[int] = []
+        current_chars = 0
+
+        for idx, text in enumerate(chunk_texts):
+            estimated = len(text) + 400
+            if current and (
+                len(current) >= self.batch_size
+                or current_chars + estimated > self.batch_max_chars
+            ):
+                batches.append(current)
+                current = []
+                current_chars = 0
+
+            current.append(idx)
+            current_chars += estimated
+
+        if current:
+            batches.append(current)
+
+        return batches
+
+    def _generate_many_with_llm(
         self,
         *,
-        chunk_text: str,
-        context: dict[str, str | None],
-        fallback_search: dict[str, list[str]],
-    ) -> tuple[dict[str, list[str]] | None, HyQResult | None]:
-        llm = self._get_llm()
+        chunk_texts: list[str],
+        contexts: list[dict[str, str | None]],
+    ) -> list[HyQResult | None]:
+        llm = self._get_batch_llm()
         if llm is None:
-            return None, None
+            return [None] * len(chunk_texts)
 
-        try:
-            prompt = (
-                f"Hãy tóm tắt ngắn gọn (dưới {self.summary_words} từ) và sinh ra chính xác {self.question_count} "
-                "câu hỏi tiếng Việt từ đoạn văn bản sau.\n"
-                f"Ngữ cảnh H2: {context.get('h2') or ''}\n"
-                f"Ngữ cảnh H3: {context.get('h3') or ''}\n\n"
-                f"Nội dung văn bản:\n{chunk_text}"
-            )
-            response: HyQResultModel = llm.invoke(prompt)
-            
-            # Using structured output guarantees adherence to the Pydantic schema
-            hyq = HyQResult(summary=response.summary, questions=response.questions)
-            return fallback_search, hyq
-            
-        except Exception as e:
-            # Fallback gracefully
-            return None, None
+        results: list[HyQResult | None] = [None] * len(chunk_texts)
+        batches = self._iter_batch_indexes(chunk_texts)
+
+        for batch_indexes in batches:
+            batch_items = [
+                (index, chunk_texts[index], contexts[index])
+                for index in batch_indexes
+            ]
+            prompt = self._build_batch_prompt(batch_items)
+
+            try:
+                response: HyQBatchResultModel = llm.invoke(prompt)
+            except Exception:
+                continue
+
+            wanted_indexes = set(batch_indexes)
+            for item in response.items:
+                if item.index not in wanted_indexes:
+                    continue
+
+                parsed = _parse_hyq_payload(
+                    {
+                        "summary": item.summary,
+                        "questions": item.questions,
+                    },
+                    summary_words=self.summary_words,
+                    question_count=self.question_count,
+                )
+                if parsed is None:
+                    continue
+                results[item.index] = parsed
+
+        return results
 
     def generate(
         self,
@@ -458,16 +537,28 @@ class MetadataBundleGenerator:
         context: dict[str, str | None],
         fallback_search: dict[str, list[str]],
     ) -> tuple[dict[str, list[str]], HyQResult | None]:
-        if not self.use_llm:
-            return fallback_search, None
-
-        llm_search, llm_hyq = self._generate_with_llm(
-            chunk_text=chunk_text,
-            context=context,
-            fallback_search=fallback_search,
+        _, hyq_results = self.generate_many(
+            chunk_texts=[chunk_text],
+            contexts=[context],
+            fallback_searches=[fallback_search],
         )
+        return fallback_search, hyq_results[0]
 
-        return fallback_search, llm_hyq
+    def generate_many(
+        self,
+        *,
+        chunk_texts: list[str],
+        contexts: list[dict[str, str | None]],
+        fallback_searches: list[dict[str, list[str]]],
+    ) -> tuple[list[dict[str, list[str]]], list[HyQResult | None]]:
+        if not self.use_llm or not chunk_texts:
+            return fallback_searches, [None] * len(chunk_texts)
+
+        hyq_results = self._generate_many_with_llm(
+            chunk_texts=chunk_texts,
+            contexts=contexts,
+        )
+        return fallback_searches, hyq_results
 
 
 _metadata_bundle_generator: MetadataBundleGenerator | None = None
@@ -491,47 +582,98 @@ def build_structured_chunk_metadata(
     raw_metadata: dict[str, Any],
     chunk_text: str,
 ) -> dict[str, Any]:
-    context = _extract_context(raw_metadata)
-    fallback_search = _fallback_search_optimization(chunk_text)
-    search_optimization, llm_hyq = _get_metadata_bundle_generator().generate(
-        chunk_text=chunk_text,
-        context=context,
-        fallback_search=fallback_search,
+    batch_result = build_structured_chunk_metadata_batch(
+        document_id=document_id,
+        file_name=file_name,
+        chunks=[
+            {
+                "chunk_index": chunk_index,
+                "source_page": source_page,
+                "raw_metadata": raw_metadata,
+                "chunk_text": chunk_text,
+            }
+        ],
+    )
+    return batch_result[0]
+
+
+def build_structured_chunk_metadata_batch(
+    *,
+    document_id: int,
+    file_name: str,
+    chunks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not chunks:
+        return []
+
+    contexts: list[dict[str, str | None]] = []
+    fallback_searches: list[dict[str, list[str]]] = []
+    chunk_texts: list[str] = []
+
+    for item in chunks:
+        raw_metadata = item.get("raw_metadata")
+        if not isinstance(raw_metadata, dict):
+            raw_metadata = {}
+
+        chunk_text = str(item.get("chunk_text") or "")
+        contexts.append(_extract_context(raw_metadata))
+        fallback_searches.append(_fallback_search_optimization(chunk_text))
+        chunk_texts.append(chunk_text)
+
+    search_optimizations, llm_hyqs = _get_metadata_bundle_generator().generate_many(
+        chunk_texts=chunk_texts,
+        contexts=contexts,
+        fallback_searches=fallback_searches,
     )
 
-    hyq_result = HyQResult(summary="", questions=[])
-    if settings.hyq_enabled:
-        if llm_hyq is not None:
-            hyq_result = llm_hyq
-        else:
-            hyq_result = _fallback_hyq(
-                chunk_text=chunk_text,
-                context=context,
-                search_optimization=search_optimization,
-                summary_words=settings.hyq_summary_words,
-                question_count=settings.hyq_questions_per_chunk,
-            )
+    structured_results: list[dict[str, Any]] = []
+    for idx, item in enumerate(chunks):
+        raw_metadata = item.get("raw_metadata")
+        if not isinstance(raw_metadata, dict):
+            raw_metadata = {}
 
-    structured_metadata: dict[str, Any] = {
-        "chunk_id": f"doc_{document_id:02d}_chunk_{chunk_index:04d}",
-        "source_info": {
-            "file_name": file_name,
-            "page_number": source_page,
-            "doc_type": _infer_doc_type(file_name, raw_metadata),
-        },
-        "context": context,
-        "search_optimization": search_optimization,
-        "admin_tags": {
-            "security_level": _infer_security_level(file_name, raw_metadata),
-            "department": _infer_department(raw_metadata, context),
-        },
-        "hyq": {
-            "summary": hyq_result.summary,
-            "questions": hyq_result.questions,
-        },
-    }
+        raw_chunk_index = item.get("chunk_index")
+        chunk_index = idx if raw_chunk_index is None else int(raw_chunk_index)
+        source_page = item.get("source_page")
+        chunk_text = chunk_texts[idx]
+        context = contexts[idx]
+        search_optimization = search_optimizations[idx]
 
-    return structured_metadata
+        hyq_result = HyQResult(summary="", questions=[])
+        if settings.hyq_enabled:
+            if llm_hyqs[idx] is not None:
+                hyq_result = llm_hyqs[idx] or hyq_result
+            else:
+                hyq_result = _fallback_hyq(
+                    chunk_text=chunk_text,
+                    context=context,
+                    search_optimization=search_optimization,
+                    summary_words=settings.hyq_summary_words,
+                    question_count=settings.hyq_questions_per_chunk,
+                )
+
+        structured_metadata: dict[str, Any] = {
+            "chunk_id": f"doc_{document_id:02d}_chunk_{chunk_index:04d}",
+            "source_info": {
+                "file_name": file_name,
+                "page_number": source_page,
+                "doc_type": _infer_doc_type(file_name, raw_metadata),
+            },
+            "context": context,
+            "search_optimization": search_optimization,
+            "admin_tags": {
+                "security_level": _infer_security_level(file_name, raw_metadata),
+                "department": _infer_department(raw_metadata, context),
+            },
+            "hyq": {
+                "summary": hyq_result.summary,
+                "questions": hyq_result.questions,
+            },
+        }
+
+        structured_results.append(structured_metadata)
+
+    return structured_results
 
 
 def build_hyq_children(metadata: dict[str, Any], fallback_text: str) -> list[tuple[str, str]]:

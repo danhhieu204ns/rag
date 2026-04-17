@@ -36,6 +36,8 @@ class Settings:
     metadata_ollama_num_thread: int
     metadata_ollama_num_predict: int
     metadata_max_workers: int
+    metadata_llm_batch_size: int
+    metadata_llm_batch_max_chars: int
     vector_batch_size: int
     hyq_summary_words: int
     hyq_questions_per_chunk: int
@@ -145,6 +147,8 @@ def get_settings() -> Settings:
         metadata_ollama_num_thread=metadata_ollama_num_thread,
         metadata_ollama_num_predict=metadata_ollama_num_predict,
         metadata_max_workers=metadata_max_workers,
+        metadata_llm_batch_size=max(1, _int_env("METADATA_LLM_BATCH_SIZE", 8)),
+        metadata_llm_batch_max_chars=max(2000, _int_env("METADATA_LLM_BATCH_MAX_CHARS", 12000)),
         vector_batch_size=max(1, _int_env("VECTOR_BATCH_SIZE", 64)),
         hyq_summary_words=_int_env("HYQ_SUMMARY_WORDS", 50),
         hyq_questions_per_chunk=_int_env("HYQ_QUESTIONS_PER_CHUNK", 3),

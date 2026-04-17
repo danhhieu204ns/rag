@@ -55,6 +55,8 @@ Optional tuning:
 - `METADATA_MODEL` (default: fallback to `HYQ_MODEL`, then `LLM_MODEL`)
 - `METADATA_OLLAMA_NUM_THREAD` (default: fallback to `OLLAMA_NUM_THREAD`)
 - `METADATA_OLLAMA_NUM_PREDICT` (default: `256`)
+- `METADATA_LLM_BATCH_SIZE` (default: `8`, số chunk gọi LLM mỗi lượt)
+- `METADATA_LLM_BATCH_MAX_CHARS` (default: `12000`, ngưỡng ký tự prompt cho mỗi batch)
 - `VECTOR_BATCH_SIZE` (default: `64`, can increase to `128` if RAM allows)
 - `HYQ_SUMMARY_WORDS` (default: `50`)
 - `HYQ_QUESTIONS_PER_CHUNK` (default: `3`)
@@ -114,6 +116,12 @@ Embedding model is served via Ollama using `langchain-ollama`.
 - `POST /api/documents/reindex` now queues pending documents in background instead of blocking request time.
 - Document `status` transitions: `uploaded` -> `indexing` -> `embedded` (or `index_failed` when background task fails).
 - Qdrant upsert is executed with async write mode (`wait=false`) for faster ingestion throughput.
+
+## Metadata Optimization
+
+- HyQ LLM calls are now batched: multiple chunks are grouped into one inference call to reduce Ollama I/O overhead.
+- Metadata is cached per `document_id + file_hash + chunk_fingerprint` in SQLite table `chunk_metadata_cache`.
+- Re-indexing the same content reuses cached metadata and skips repeated LLM generation.
 
 ## Optimizations Applied for Indexing
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import hashlib
 import json
@@ -18,9 +17,9 @@ from sqlalchemy.orm import Session
 
 from ..core.settings import settings
 from ..db import SessionLocal, get_db
-from ..models import AdminUser, Document, DocumentChunk, DocumentIndexState
+from ..models import AdminUser, ChunkMetadataCache, Document, DocumentChunk, DocumentIndexState
 from ..schemas import DocumentChunkListResponse, DocumentChunkRead, DocumentRead, DocumentUpdate, EmbedDocumentResponse
-from ..services.chunk_metadata import build_structured_chunk_metadata
+from ..services.chunk_metadata import build_structured_chunk_metadata_batch
 from ..services.document_processing import load_source_documents, split_source_documents
 from .auth import require_admin
 from ..services.rag_runtime import delete_vectors_by_document_id, rebuild_index_from_chunks
@@ -117,6 +116,88 @@ def _compute_file_hash(file_path: Path) -> str:
     return digest.hexdigest()
 
 
+def _compute_chunk_fingerprint(
+    *,
+    chunk_text: str,
+    raw_metadata: dict[str, Any],
+    source_page: int | None,
+    source_kind: str,
+) -> str:
+    payload = {
+        "chunk_text": chunk_text,
+        "source_page": source_page,
+        "source_kind": source_kind,
+        "raw_metadata": _json_safe_value(raw_metadata),
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _load_metadata_cache(
+    *,
+    db: Session,
+    document_id: int,
+    file_hash: str,
+    chunk_fingerprints: list[str],
+) -> dict[str, dict[str, Any]]:
+    if not chunk_fingerprints:
+        return {}
+
+    rows = (
+        db.query(ChunkMetadataCache)
+        .filter(ChunkMetadataCache.document_id == document_id)
+        .filter(ChunkMetadataCache.file_hash == file_hash)
+        .filter(ChunkMetadataCache.chunk_fingerprint.in_(chunk_fingerprints))
+        .all()
+    )
+
+    cache_map: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        parsed = _parse_source_metadata(row.metadata_json)
+        if parsed is None:
+            continue
+        cache_map[row.chunk_fingerprint] = parsed
+    return cache_map
+
+
+def _save_metadata_cache(
+    *,
+    db: Session,
+    document_id: int,
+    file_hash: str,
+    cached_payloads: list[tuple[str, str]],
+) -> None:
+    write_attempts = 3
+    for attempt in range(write_attempts):
+        try:
+            db.query(ChunkMetadataCache).filter(
+                ChunkMetadataCache.document_id == document_id,
+                ChunkMetadataCache.file_hash == file_hash,
+            ).delete(synchronize_session=False)
+
+            if cached_payloads:
+                rows = [
+                    ChunkMetadataCache(
+                        document_id=document_id,
+                        file_hash=file_hash,
+                        chunk_fingerprint=fingerprint,
+                        metadata_json=metadata_json,
+                    )
+                    for fingerprint, metadata_json in cached_payloads
+                ]
+                db.add_all(rows)
+
+            db.commit()
+            return
+        except OperationalError as exc:
+            db.rollback()
+            if "database is locked" not in str(exc).lower() or attempt == write_attempts - 1:
+                raise RuntimeError(
+                    "Database is busy while saving metadata cache. Please retry after a few seconds."
+                ) from exc
+            time.sleep(0.4 * (attempt + 1))
+
+
 
 def _to_document_read(document: Document, chunk_count: int) -> DocumentRead:
     return DocumentRead(
@@ -146,10 +227,12 @@ def _to_document_chunk_read(chunk: DocumentChunk) -> DocumentChunkRead:
 
 def _build_document_chunks_for_indexing(
     *,
+    db: Session,
     document_id: int,
     original_filename: str,
     file_path: Path,
-) -> list[DocumentChunk]:
+    file_hash: str,
+) -> tuple[list[DocumentChunk], list[tuple[str, str]]]:
     loaded_documents = load_source_documents(file_path)
     _emit_progress(
         "[embed_document][bg] Loaded %d source document blocks for document_id=%s",
@@ -167,7 +250,7 @@ def _build_document_chunks_for_indexing(
         document_id,
     )
 
-    candidates: list[tuple[int, str, dict[str, Any], int | None, str]] = []
+    candidates: list[dict[str, Any]] = []
     for item in split_documents:
         text = item.page_content.strip()
         if not text:
@@ -176,70 +259,85 @@ def _build_document_chunks_for_indexing(
         item_metadata = dict(item.metadata or {})
         source_page = _extract_source_page(item_metadata)
         source_kind = _extract_source_kind(item_metadata, file_path.suffix.lower())
-        candidates.append((len(candidates), text, item_metadata, source_page, source_kind))
+        chunk_index = len(candidates)
+        fingerprint = _compute_chunk_fingerprint(
+            chunk_text=text,
+            raw_metadata=item_metadata,
+            source_page=source_page,
+            source_kind=source_kind,
+        )
+        candidates.append(
+            {
+                "chunk_index": chunk_index,
+                "chunk_text": text,
+                "raw_metadata": item_metadata,
+                "source_page": source_page,
+                "source_kind": source_kind,
+                "fingerprint": fingerprint,
+            }
+        )
 
-    metadata_workers = max(1, settings.metadata_max_workers)
+    metadata_cache = _load_metadata_cache(
+        db=db,
+        document_id=document_id,
+        file_hash=file_hash,
+        chunk_fingerprints=[str(item["fingerprint"]) for item in candidates],
+    )
+    cached_count = sum(1 for item in candidates if item["fingerprint"] in metadata_cache)
+
     _emit_progress(
-        "[embed_document][bg] Preparing metadata for %d chunks with workers=%d (document_id=%s)",
+        "[embed_document][bg] Preparing metadata for %d chunks (cache_hit=%d, document_id=%s)",
         len(candidates),
-        metadata_workers,
+        cached_count,
         document_id,
     )
 
-    prepared_rows: list[tuple[str, int | None, str, dict[str, Any]] | None] = [None] * len(candidates)
+    prepared_metadata: list[dict[str, Any] | None] = [None] * len(candidates)
+    uncached_candidates: list[dict[str, Any]] = []
 
-    def _build_metadata_row(
-        candidate: tuple[int, str, dict[str, Any], int | None, str],
-    ) -> tuple[int, tuple[str, int | None, str, dict[str, Any]]]:
-        chunk_index, text, item_metadata, source_page, source_kind = candidate
-        structured_metadata = build_structured_chunk_metadata(
+    for item in candidates:
+        cached_metadata = metadata_cache.get(str(item["fingerprint"]))
+        if cached_metadata is not None:
+            prepared_metadata[int(item["chunk_index"])] = cached_metadata
+            continue
+        uncached_candidates.append(item)
+
+    if uncached_candidates:
+        generated_metadata = build_structured_chunk_metadata_batch(
             document_id=document_id,
-            chunk_index=chunk_index,
             file_name=original_filename,
-            source_page=source_page,
-            raw_metadata=item_metadata,
-            chunk_text=text,
+            chunks=[
+                {
+                    "chunk_index": item["chunk_index"],
+                    "source_page": item["source_page"],
+                    "raw_metadata": item["raw_metadata"],
+                    "chunk_text": item["chunk_text"],
+                }
+                for item in uncached_candidates
+            ],
         )
-        return chunk_index, (text, source_page, source_kind, structured_metadata)
 
-    if metadata_workers <= 1 or len(candidates) <= 1:
-        for processed_count, candidate in enumerate(candidates, start=1):
-            chunk_index, payload = _build_metadata_row(candidate)
-            prepared_rows[chunk_index] = payload
-            if processed_count % 20 == 0 or processed_count == len(candidates):
-                _emit_progress(
-                    "[embed_document][bg] Prepared chunk metadata %d/%d for document_id=%s",
-                    processed_count,
-                    len(candidates),
-                    document_id,
-                )
-    else:
-        with ThreadPoolExecutor(max_workers=metadata_workers) as executor:
-            futures = [executor.submit(_build_metadata_row, candidate) for candidate in candidates]
-            processed_count = 0
+        for idx, item in enumerate(uncached_candidates):
+            prepared_metadata[int(item["chunk_index"])] = generated_metadata[idx]
 
-            for future in as_completed(futures):
-                chunk_index, payload = future.result()
-                prepared_rows[chunk_index] = payload
-                processed_count += 1
-
-                if processed_count % 20 == 0 or processed_count == len(candidates):
-                    _emit_progress(
-                        "[embed_document][bg] Prepared chunk metadata %d/%d for document_id=%s",
-                        processed_count,
-                        len(candidates),
-                        document_id,
-                    )
-
-    if any(item is None for item in prepared_rows):
+    if any(item is None for item in prepared_metadata):
         raise RuntimeError("Failed to build chunk metadata for all chunks.")
 
     new_chunks: list[DocumentChunk] = []
-    for chunk_index, payload in enumerate(prepared_rows):
-        if payload is None:
+    cached_payloads: list[tuple[str, str]] = []
+    for item in candidates:
+        chunk_index = int(item["chunk_index"])
+        structured_metadata = prepared_metadata[chunk_index]
+        if structured_metadata is None:
             continue
 
-        text, source_page, source_kind, structured_metadata = payload
+        text = str(item["chunk_text"])
+        source_page = _to_int(item["source_page"])
+        source_kind = str(item["source_kind"])
+        serialized = _serialize_source_metadata(structured_metadata)
+        if serialized is not None:
+            cached_payloads.append((str(item["fingerprint"]), serialized))
+
         new_chunks.append(
             DocumentChunk(
                 document_id=document_id,
@@ -247,11 +345,11 @@ def _build_document_chunks_for_indexing(
                 content=text,
                 source_page=source_page,
                 source_kind=source_kind,
-                source_metadata_json=_serialize_source_metadata(structured_metadata),
+                source_metadata_json=serialized,
             )
         )
 
-    return new_chunks
+    return new_chunks, cached_payloads
 
 
 def _write_document_chunks(
@@ -356,15 +454,25 @@ def _run_document_indexing_job(document_id: int, file_hash: str) -> None:
         )
 
         new_chunks = _build_document_chunks_for_indexing(
+            db=db,
             document_id=document_id,
             original_filename=original_filename,
             file_path=file_path,
+            file_hash=file_hash,
         )
+        chunk_rows, metadata_cache_payloads = new_chunks
 
         _write_document_chunks(
             db=db,
             document_id=document_id,
-            new_chunks=new_chunks,
+            new_chunks=chunk_rows,
+        )
+
+        _save_metadata_cache(
+            db=db,
+            document_id=document_id,
+            file_hash=file_hash,
+            cached_payloads=metadata_cache_payloads,
         )
 
         document_chunks = (
@@ -394,7 +502,7 @@ def _run_document_indexing_job(document_id: int, file_hash: str) -> None:
         _emit_progress(
             "[embed_document][bg] Completed document_id=%s chunks_created=%s indexed_children=%s elapsed=%.2fs",
             document_id,
-            len(new_chunks),
+            len(chunk_rows),
             indexed_count,
             elapsed,
         )
