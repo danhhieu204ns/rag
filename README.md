@@ -283,3 +283,71 @@ cd frontend
 npm install
 npm run dev
 ```
+
+## 13) Future Work (tối ưu RAG)
+
+Mục này tập trung vào các hạng mục chưa có trong code hiện tại nhưng có tác động lớn đến chất lượng trả lời, tốc độ truy xuất, và độ ổn định vận hành.
+
+### P0 - Ưu tiên cao (nên làm trước)
+
+1. Bổ sung reranker sau bước hybrid retrieval
+	- Hiện tại đang dùng RRF để trộn vector + keyword, chưa có bước rerank cuối theo mức độ liên quan ngữ nghĩa sâu.
+	- Đề xuất: lấy top N (ví dụ 20) từ hybrid, sau đó rerank về top K bằng cross-encoder hoặc LLM reranker nhẹ.
+	- Kỳ vọng: tăng độ chính xác câu trả lời cho truy vấn dài, đa ý, hoặc nhiều chunk na ná nhau.
+
+2. Tối ưu keyword retrieval để tránh full scan SQLite
+	- Hiện tại keyword scoring đang duyệt toàn bộ `document_chunks` theo Python, dễ thành nút thắt khi dữ liệu tăng.
+	- Đề xuất: đưa lexical retrieval sang BM25/FTS (SQLite FTS5 hoặc OpenSearch/Meilisearch), rồi mới fusion với vector.
+	- Kỳ vọng: giảm mạnh độ trễ query trên tập dữ liệu lớn.
+
+3. Thêm filter trực tiếp ở tầng vector search
+	- Với `document_ids`, hiện tại có bước lọc sau khi lấy kết quả vector; có thể giảm hiệu quả khi dữ liệu lớn.
+	- Đề xuất: dùng payload filter ngay trong truy vấn Qdrant (`document_id in [...]`) để giảm candidate không cần thiết.
+	- Kỳ vọng: latency thấp hơn, kết quả ổn định hơn khi có document scope.
+
+4. Tách indexing job khỏi FastAPI process
+	- Hiện indexing đang chạy bằng `BackgroundTasks`; nếu API restart có thể gián đoạn job.
+	- Đề xuất: chuyển sang queue worker (Celery/RQ/Dramatiq + Redis) và có trạng thái retry/dead-letter.
+	- Kỳ vọng: indexing bền vững hơn trong production.
+
+### P1 - Ưu tiên trung bình (nâng chất lượng và vận hành)
+
+1. Query rewrite và multi-query retrieval
+	- Tự động sinh 2-4 biến thể câu hỏi để truy xuất rộng hơn (đồng nghĩa, viết tắt, mã văn bản).
+	- Hợp nhất kết quả bằng RRF hoặc weighted merge.
+
+2. Context compression trước khi vào LLM
+	- Hiện prompt có thể chứa nguyên văn nhiều chunk; dễ tốn token và nhiễu.
+	- Đề xuất: thêm bước nén context theo câu liên quan hoặc sentence-level extraction trước khi generate.
+
+3. Guardrails groundedness
+	- Thêm bước kiểm tra câu trả lời có bám nguồn hay không (citation coverage / unsupported-claim check).
+	- Nếu thiếu bằng chứng, phản hồi theo chế độ "insufficient context" thay vì suy diễn.
+
+4. Cơ chế fallback model/runtime
+	- Khi Ollama chậm hoặc lỗi, bổ sung timeout + fallback model cho chat/rerank để tránh fail cứng.
+
+### P2 - Nâng cao (scale và observability)
+
+1. Đánh giá RAG tự động (offline + regression)
+	- Xây bộ eval gồm câu hỏi chuẩn, expected facts, và metrics: Recall@K, MRR, groundedness, answer relevance.
+	- Chạy định kỳ sau mỗi thay đổi prompt/retrieval/indexing.
+
+2. Telemetry chi tiết theo từng stage
+	- Ghi latency tách bạch: query rewrite, vector search, keyword search, rerank, generation.
+	- Export metrics qua Prometheus/OpenTelemetry để theo dõi P95/P99.
+
+3. Chính sách lifecycle cho logs và index
+	- Query logs hiện ghi file JSON nội bộ; cần thêm rotation/retention để tránh phình storage.
+	- Bổ sung quy trình backup/restore cho SQLite + Qdrant.
+
+4. Multi-tenant và quyền truy cập theo tài liệu
+	- Chuẩn hóa schema metadata cho ACL để lọc retrieval theo user/role/team.
+	- Chuẩn bị sẵn kiến trúc nếu mở rộng từ nội bộ sang nhiều nhóm dữ liệu độc lập.
+
+### KPI gợi ý để đo hiệu quả tối ưu
+
+- Chất lượng: Recall@5 >= 0.75, grounded answer rate >= 0.85.
+- Tốc độ: P95 `/api/chat/query` < 2.5s (không tính thời gian model lớn trong tải cao).
+- Indexing: thời gian embed theo tài liệu giảm >= 30% khi bật cache + batching.
+- Độ ổn định: tỷ lệ job indexing lỗi < 1% và có retry tự động.
