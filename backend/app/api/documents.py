@@ -21,7 +21,7 @@ from ..schemas import DocumentChunkListResponse, DocumentChunkRead, DocumentRead
 from ..services.chunk_metadata import build_structured_chunk_metadata
 from ..services.document_processing import load_source_documents, split_source_documents
 from .auth import require_admin
-from ..services.rag_runtime import rebuild_index_from_chunks
+from ..services.rag_runtime import delete_vectors_by_document_id, rebuild_index_from_chunks
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
@@ -271,28 +271,42 @@ def delete_document(
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
 ) -> None:
-    """Delete document metadata, source file, and rebuild global vector index."""
+    """Delete one document from DB, source storage, and VectorDB."""
 
     document = db.get(Document, document_id)
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found.")
 
+    try:
+        delete_vectors_by_document_id(document_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to delete vectors for document_id={document_id}. Root cause: {exc}",
+        ) from exc
+
     file_path = settings.uploads_dir / document.stored_filename
+
+    try:
+        db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete(
+            synchronize_session=False
+        )
+        db.delete(document)
+        db.commit()
+    except OperationalError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Database is busy while deleting document. Please retry after a few seconds.",
+        ) from exc
+
     if file_path.exists():
         file_path.unlink()
 
-    db.delete(document)
-    db.commit()
-
-    remaining_chunks = db.query(DocumentChunk).order_by(DocumentChunk.id.asc()).all()
     _emit_progress(
-        "[delete_document] Rebuilding global index after deleting document_id=%s (remaining_parent_chunks=%s).",
+        "[delete_document] Deleted document_id=%s from DB and VectorDB.",
         document_id,
-        len(remaining_chunks),
     )
-    db.expunge_all()
-    db.rollback()
-    rebuild_index_from_chunks(remaining_chunks)
 
 
 @router.post("/{document_id}/embed", response_model=EmbedDocumentResponse)

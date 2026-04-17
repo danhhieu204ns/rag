@@ -16,6 +16,7 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from qdrant_client import QdrantClient
+from qdrant_client.http import models as qdrant_models
 from qdrant_client.http.models import Distance, PointStruct, VectorParams
 from sqlalchemy.orm import Session
 
@@ -253,6 +254,48 @@ def _qdrant_collection_exists(client: QdrantClient) -> bool:
 def _clear_qdrant_collection(client: QdrantClient) -> None:
     if _qdrant_collection_exists(client):
         client.delete_collection(collection_name=settings.qdrant_collection_name)
+
+
+def delete_vectors_by_document_id(document_id: int) -> None:
+    """Delete all child vectors in Qdrant for one document id."""
+
+    client = _get_qdrant_client()
+    if not _qdrant_collection_exists(client):
+        _emit_reindex_progress(
+            "[vector-delete] Collection '%s' not found. Skip document_id=%s.",
+            settings.qdrant_collection_name,
+            document_id,
+        )
+        return
+
+    document_filter = qdrant_models.Filter(
+        must=[
+            qdrant_models.FieldCondition(
+                key="document_id",
+                match=qdrant_models.MatchValue(value=document_id),
+            )
+        ]
+    )
+
+    # Compatibility: older qdrant-client may require FilterSelector explicitly.
+    try:
+        client.delete(
+            collection_name=settings.qdrant_collection_name,
+            points_selector=document_filter,
+            wait=True,
+        )
+    except TypeError:
+        client.delete(
+            collection_name=settings.qdrant_collection_name,
+            points_selector=qdrant_models.FilterSelector(filter=document_filter),
+            wait=True,
+        )
+
+    _emit_reindex_progress(
+        "[vector-delete] Deleted vectors for document_id=%s in collection '%s'.",
+        document_id,
+        settings.qdrant_collection_name,
+    )
 
 
 def _serialize_qdrant_payload(metadata: dict[str, object], child_text: str) -> dict[str, object]:
