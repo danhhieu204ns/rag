@@ -4,6 +4,8 @@
 
 - Upload và quản lý tài liệu (`.pdf`, `.txt`, `.md`)
 - Chunk + embedding theo parent-child (HyQ) và lưu index trên Qdrant
+- Indexing bất đồng bộ theo từng tài liệu (incremental), không rebuild toàn bộ mỗi lần embed
+- Batching LLM cho HyQ metadata và cache metadata theo `file_hash`
 - Chat hỏi đáp dựa trên ngữ cảnh đã truy xuất
 - Truy vết nguồn theo document/chunk/trang + metadata schema từ kết quả retrieval
 - Lưu lịch sử phiên chat bằng SQLite
@@ -160,14 +162,22 @@ VITE_API_BASE_URL=http://localhost:8000/api
 
 1. Mở trang `Documents` để upload file.
 2. Bấm `Embed` trên từng tài liệu (hoặc `Rebuild index`).
-3. Chuyển sang trang `Chat` để đặt câu hỏi.
-4. Hệ thống sẽ:
+3. Backend trả về ngay, chuyển trạng thái tài liệu sang `indexing` và xử lý nền.
+4. Khi hoàn tất, tài liệu chuyển sang `embedded` (hoặc `index_failed` nếu lỗi).
+5. Chuyển sang trang `Chat` để đặt câu hỏi.
+6. Hệ thống sẽ:
 	 - truy xuất hybrid (vector + keyword) từ child index,
 	 - kéo ngược parent chunk text để đưa vào prompt,
 	 - gửi ngữ cảnh + lịch sử chat vào LLM,
 	 - lưu cả tin nhắn user và assistant vào DB.
 
 ## 8) API chính
+
+### Authentication
+
+- Document APIs yêu cầu JWT Bearer token (đăng nhập qua `POST /api/auth/login`).
+- Chat APIs hiện public (không yêu cầu token).
+- Kiểm tra phiên admin hiện tại qua `GET /api/auth/me`.
 
 ### Health
 
@@ -183,9 +193,11 @@ VITE_API_BASE_URL=http://localhost:8000/api
 - `GET /api/documents/{document_id}`: chi tiết tài liệu
 - `GET /api/documents/{document_id}/chunks`: danh sách chunks + metadata (hỗ trợ query `offset`, `limit`)
 - `PUT /api/documents/{document_id}`: cập nhật tiêu đề
-- `DELETE /api/documents/{document_id}`: xóa tài liệu + rebuild index
-- `POST /api/documents/{document_id}/embed`: tạo chunks + rebuild index
-- `POST /api/documents/reindex`: rebuild toàn bộ index từ chunks trong DB
+- `DELETE /api/documents/{document_id}`: xóa tài liệu + xóa vectors của tài liệu trong Qdrant
+- `POST /api/documents/{document_id}/embed`: queue indexing nền cho tài liệu (`202 Accepted`)
+- `POST /api/documents/reindex`: queue indexing nền cho các tài liệu pending/thay đổi
+	- `embed` trả về ngay với `chunks_created=0` và `indexed_chunks=0` khi vừa queue.
+	- nếu tài liệu không đổi `file_hash` và đã `embedded`, `embed` trả về số chunk/vector đã có (không re-index).
 
 ### Chat
 
@@ -220,6 +232,13 @@ VITE_API_BASE_URL=http://localhost:8000/api
 - `HYQ_ENABLED` (default: `true`)
 - `HYQ_USE_LLM` (default: `false`)
 - `HYQ_MODEL` (default: dùng lại `LLM_MODEL` nếu để trống)
+- `METADATA_USE_LLM` (default: kế thừa từ `HYQ_USE_LLM`)
+- `METADATA_MODEL` (default: kế thừa từ `HYQ_MODEL`, sau đó `LLM_MODEL`)
+- `METADATA_OLLAMA_NUM_THREAD` (default: kế thừa `OLLAMA_NUM_THREAD`)
+- `METADATA_OLLAMA_NUM_PREDICT` (default: `256`)
+- `METADATA_LLM_BATCH_SIZE` (default: `8`)
+- `METADATA_LLM_BATCH_MAX_CHARS` (default: `12000`)
+- `VECTOR_BATCH_SIZE` (default: `64`)
 - `HYQ_SUMMARY_WORDS` (default: `50`)
 - `HYQ_QUESTIONS_PER_CHUNK` (default: `3`)
 - `HYBRID_VECTOR_RRF_WEIGHT` (default: `1.0`)
@@ -240,10 +259,12 @@ Các file/thư mục này đã được ignore trong git.
 ## 11) Một số lưu ý vận hành
 
 - Nếu chưa embed tài liệu hoặc index rỗng, chat vẫn chạy nhưng sẽ không có ngữ cảnh truy xuất.
-- Sau khi xóa tài liệu, hệ thống tự rebuild index từ các chunks còn lại.
+- Sau khi xóa tài liệu, hệ thống chỉ xóa vectors thuộc tài liệu đó (incremental).
 - CORS đã mở cho frontend local (`5173`, `3000`) trong backend.
 - Cần đảm bảo Ollama đang chạy cho chat model.
 - Lần chạy đầu cho embedding cần internet để tải weights `bge-m3` từ Hugging Face.
+- BackgroundTasks chạy trong process FastAPI; nếu server restart giữa chừng, job indexing đang chạy có thể bị gián đoạn.
+- Metadata cache được lưu trong SQLite theo `document_id + file_hash + chunk_fingerprint` để tái sử dụng khi re-index cùng nội dung.
 
 ## 12) Lệnh nhanh (Windows PowerShell)
 
