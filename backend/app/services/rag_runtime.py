@@ -986,11 +986,28 @@ def rerank_documents(
     if reranker is None or not documents:
         return documents[:top_k]
 
+    _emit_query_progress(
+        "[reranker] Starting reranking for %d documents",
+        len(documents),
+        event="rerank_documents_start",
+        details={
+            "input_count": len(documents),
+            "top_k": top_k,
+            "query": _preview_text(query),
+        },
+    )
+
     pairs = [(query, doc.page_content) for doc in documents]
     try:
         scores: list[float] = reranker.predict(pairs).tolist()
     except Exception as e:
         logger.error("[reranker] Prediction failed: %s", str(e))
+        _emit_query_progress(
+            "[reranker] Reranking failed: %s",
+            str(e),
+            event="rerank_documents_error",
+            details={"error": str(e)},
+        )
         return documents[:top_k]
 
     # Gắn reranker score vào metadata để debug/tracing
@@ -1001,13 +1018,22 @@ def rerank_documents(
     ranked = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)
     reranked_docs = [doc for doc, _ in ranked[:top_k]]
     
-    logger.debug(
+    _emit_query_progress(
         "[reranker] Reranked %d documents to top %d. "
         "Original top score: %.4f, Reranked top score: %.4f",
         len(documents),
         top_k,
-        scores[0] if scores else 0,
-        scores[0] if reranked_docs and "reranker_score" in reranked_docs[0].metadata else 0,
+        scores[0] if scores else 0.0,
+        ranked[0][1] if ranked else 0.0,
+        event="rerank_documents",
+        details={
+            "input_count": len(documents),
+            "output_count": len(reranked_docs),
+            "query": _preview_text(query),
+            "top_k": top_k,
+            "original_top_score": float(scores[0]) if scores else 0.0,
+            "reranked_top_score": float(ranked[0][1]) if ranked else 0.0,
+        },
     )
     
     return reranked_docs
@@ -1121,7 +1147,8 @@ def similarity_search(
             },
         )
 
-        merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, top_k)
+        merge_k = settings.reranker_candidate_pool if settings.reranker_enabled else top_k
+        merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, merge_k)
         if not merged_parent_ids:
             _emit_query_progress(
                 "[query] similarity_search stop: no merged parent ids",
@@ -1152,10 +1179,10 @@ def similarity_search(
                 )
             )
 
-        final_results = results[:top_k]
-        
         if settings.reranker_enabled and len(results) > top_k:
             final_results = rerank_documents(query, results, top_k)
+        else:
+            final_results = results[:top_k]
         
         mode_counts: dict[str, int] = defaultdict(int)
         for item in final_results:
