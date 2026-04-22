@@ -13,6 +13,7 @@ from collections import defaultdict
 from typing import Any
 
 from langchain_core.documents import Document
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from qdrant_client import QdrantClient
@@ -365,22 +366,35 @@ def _rebuild_qdrant_collection_with_batch_embeddings(documents: list[Document]) 
     batch_size = max(1, _EMBED_BATCH_SIZE)
     batch_count = (total + batch_size - 1) // batch_size
 
-    all_vectors: list[list[float]] = []
-    for batch_index, start in enumerate(range(0, total, batch_size), start=1):
+    all_vectors_dict: dict[int, list[list[float]]] = {}
+    
+    def process_batch(batch_index: int, start: int) -> tuple[int, int, int, list[list[float]], float]:
         end = min(start + batch_size, total)
         batch_started_at = time.perf_counter()
         batch_vectors = embeddings_client.embed_documents(texts[start:end])
-        all_vectors.extend(batch_vectors)
-
         elapsed = time.perf_counter() - batch_started_at
-        _emit_reindex_progress(
-            "[reindex] Embedded child docs %d/%d (batch %d/%d, %.2fs)",
-            end,
-            total,
-            batch_index,
-            batch_count,
-            elapsed,
-        )
+        return batch_index, start, end, batch_vectors, elapsed
+
+    batches = list(enumerate(range(0, total, batch_size), start=1))
+    
+    with ThreadPoolExecutor(max_workers=settings.ollama_num_thread) as executor:
+        future_to_batch = {executor.submit(process_batch, batch_index, start): (batch_index, start) for batch_index, start in batches}
+        for future in as_completed(future_to_batch):
+            batch_index, start, end, batch_vectors, elapsed = future.result()
+            all_vectors_dict[start] = batch_vectors
+
+            _emit_reindex_progress(
+                "[reindex] Embedded child docs %d/%d (batch %d/%d, %.2fs)",
+                end,
+                total,
+                batch_index,
+                batch_count,
+                elapsed,
+            )
+
+    all_vectors: list[list[float]] = []
+    for _, start in batches:
+        all_vectors.extend(all_vectors_dict[start])
 
     if not all_vectors:
         return 0
