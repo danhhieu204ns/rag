@@ -875,6 +875,7 @@ def get_llm() -> ChatOllama:
             base_url=settings.ollama_base_url,
             temperature=settings.llm_temperature,
             num_thread=settings.ollama_num_thread,
+            num_ctx=settings.llm_num_ctx,
         )
     return _llm
 

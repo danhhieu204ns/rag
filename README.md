@@ -95,11 +95,24 @@ Mở `.env` và thêm tối thiểu:
 
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
-EMBEDDING_MODEL_NAME=BAAI/bge-m3
+EMBEDDING_MODEL_NAME=bge-m3:latest
 QDRANT_COLLECTION_NAME=global_child_chunks
 PDF_PARSER_MODE=legacy
 LLM_MODEL=llama3.1:8b
 ```
+
+Khuyến nghị cho máy 12GB VRAM:
+
+```env
+HYQ_MODEL=llama3.2:3b
+METADATA_MODEL=llama3.2:3b
+LLM_NUM_CTX=2048
+METADATA_NUM_CTX=1536
+OLLAMA_KV_CACHE_TYPE=q8_0
+OLLAMA_FLASH_ATTENTION=1
+```
+
+Với `OLLAMA_KV_CACHE_TYPE` và `OLLAMA_FLASH_ATTENTION`, cần set trước khi khởi động `ollama serve`.
 
 `PDF_PARSER_MODE`:
 
@@ -229,6 +242,7 @@ VITE_API_BASE_URL=http://localhost:8000/api
 - `RETRIEVER_K` (default: `4`)
 - `LLM_MODEL` (default: `llama3.1:8b`)
 - `LLM_TEMPERATURE` (default: `0.0`)
+- `LLM_NUM_CTX` (default: `2048`)
 - `HYQ_ENABLED` (default: `true`)
 - `HYQ_USE_LLM` (default: `false`)
 - `HYQ_MODEL` (default: dùng lại `LLM_MODEL` nếu để trống)
@@ -236,6 +250,7 @@ VITE_API_BASE_URL=http://localhost:8000/api
 - `METADATA_MODEL` (default: kế thừa từ `HYQ_MODEL`, sau đó `LLM_MODEL`)
 - `METADATA_OLLAMA_NUM_THREAD` (default: kế thừa `OLLAMA_NUM_THREAD`)
 - `METADATA_OLLAMA_NUM_PREDICT` (default: `256`)
+- `METADATA_NUM_CTX` (default: `1536`)
 - `METADATA_LLM_BATCH_SIZE` (default: `8`)
 - `METADATA_LLM_BATCH_MAX_CHARS` (default: `12000`)
 - `VECTOR_BATCH_SIZE` (default: `64`)

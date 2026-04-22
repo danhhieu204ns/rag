@@ -27,7 +27,9 @@ class Settings:
     retriever_k: int
     llm_model: str
     llm_temperature: float
+    llm_num_ctx: int
     ollama_num_thread: int
+    metadata_num_ctx: int
     hyq_enabled: bool
     hyq_use_llm: bool
     hyq_model: str
@@ -138,7 +140,9 @@ def get_settings() -> Settings:
         retriever_k=_int_env("RETRIEVER_K", 4),
         llm_model=_string_env("LLM_MODEL", "llama3.1:8b"),
         llm_temperature=_float_env("LLM_TEMPERATURE", 0.0),
+        llm_num_ctx=max(512, _int_env("LLM_NUM_CTX", 2048)),
         ollama_num_thread=ollama_num_thread,
+        metadata_num_ctx=max(512, _int_env("METADATA_NUM_CTX", 1536)),
         hyq_enabled=_bool_env("HYQ_ENABLED", True),
         hyq_use_llm=hyq_use_llm,
         hyq_model=hyq_model,

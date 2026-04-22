@@ -55,6 +55,7 @@ Optional tuning:
 - `RETRIEVER_K`
 - `LLM_MODEL` (default: `llama3.1:8b`)
 - `LLM_TEMPERATURE`
+- `LLM_NUM_CTX` (default: `2048`, giảm KV cache cho LLM chính)
 - `OLLAMA_NUM_THREAD` (default: `8`)
 - `HYQ_ENABLED` (default: `true`)
 - `HYQ_USE_LLM` (default: `false`)
@@ -63,6 +64,7 @@ Optional tuning:
 - `METADATA_MODEL` (default: fallback to `HYQ_MODEL`, then `LLM_MODEL`)
 - `METADATA_OLLAMA_NUM_THREAD` (default: fallback to `OLLAMA_NUM_THREAD`)
 - `METADATA_OLLAMA_NUM_PREDICT` (default: `256`)
+- `METADATA_NUM_CTX` (default: `1536`, giảm KV cache cho metadata/HyQ)
 - `METADATA_LLM_BATCH_SIZE` (default: `8`, số chunk gọi LLM mỗi lượt)
 - `METADATA_LLM_BATCH_MAX_CHARS` (default: `12000`, ngưỡng ký tự prompt cho mỗi batch)
 - `VECTOR_BATCH_SIZE` (default: `64`, can increase to `128` if RAM allows)
@@ -104,6 +106,24 @@ Optional if HyQ LLM generation is enabled:
 ollama pull llama3.2:3b
 ```
 
+For 12GB VRAM, prioritize quantized tags (`q4` or `q5`) for all chat/metadata LLM models when your registry exposes them.
+
+Set Ollama daemon memory knobs before starting `ollama serve`:
+
+```bash
+export OLLAMA_KV_CACHE_TYPE=q8_0
+export OLLAMA_FLASH_ATTENTION=1
+ollama serve
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:OLLAMA_KV_CACHE_TYPE="q8_0"
+$env:OLLAMA_FLASH_ATTENTION="1"
+ollama serve
+```
+
 Recommended setup for lower VRAM/CPU load on metadata tasks (keyword extraction, summary, hypothetical questions):
 
 ```env
@@ -114,6 +134,10 @@ METADATA_MODEL=llama3.2:3b
 OLLAMA_NUM_THREAD=8
 METADATA_OLLAMA_NUM_THREAD=8
 METADATA_OLLAMA_NUM_PREDICT=192
+LLM_NUM_CTX=2048
+METADATA_NUM_CTX=1536
+OLLAMA_KV_CACHE_TYPE=q8_0
+OLLAMA_FLASH_ATTENTION=1
 ```
 
 Embedding model is served via Ollama using `langchain-ollama`.

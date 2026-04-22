@@ -406,6 +406,7 @@ class MetadataBundleGenerator:
         self.base_url = settings.ollama_base_url
         self.num_thread = max(1, settings.metadata_ollama_num_thread)
         self.num_predict = max(128, settings.metadata_ollama_num_predict)
+        self.num_ctx = max(512, settings.metadata_num_ctx)
         self.batch_size = max(1, settings.metadata_llm_batch_size)
         self.batch_max_chars = max(2000, settings.metadata_llm_batch_max_chars)
         self._thread_local = threading.local()
@@ -427,6 +428,7 @@ class MetadataBundleGenerator:
                 temperature=0.0,
                 num_thread=self.num_thread,
                 num_predict=self.num_predict,
+                num_ctx=self.num_ctx,
                 format="json",
             )
             llm = base_llm.with_structured_output(HyQBatchResultModel)
