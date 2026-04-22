@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from datetime import datetime
 import hashlib
 import json
@@ -234,32 +235,82 @@ def _build_document_chunks_for_indexing(
     file_path: Path,
     file_hash: str,
 ) -> tuple[list[DocumentChunk], list[tuple[str, str]], list[dict[str, Any]]]:
+    load_started_at = time.perf_counter()
     loaded_documents = load_source_documents(file_path)
+    load_elapsed = time.perf_counter() - load_started_at
     _emit_progress(
         "[embed_document][bg] Loaded %d source document blocks for document_id=%s",
         len(loaded_documents),
         document_id,
     )
+
+    loaded_source_type_counter: Counter[str] = Counter()
+    loaded_parser_counter: Counter[str] = Counter()
+    loaded_text_lengths: list[int] = []
+    for item in loaded_documents:
+        metadata = dict(item.metadata or {})
+        loaded_source_type_counter[str(metadata.get("source_type") or "unknown")] += 1
+        loaded_parser_counter[str(metadata.get("source_parser") or "legacy")] += 1
+        loaded_text_lengths.append(len(str(item.page_content or "")))
+
+    avg_loaded_chars = (
+        sum(loaded_text_lengths) / len(loaded_text_lengths)
+        if loaded_text_lengths
+        else 0.0
+    )
+    _emit_progress(
+        "[embed_document][bg][debug] Load stats document_id=%s elapsed=%.2fs avg_chars=%.1f source_types=%s parsers=%s",
+        document_id,
+        load_elapsed,
+        avg_loaded_chars,
+        dict(loaded_source_type_counter),
+        dict(loaded_parser_counter),
+    )
+
+    split_started_at = time.perf_counter()
     split_documents = split_source_documents(
         loaded_documents,
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
     )
+    split_elapsed = time.perf_counter() - split_started_at
     _emit_progress(
         "[embed_document][bg] Split into %d chunks for document_id=%s",
         len(split_documents),
         document_id,
     )
 
+    split_lengths = [len(str(item.page_content or "")) for item in split_documents]
+    split_avg_chars = sum(split_lengths) / len(split_lengths) if split_lengths else 0.0
+    split_min_chars = min(split_lengths) if split_lengths else 0
+    split_max_chars = max(split_lengths) if split_lengths else 0
+    _emit_progress(
+        "[embed_document][bg][debug] Split stats document_id=%s elapsed=%.2fs min_chars=%d avg_chars=%.1f max_chars=%d chunk_size=%d overlap=%d",
+        document_id,
+        split_elapsed,
+        split_min_chars,
+        split_avg_chars,
+        split_max_chars,
+        settings.chunk_size,
+        settings.chunk_overlap,
+    )
+
     candidates: list[dict[str, Any]] = []
+    source_kind_counter: Counter[str] = Counter()
+    source_pages: list[int] = []
+    skipped_empty_chunks = 0
     for item in split_documents:
         text = item.page_content.strip()
         if not text:
+            skipped_empty_chunks += 1
             continue
 
         item_metadata = dict(item.metadata or {})
         source_page = _extract_source_page(item_metadata)
         source_kind = _extract_source_kind(item_metadata, file_path.suffix.lower())
+        source_kind_counter[source_kind] += 1
+        if source_page is not None:
+            source_pages.append(source_page)
         chunk_index = len(candidates)
         fingerprint = _compute_chunk_fingerprint(
             chunk_text=text,
@@ -285,12 +336,32 @@ def _build_document_chunks_for_indexing(
         chunk_fingerprints=[str(item["fingerprint"]) for item in candidates],
     )
     cached_count = sum(1 for item in candidates if item["fingerprint"] in metadata_cache)
+    uncached_count = len(candidates) - cached_count
+    cache_ratio = (cached_count / len(candidates) * 100.0) if candidates else 0.0
+    metadata_batch_size = max(1, settings.metadata_llm_batch_size)
+    metadata_batch_count = (uncached_count + metadata_batch_size - 1) // metadata_batch_size if uncached_count else 0
 
     _emit_progress(
         "[embed_document][bg] Preparing metadata for %d chunks (cache_hit=%d, document_id=%s)",
         len(candidates),
         cached_count,
         document_id,
+    )
+    _emit_progress(
+        "[embed_document][bg][debug] Candidate stats document_id=%s non_empty=%d empty_skipped=%d cache_hit_ratio=%.1f%% uncached=%d batch_size=%d batch_count=%d source_kinds=%s page_span=%s",
+        document_id,
+        len(candidates),
+        skipped_empty_chunks,
+        cache_ratio,
+        uncached_count,
+        metadata_batch_size,
+        metadata_batch_count,
+        dict(source_kind_counter),
+        (
+            f"{min(source_pages)}-{max(source_pages)}"
+            if source_pages
+            else "n/a"
+        ),
     )
 
     prepared_metadata: list[dict[str, Any] | None] = [None] * len(candidates)
