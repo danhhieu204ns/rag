@@ -397,16 +397,32 @@ class HyQBatchItemModel(BaseModel):
 class HyQBatchResultModel(BaseModel):
     items: list[HyQBatchItemModel] = Field(default_factory=list)
 
+
+class SummaryBatchItemModel(BaseModel):
+    index: int = Field(description="Index của đoạn trong batch")
+    summary: str = Field(description="Tóm tắt nội dung chính ngắn gọn")
+
+
+class SummaryBatchResultModel(BaseModel):
+    items: list[SummaryBatchItemModel] = Field(default_factory=list)
+
 class MetadataBundleGenerator:
     def __init__(self) -> None:
         self.summary_words = max(20, settings.hyq_summary_words)
         self.question_count = max(1, settings.hyq_questions_per_chunk)
         self.use_llm = bool(settings.metadata_use_llm or settings.hyq_use_llm)
         self.model_name = settings.metadata_model or settings.hyq_model or settings.llm_model
+        self.summary_model_name = (
+            settings.metadata_summary_model.strip()
+            if settings.metadata_summary_use_high_accuracy
+            else ""
+        )
         self.base_url = settings.ollama_base_url
         self.num_thread = max(1, settings.metadata_ollama_num_thread)
         self.num_predict = max(128, settings.metadata_ollama_num_predict)
         self.num_ctx = max(512, settings.metadata_num_ctx)
+        self.summary_num_ctx = max(512, settings.metadata_summary_num_ctx)
+        self.keep_alive = settings.metadata_keep_alive
         self.batch_size = max(1, settings.metadata_llm_batch_size)
         self.batch_max_chars = max(2000, settings.metadata_llm_batch_max_chars)
         self._thread_local = threading.local()
@@ -429,10 +445,32 @@ class MetadataBundleGenerator:
                 num_thread=self.num_thread,
                 num_predict=self.num_predict,
                 num_ctx=self.num_ctx,
+                keep_alive=self.keep_alive,
                 format="json",
             )
             llm = base_llm.with_structured_output(HyQBatchResultModel)
             self._thread_local.llm_batch = llm
+
+        return llm
+
+    def _get_summary_llm(self) -> ChatOllama | None:
+        if not self.summary_model_name:
+            return None
+
+        llm = getattr(self._thread_local, "llm_summary", None)
+        if llm is None:
+            base_llm = ChatOllama(
+                model=self.summary_model_name,
+                base_url=self.base_url,
+                temperature=0.0,
+                num_thread=self.num_thread,
+                num_predict=self.num_predict,
+                num_ctx=self.summary_num_ctx,
+                keep_alive=self.keep_alive,
+                format="json",
+            )
+            llm = base_llm.with_structured_output(SummaryBatchResultModel)
+            self._thread_local.llm_summary = llm
 
         return llm
 
@@ -488,6 +526,32 @@ class MetadataBundleGenerator:
 
         return batches
 
+    def _build_summary_batch_prompt(
+        self,
+        batch_items: list[tuple[int, str, dict[str, str | None]]],
+    ) -> str:
+        sections: list[str] = []
+        for index, chunk_text, context in batch_items:
+            sections.extend(
+                [
+                    f"### ITEM {index}",
+                    f"H2: {context.get('h2') or ''}",
+                    f"H3: {context.get('h3') or ''}",
+                    "CONTENT:",
+                    chunk_text,
+                    "",
+                ]
+            )
+
+        return (
+            "Bạn là hệ thống tạo tóm tắt cho RAG. "
+            f"Với mỗi ITEM, hãy tóm tắt dưới {self.summary_words} từ bằng tiếng Việt. "
+            "Trả về DUY NHẤT JSON theo schema: "
+            '{"items":[{"index":<int>,"summary":"..."}]}. '
+            "Không thêm text ngoài JSON.\n\n"
+            + "\n".join(sections)
+        )
+
     def _generate_many_with_llm(
         self,
         *,
@@ -532,6 +596,41 @@ class MetadataBundleGenerator:
 
         return results
 
+    def _generate_summaries_with_summary_model(
+        self,
+        *,
+        chunk_texts: list[str],
+        contexts: list[dict[str, str | None]],
+    ) -> list[str | None]:
+        llm = self._get_summary_llm()
+        if llm is None:
+            return [None] * len(chunk_texts)
+
+        outputs: list[str | None] = [None] * len(chunk_texts)
+        batches = self._iter_batch_indexes(chunk_texts)
+
+        for batch_indexes in batches:
+            batch_items = [
+                (index, chunk_texts[index], contexts[index])
+                for index in batch_indexes
+            ]
+            prompt = self._build_summary_batch_prompt(batch_items)
+
+            try:
+                response: SummaryBatchResultModel = llm.invoke(prompt)
+            except Exception:
+                continue
+
+            wanted_indexes = set(batch_indexes)
+            for item in response.items:
+                if item.index not in wanted_indexes:
+                    continue
+                summary = _word_limited_text(str(item.summary or ""), self.summary_words)
+                if summary:
+                    outputs[item.index] = summary
+
+        return outputs
+
     def generate(
         self,
         *,
@@ -560,6 +659,20 @@ class MetadataBundleGenerator:
             chunk_texts=chunk_texts,
             contexts=contexts,
         )
+
+        if self.summary_model_name and self.summary_model_name != self.model_name:
+            refined_summaries = self._generate_summaries_with_summary_model(
+                chunk_texts=chunk_texts,
+                contexts=contexts,
+            )
+            for idx, summary in enumerate(refined_summaries):
+                if summary is None:
+                    continue
+                existing = hyq_results[idx]
+                if existing is None:
+                    continue
+                hyq_results[idx] = HyQResult(summary=summary, questions=existing.questions)
+
         return fallback_searches, hyq_results
 
 
@@ -573,6 +686,20 @@ def _get_metadata_bundle_generator() -> MetadataBundleGenerator:
         _metadata_bundle_generator = MetadataBundleGenerator()
 
     return _metadata_bundle_generator
+
+
+def warmup_metadata_model() -> None:
+    """Issue a tiny structured call so metadata model stays warm in Ollama."""
+
+    generator = _get_metadata_bundle_generator()
+    if not generator.use_llm:
+        return
+
+    generator.generate_many(
+        chunk_texts=["Warmup metadata model for resident VRAM."],
+        contexts=[{"h2": "Warmup", "h3": "Metadata"}],
+        fallback_searches=[_fallback_search_optimization("Warmup metadata model")],
+    )
 
 
 def build_structured_chunk_metadata(

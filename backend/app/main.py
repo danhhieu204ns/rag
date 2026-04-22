@@ -16,6 +16,8 @@ from .api.chat import router as chat_router
 from .api.documents import router as documents_router
 from .core.settings import settings
 from .db import init_db
+from .services.chunk_metadata import warmup_metadata_model
+from .services.rag_runtime import warmup_chat_model, warmup_embedding_model
 
 
 logger = logging.getLogger(__name__)
@@ -64,6 +66,48 @@ def _log_vram_tuning_hints() -> None:
             "OLLAMA_FLASH_ATTENTION is not enabled. Enable it if your Ollama build supports Flash Attention."
         )
 
+    num_parallel = os.getenv("OLLAMA_NUM_PARALLEL", "").strip()
+    if not num_parallel:
+        logger.warning(
+            "OLLAMA_NUM_PARALLEL is not set. For orchestration with shared VRAM, start with OLLAMA_NUM_PARALLEL=2."
+        )
+    else:
+        logger.info("OLLAMA_NUM_PARALLEL=%s", num_parallel)
+
+    max_loaded = os.getenv("OLLAMA_MAX_LOADED_MODELS", "").strip()
+    if not max_loaded:
+        logger.warning(
+            "OLLAMA_MAX_LOADED_MODELS is not set. Set it to at least 2-3 to keep metadata and embedding models resident."
+        )
+    else:
+        logger.info("OLLAMA_MAX_LOADED_MODELS=%s", max_loaded)
+
+
+def _warmup_orchestrated_models() -> None:
+    if not settings.model_warmup_on_startup:
+        return
+
+    if settings.model_warmup_embedding:
+        try:
+            warmup_embedding_model()
+            logger.info("Embedding model warmup completed.")
+        except Exception as exc:
+            logger.warning("Embedding model warmup failed: %s", exc)
+
+    if settings.model_warmup_metadata:
+        try:
+            warmup_metadata_model()
+            logger.info("Metadata model warmup completed.")
+        except Exception as exc:
+            logger.warning("Metadata model warmup failed: %s", exc)
+
+    if settings.model_warmup_chat:
+        try:
+            warmup_chat_model()
+            logger.info("Chat model warmup completed.")
+        except Exception as exc:
+            logger.warning("Chat model warmup failed: %s", exc)
+
 
 app = FastAPI(title=settings.app_name)
 
@@ -89,6 +133,7 @@ def on_startup() -> None:
 
     init_db()
     _log_vram_tuning_hints()
+    _warmup_orchestrated_models()
 
 
 @app.get("/api/health")

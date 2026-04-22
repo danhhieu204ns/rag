@@ -56,15 +56,21 @@ Optional tuning:
 - `LLM_MODEL` (default: `llama3.1:8b`)
 - `LLM_TEMPERATURE`
 - `LLM_NUM_CTX` (default: `2048`, giảm KV cache cho LLM chính)
+- `LLM_KEEP_ALIVE` (default: `10m`, thời gian giữ model chat trên VRAM)
 - `OLLAMA_NUM_THREAD` (default: `8`)
 - `HYQ_ENABLED` (default: `true`)
 - `HYQ_USE_LLM` (default: `false`)
 - `HYQ_MODEL` (default: fallback to `METADATA_MODEL`, then `LLM_MODEL`)
 - `METADATA_USE_LLM` (default: fallback to `HYQ_USE_LLM`)
 - `METADATA_MODEL` (default: fallback to `HYQ_MODEL`, then `LLM_MODEL`)
+- `METADATA_SUMMARY_USE_HIGH_ACCURACY` (default: `false`, bật thì dùng model riêng cho phần summary)
+- `METADATA_SUMMARY_MODEL` (default: empty, ví dụ `llama3.1:8b` nếu cần summary chất lượng cao)
+- `METADATA_SUMMARY_NUM_CTX` (default: `2048`)
 - `METADATA_OLLAMA_NUM_THREAD` (default: fallback to `OLLAMA_NUM_THREAD`)
 - `METADATA_OLLAMA_NUM_PREDICT` (default: `256`)
 - `METADATA_NUM_CTX` (default: `1536`, giảm KV cache cho metadata/HyQ)
+- `METADATA_KEEP_ALIVE` (default: `-1`, giữ model metadata resident)
+- `EMBEDDING_KEEP_ALIVE` (default: `-1`, giữ model embedding resident)
 - `METADATA_LLM_BATCH_SIZE` (default: `8`, số chunk gọi LLM mỗi lượt)
 - `METADATA_LLM_BATCH_MAX_CHARS` (default: `12000`, ngưỡng ký tự prompt cho mỗi batch)
 - `VECTOR_BATCH_SIZE` (default: `64`, can increase to `128` if RAM allows)
@@ -74,6 +80,10 @@ Optional tuning:
 - `HYBRID_KEYWORD_RRF_WEIGHT` (default: `1.2`)
 - `HYBRID_RRF_K` (default: `60`)
 - `HYBRID_PROBE_MULTIPLIER` (default: `4`)
+- `MODEL_WARMUP_ON_STARTUP` (default: `false`, warmup model sau khi backend khởi động)
+- `MODEL_WARMUP_METADATA` (default: `true`)
+- `MODEL_WARMUP_EMBEDDING` (default: `true`)
+- `MODEL_WARMUP_CHAT` (default: `false`)
 
 If `HYQ_USE_LLM=true` or `METADATA_USE_LLM=true`, ensure the selected model is available in Ollama.
 
@@ -113,6 +123,9 @@ Set Ollama daemon memory knobs before starting `ollama serve`:
 ```bash
 export OLLAMA_KV_CACHE_TYPE=q8_0
 export OLLAMA_FLASH_ATTENTION=1
+export OLLAMA_NUM_PARALLEL=2
+export OLLAMA_MAX_LOADED_MODELS=3
+export OLLAMA_KEEP_ALIVE=-1
 ollama serve
 ```
 
@@ -121,8 +134,41 @@ On Windows PowerShell:
 ```powershell
 $env:OLLAMA_KV_CACHE_TYPE="q8_0"
 $env:OLLAMA_FLASH_ATTENTION="1"
+$env:OLLAMA_NUM_PARALLEL="2"
+$env:OLLAMA_MAX_LOADED_MODELS="3"
+$env:OLLAMA_KEEP_ALIVE="-1"
 ollama serve
 ```
+
+## Deployment Orchestration (12GB VRAM)
+
+Recommended tiered pipeline to reduce model-switch overhead:
+
+- `llama3.2:3b` as persistent model for metadata + HyQ.
+- `bge-m3` as persistent embedding model.
+- `llama3.1:8b` only for high-accuracy summary when needed.
+
+Profile A (default, fastest switching / lowest VRAM pressure):
+
+```env
+HYQ_MODEL=llama3.2:3b
+METADATA_MODEL=llama3.2:3b
+METADATA_SUMMARY_USE_HIGH_ACCURACY=false
+METADATA_KEEP_ALIVE=-1
+EMBEDDING_KEEP_ALIVE=-1
+LLM_KEEP_ALIVE=10m
+```
+
+Profile B (precision summary, accepts extra model switch):
+
+```env
+HYQ_MODEL=llama3.2:3b
+METADATA_MODEL=llama3.2:3b
+METADATA_SUMMARY_USE_HIGH_ACCURACY=true
+METADATA_SUMMARY_MODEL=llama3.1:8b
+```
+
+When `METADATA_SUMMARY_USE_HIGH_ACCURACY=true`, only summary is refined by `METADATA_SUMMARY_MODEL`; keyword extraction and HyQ question generation stay on the smaller metadata model.
 
 Recommended setup for lower VRAM/CPU load on metadata tasks (keyword extraction, summary, hypothetical questions):
 

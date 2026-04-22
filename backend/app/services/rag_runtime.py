@@ -857,6 +857,7 @@ def get_embeddings() -> Embeddings:
             model=settings.embedding_model_name,
             base_url=settings.ollama_base_url,
             num_thread=settings.ollama_num_thread,
+            keep_alive=settings.embedding_keep_alive,
             client_kwargs={"timeout": 180},
         )
 
@@ -876,8 +877,21 @@ def get_llm() -> ChatOllama:
             temperature=settings.llm_temperature,
             num_thread=settings.ollama_num_thread,
             num_ctx=settings.llm_num_ctx,
+            keep_alive=settings.llm_keep_alive,
         )
     return _llm
+
+
+def warmup_embedding_model() -> None:
+    """Warm embedding model once so Ollama can keep it resident with keep_alive."""
+
+    get_embeddings().embed_documents(["warmup embedding model"])
+
+
+def warmup_chat_model() -> None:
+    """Warm chat model with minimal output to reduce first-request cold start."""
+
+    get_llm().invoke("Trả về đúng 1 từ: OK")
 
 
 

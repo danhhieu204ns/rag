@@ -28,13 +28,19 @@ class Settings:
     llm_model: str
     llm_temperature: float
     llm_num_ctx: int
+    llm_keep_alive: str
     ollama_num_thread: int
     metadata_num_ctx: int
+    metadata_keep_alive: str
+    embedding_keep_alive: str
     hyq_enabled: bool
     hyq_use_llm: bool
     hyq_model: str
     metadata_use_llm: bool
     metadata_model: str
+    metadata_summary_model: str
+    metadata_summary_use_high_accuracy: bool
+    metadata_summary_num_ctx: int
     metadata_ollama_num_thread: int
     metadata_ollama_num_predict: int
     metadata_max_workers: int
@@ -47,6 +53,10 @@ class Settings:
     hybrid_keyword_rrf_weight: float
     hybrid_rrf_k: int
     hybrid_probe_multiplier: int
+    model_warmup_on_startup: bool
+    model_warmup_chat: bool
+    model_warmup_metadata: bool
+    model_warmup_embedding: bool
     # Auth
     secret_key: str
     access_token_expire_minutes: int
@@ -141,13 +151,19 @@ def get_settings() -> Settings:
         llm_model=_string_env("LLM_MODEL", "llama3.1:8b"),
         llm_temperature=_float_env("LLM_TEMPERATURE", 0.0),
         llm_num_ctx=max(512, _int_env("LLM_NUM_CTX", 2048)),
+        llm_keep_alive=_string_env("LLM_KEEP_ALIVE", "10m"),
         ollama_num_thread=ollama_num_thread,
         metadata_num_ctx=max(512, _int_env("METADATA_NUM_CTX", 1536)),
+        metadata_keep_alive=_string_env("METADATA_KEEP_ALIVE", "-1"),
+        embedding_keep_alive=_string_env("EMBEDDING_KEEP_ALIVE", "-1"),
         hyq_enabled=_bool_env("HYQ_ENABLED", True),
         hyq_use_llm=hyq_use_llm,
         hyq_model=hyq_model,
         metadata_use_llm=_bool_env("METADATA_USE_LLM", hyq_use_llm),
         metadata_model=_string_env("METADATA_MODEL", hyq_model),
+        metadata_summary_model=_string_env("METADATA_SUMMARY_MODEL", ""),
+        metadata_summary_use_high_accuracy=_bool_env("METADATA_SUMMARY_USE_HIGH_ACCURACY", False),
+        metadata_summary_num_ctx=max(512, _int_env("METADATA_SUMMARY_NUM_CTX", 2048)),
         metadata_ollama_num_thread=metadata_ollama_num_thread,
         metadata_ollama_num_predict=metadata_ollama_num_predict,
         metadata_max_workers=metadata_max_workers,
@@ -160,6 +176,10 @@ def get_settings() -> Settings:
         hybrid_keyword_rrf_weight=_float_env("HYBRID_KEYWORD_RRF_WEIGHT", 1.2),
         hybrid_rrf_k=_int_env("HYBRID_RRF_K", 60),
         hybrid_probe_multiplier=_int_env("HYBRID_PROBE_MULTIPLIER", 4),
+        model_warmup_on_startup=_bool_env("MODEL_WARMUP_ON_STARTUP", False),
+        model_warmup_chat=_bool_env("MODEL_WARMUP_CHAT", False),
+        model_warmup_metadata=_bool_env("MODEL_WARMUP_METADATA", True),
+        model_warmup_embedding=_bool_env("MODEL_WARMUP_EMBEDDING", True),
         secret_key=os.getenv("SECRET_KEY", "change-this-secret-key-in-production"),
         access_token_expire_minutes=_int_env("ACCESS_TOKEN_EXPIRE_MINUTES", 1440),
         admin_default_username=os.getenv("ADMIN_DEFAULT_USERNAME", "admin"),
