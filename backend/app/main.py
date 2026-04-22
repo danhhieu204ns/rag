@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+from urllib import error, request
 
 from dotenv import load_dotenv
 
@@ -26,6 +28,48 @@ logger = logging.getLogger(__name__)
 _QUANTIZED_TAG_PATTERN = re.compile(r"(?:^|:|[-_])q[2-8](?:[_-]?[a-z0-9]+)?$", re.IGNORECASE)
 
 
+def _fetch_ollama_model_sizes() -> dict[str, int]:
+    """Fetch installed Ollama model sizes (bytes) via /api/tags."""
+
+    base_url = settings.ollama_base_url.rstrip("/")
+    url = f"{base_url}/api/tags"
+    try:
+        with request.urlopen(url, timeout=2.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return {}
+
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return {}
+
+    sizes: dict[str, int] = {}
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        size = item.get("size")
+        if not name:
+            continue
+        try:
+            sizes[name] = int(size)
+        except (TypeError, ValueError):
+            continue
+    return sizes
+
+
+def _is_likely_quantized_by_size(model_name: str, size_bytes: int) -> bool:
+    """Best-effort size heuristic for common model families when tag has no explicit q-suffix."""
+
+    lower_name = model_name.lower()
+    # Heuristic thresholds for common quantized pulls in Ollama.
+    if "8b" in lower_name:
+        return size_bytes <= 7 * 1024 * 1024 * 1024
+    if "3b" in lower_name:
+        return size_bytes <= 4 * 1024 * 1024 * 1024
+    return False
+
+
 def _is_probably_quantized(model_name: str) -> bool:
     name = str(model_name or "").strip()
     if not name:
@@ -37,13 +81,34 @@ def _is_probably_quantized(model_name: str) -> bool:
 
 
 def _log_vram_tuning_hints() -> None:
+    ollama_sizes = _fetch_ollama_model_sizes()
+
     check_models = [
         ("LLM_MODEL", settings.llm_model),
         ("METADATA_MODEL", settings.metadata_model or settings.hyq_model or settings.llm_model),
     ]
 
     for setting_name, model_name in check_models:
-        if model_name and not _is_probably_quantized(model_name):
+        if not model_name:
+            continue
+
+        if _is_probably_quantized(model_name):
+            continue
+
+        size = ollama_sizes.get(model_name)
+        if size is None and ":" not in model_name:
+            size = ollama_sizes.get(f"{model_name}:latest")
+
+        if size is not None and _is_likely_quantized_by_size(model_name, size):
+            logger.info(
+                "[%s] model='%s' looks quantized by size (%d bytes) even without explicit q4/q5 tag.",
+                setting_name,
+                model_name,
+                size,
+            )
+            continue
+
+        if model_name:
             logger.warning(
                 "[%s] model='%s' has no explicit q4/q5 tag. For 12GB VRAM, prefer quantized tags (e.g. q4 or q5).",
                 setting_name,

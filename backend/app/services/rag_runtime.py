@@ -6,6 +6,7 @@ import json
 import logging
 from pathlib import Path
 import re
+import threading
 import time
 import unicodedata
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -33,6 +34,8 @@ _qdrant_client: QdrantClient | None = None
 _llm: ChatOllama | None = None
 _reranker: Any = None
 _query_trace_id_ctx: ContextVar[str] = ContextVar("query_trace_id", default="-")
+_embeddings_lock = threading.Lock()
+_llm_lock = threading.Lock()
 
 
 class SentenceTransformerEmbeddings(Embeddings):
@@ -54,7 +57,16 @@ class SentenceTransformerEmbeddings(Embeddings):
         if resolved_device == "auto":
             resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.model = SentenceTransformer(model_name, device=resolved_device)
+        model_kwargs: dict[str, Any] = {}
+        if use_fp16 and resolved_device.startswith("cuda"):
+            model_kwargs["torch_dtype"] = torch.float16
+
+        self.model = SentenceTransformer(
+            model_name,
+            device=resolved_device,
+            model_kwargs=model_kwargs,
+            local_files_only=settings.embedding_local_files_only,
+        )
         self.model.max_seq_length = max_length
         self.batch_size = max(1, batch_size)
         self.use_fp16 = bool(use_fp16)
@@ -905,28 +917,30 @@ def get_embeddings() -> Embeddings:
     global _embeddings
 
     if _embeddings is None:
-        backend = settings.embedding_backend.strip().lower()
-        if backend == "sentence-transformers":
-            try:
-                _embeddings = SentenceTransformerEmbeddings(
-                    model_name=settings.embedding_model_name,
-                    max_length=settings.embedding_max_length,
-                    use_fp16=settings.embedding_use_fp16,
-                    batch_size=settings.embedding_batch_size,
-                    device=settings.embedding_device,
-                )
-            except ImportError as exc:
-                raise RuntimeError(
-                    "Embedding backend 'sentence-transformers' requires package 'sentence-transformers'."
-                ) from exc
-        else:
-            _embeddings = OllamaEmbeddings(
-                model=settings.embedding_model_name,
-                base_url=settings.ollama_base_url,
-                num_thread=settings.ollama_num_thread,
-                keep_alive=settings.embedding_keep_alive,
-                client_kwargs={"timeout": 180},
-            )
+        with _embeddings_lock:
+            if _embeddings is None:
+                backend = settings.embedding_backend.strip().lower()
+                if backend == "sentence-transformers":
+                    try:
+                        _embeddings = SentenceTransformerEmbeddings(
+                            model_name=settings.embedding_model_name,
+                            max_length=settings.embedding_max_length,
+                            use_fp16=settings.embedding_use_fp16,
+                            batch_size=settings.embedding_batch_size,
+                            device=settings.embedding_device,
+                        )
+                    except ImportError as exc:
+                        raise RuntimeError(
+                            "Embedding backend 'sentence-transformers' requires package 'sentence-transformers'."
+                        ) from exc
+                else:
+                    _embeddings = OllamaEmbeddings(
+                        model=settings.embedding_model_name,
+                        base_url=settings.ollama_base_url,
+                        num_thread=settings.ollama_num_thread,
+                        keep_alive=settings.embedding_keep_alive,
+                        client_kwargs={"timeout": 180},
+                    )
 
     return _embeddings
 
@@ -938,14 +952,16 @@ def get_llm() -> ChatOllama:
     global _llm
 
     if _llm is None:
-        _llm = ChatOllama(
-            model=settings.llm_model,
-            base_url=settings.ollama_base_url,
-            temperature=settings.llm_temperature,
-            num_thread=settings.ollama_num_thread,
-            num_ctx=settings.llm_num_ctx,
-            keep_alive=settings.llm_keep_alive,
-        )
+        with _llm_lock:
+            if _llm is None:
+                _llm = ChatOllama(
+                    model=settings.llm_model,
+                    base_url=settings.ollama_base_url,
+                    temperature=settings.llm_temperature,
+                    num_thread=settings.ollama_num_thread,
+                    num_ctx=settings.llm_num_ctx,
+                    keep_alive=settings.llm_keep_alive,
+                )
     return _llm
 
 

@@ -51,6 +51,7 @@ Optional tuning:
 - `EMBEDDING_USE_FP16` (default: `true`, only for `sentence-transformers` backend)
 - `EMBEDDING_BATCH_SIZE` (default: `64`, only for `sentence-transformers` backend)
 - `EMBEDDING_DEVICE` (default: `auto`, values: `auto`, `cuda`, `cpu`)
+- `EMBEDDING_LOCAL_FILES_ONLY` (default: `false`, set `true` after first successful download to skip network fetch)
 - `QDRANT_URL` (default: empty -> local embedded Qdrant)
 - `QDRANT_API_KEY` (default: empty)
 - `QDRANT_COLLECTION_NAME` (default: `global_child_chunks`)
@@ -202,12 +203,19 @@ EMBEDDING_MAX_LENGTH=512
 EMBEDDING_USE_FP16=true
 EMBEDDING_BATCH_SIZE=64
 EMBEDDING_DEVICE=auto
+EMBEDDING_LOCAL_FILES_ONLY=false
 ```
 
 Notes:
 
 - `EMBEDDING_MAX_LENGTH` should align with chunk size to avoid extra padding compute.
 - `EMBEDDING_USE_FP16=true` gives best speed on modern RTX GPUs and is ignored on CPU.
+
+To reduce model load time in practice:
+
+- First run (download once): keep `EMBEDDING_LOCAL_FILES_ONLY=false`.
+- Next runs: switch `EMBEDDING_LOCAL_FILES_ONLY=true` to avoid network checks/download.
+- For large indexing jobs, prefer running backend without `--reload` to avoid extra process restart overhead.
 
 ## Async Indexing Behavior
 

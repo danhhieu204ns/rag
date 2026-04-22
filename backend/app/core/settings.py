@@ -26,6 +26,7 @@ class Settings:
     embedding_use_fp16: bool
     embedding_batch_size: int
     embedding_device: str
+    embedding_local_files_only: bool
     pdf_parser_mode: str
     chunk_size: int
     chunk_overlap: int
@@ -154,6 +155,7 @@ def get_settings() -> Settings:
         embedding_use_fp16=_bool_env("EMBEDDING_USE_FP16", True),
         embedding_batch_size=max(1, _int_env("EMBEDDING_BATCH_SIZE", 64)),
         embedding_device=_string_env("EMBEDDING_DEVICE", "auto"),
+        embedding_local_files_only=_bool_env("EMBEDDING_LOCAL_FILES_ONLY", False),
         pdf_parser_mode=_pdf_parser_mode_env(),
         chunk_size=_int_env("CHUNK_SIZE", 500),
         chunk_overlap=_int_env("CHUNK_OVERLAP", 50),
