@@ -45,6 +45,11 @@ class Settings:
     hybrid_keyword_rrf_weight: float
     hybrid_rrf_k: int
     hybrid_probe_multiplier: int
+    # Reranking
+    reranker_enabled: bool
+    reranker_model: str
+    reranker_top_k: int
+    reranker_candidate_pool: int
     # Auth
     secret_key: str
     access_token_expire_minutes: int
@@ -156,6 +161,10 @@ def get_settings() -> Settings:
         hybrid_keyword_rrf_weight=_float_env("HYBRID_KEYWORD_RRF_WEIGHT", 1.2),
         hybrid_rrf_k=_int_env("HYBRID_RRF_K", 60),
         hybrid_probe_multiplier=_int_env("HYBRID_PROBE_MULTIPLIER", 4),
+        reranker_enabled=_bool_env("RERANKER_ENABLED", False),
+        reranker_model=_string_env("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
+        reranker_top_k=_int_env("RERANKER_TOP_K", 4),
+        reranker_candidate_pool=_int_env("RERANKER_CANDIDATE_POOL", 20),
         secret_key=os.getenv("SECRET_KEY", "change-this-secret-key-in-production"),
         access_token_expire_minutes=_int_env("ACCESS_TOKEN_EXPIRE_MINUTES", 1440),
         admin_default_username=os.getenv("ADMIN_DEFAULT_USERNAME", "admin"),
