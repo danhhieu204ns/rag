@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from ..core.settings import settings
 from ..models import ChatMessage, DocumentChunk
 from .chunk_metadata import build_hyq_children, build_keyword_blob, extract_document_codes
+from .query_rewriter import rewrite_for_vector
 
 logger = logging.getLogger(__name__)
 _QUERY_LOG_FILE_NAME = "query_trace.json"
@@ -1093,8 +1094,21 @@ def similarity_search(
             )
             return vector_only_results
 
+        # Keyword branch always uses the original query to preserve exact identifiers
+        # (document codes, dates, org names).  Vector branch uses an expanded query
+        # when QUERY_REWRITE_ENABLED=true and the query is short/vague.
+        vector_query = rewrite_for_vector(query)
+        if vector_query != query:
+            _emit_query_progress(
+                "[query][rewrite] Vector query expanded: '%s' → '%s'",
+                _preview_text(query),
+                _preview_text(vector_query),
+                event="query_rewrite",
+                details={"original_query": query, "vector_query": vector_query},
+            )
+
         vector_parent_ids, parent_child_type = _vector_parent_candidates(
-            query,
+            vector_query,
             top_k,
             document_ids,
         )
