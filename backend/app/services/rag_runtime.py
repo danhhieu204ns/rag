@@ -32,6 +32,7 @@ _LEGACY_QUERY_LOG_FILE_NAME = "query_trace.jsonl"
 _embeddings: Embeddings | None = None
 _qdrant_client: QdrantClient | None = None
 _llm: ChatOllama | None = None
+_variant_llm: ChatOllama | None = None
 _reranker: Any = None
 _query_trace_id_ctx: ContextVar[str] = ContextVar("query_trace_id", default="-")
 
@@ -869,6 +870,378 @@ def get_llm() -> ChatOllama:
     return _llm
 
 
+def _get_variant_llm() -> ChatOllama:
+    """Return cached LLM instance for multi-query variant generation.
+
+    Uses MULTI_QUERY_MODEL if set, otherwise falls back to the main LLM.
+    Always runs with format="json" to guarantee structured output and
+    eliminate the markdown-wrapper parse failure that affects json.loads.
+    A separate cache avoids sharing state with the answer-generation LLM.
+    """
+    global _variant_llm
+
+    if _variant_llm is None:
+        model = settings.multi_query_model or settings.llm_model
+        _variant_llm = ChatOllama(
+            model=model,
+            base_url=settings.ollama_base_url,
+            temperature=0.0,
+            num_thread=settings.ollama_num_thread,
+            format="json",
+        )
+    return _variant_llm
+
+
+def _should_rewrite_query(query: str) -> tuple[bool, int, str]:
+    terms = _lookup_terms(query)
+    term_count = len(terms)
+    min_terms = max(1, settings.query_rewrite_min_terms)
+    max_terms = max(min_terms, settings.query_rewrite_max_terms)
+    if term_count < min_terms:
+        return False, term_count, "too_short"
+    if term_count >= max_terms:
+        return False, term_count, "already_specific"
+    return True, term_count, "rewrite_window"
+
+
+def _rewrite_query(query: str) -> str:
+    llm = get_llm()
+    prompt = (
+        "Viết lại câu hỏi sau thành phiên bản đầy đủ hơn để tối ưu truy xuất tài liệu nội bộ. "
+        "Giữ nguyên ý nghĩa gốc. Chỉ trả về đúng một câu đã viết lại, không giải thích.\n\n"
+        f"Câu hỏi gốc: {query}\n"
+        "Câu hỏi đã viết lại:"
+    )
+
+    started_at = time.perf_counter()
+    try:
+        response = llm.invoke(prompt)
+        rewritten = str(response.content or "").strip()
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        if not rewritten:
+            _emit_query_progress(
+                "[query][rewrite] Empty rewrite result, fallback to original query (%.2fms)",
+                elapsed_ms,
+                event="query_rewrite_empty",
+                details={
+                    "elapsed_ms": elapsed_ms,
+                    "original_query_preview": _preview_text(query),
+                },
+            )
+            return query
+        rewritten_terms = len(_lookup_terms(rewritten))
+        original_terms = len(_lookup_terms(query))
+        if rewritten_terms < original_terms:
+            _emit_query_progress(
+                "[query][rewrite] Rewritten query has fewer terms (%d < %d), keep original (%.2fms)",
+                rewritten_terms,
+                original_terms,
+                elapsed_ms,
+                event="query_rewrite_rejected",
+                details={
+                    "elapsed_ms": elapsed_ms,
+                    "original_term_count": original_terms,
+                    "rewritten_term_count": rewritten_terms,
+                    "original_query_preview": _preview_text(query),
+                    "rewritten_query_preview": _preview_text(rewritten),
+                },
+            )
+            return query
+        _emit_query_progress(
+            "[query][rewrite] Rewrite success in %.2fms: '%s' => '%s'",
+            elapsed_ms,
+            _preview_text(query),
+            _preview_text(rewritten),
+            event="query_rewrite_success",
+            details={
+                "elapsed_ms": elapsed_ms,
+                "original_term_count": original_terms,
+                "rewritten_term_count": rewritten_terms,
+                "original_query_preview": _preview_text(query),
+                "rewritten_query_preview": _preview_text(rewritten),
+            },
+        )
+        return rewritten
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        _emit_query_progress(
+            "[query][rewrite] Rewrite failed after %.2fms: %s",
+            elapsed_ms,
+            str(exc),
+            event="query_rewrite_error",
+            details={
+                "elapsed_ms": elapsed_ms,
+                "error": str(exc),
+                "original_query_preview": _preview_text(query),
+            },
+        )
+        return query
+
+
+def _maybe_rewrite_query(query: str) -> tuple[str, dict[str, Any]]:
+    should_rewrite, term_count, reason = _should_rewrite_query(query)
+    details: dict[str, Any] = {
+        "enabled": settings.query_rewrite_enabled,
+        "term_count": term_count,
+        "min_terms": settings.query_rewrite_min_terms,
+        "max_terms": settings.query_rewrite_max_terms,
+        "decision_reason": reason,
+        "rewritten": False,
+    }
+
+    if not settings.query_rewrite_enabled:
+        _emit_query_progress(
+            "[query][rewrite] Disabled, skip rewrite (terms=%d)",
+            term_count,
+            event="query_rewrite_skip",
+            details=details,
+        )
+        return query, details
+
+    if settings.multi_query_enabled:
+        details["decision_reason"] = "skipped_multi_query_active"
+        _emit_query_progress(
+            "[query][rewrite] Skip rewrite: multi-query active, variants cover query diversity (terms=%d)",
+            term_count,
+            event="query_rewrite_skip",
+            details=details,
+        )
+        return query, details
+
+    if not should_rewrite:
+        _emit_query_progress(
+            "[query][rewrite] Skip rewrite: reason=%s, terms=%d",
+            reason,
+            term_count,
+            event="query_rewrite_skip",
+            details=details,
+        )
+        return query, details
+
+    rewritten = _rewrite_query(query)
+    details["rewritten"] = rewritten != query
+    details["effective_query_preview"] = _preview_text(rewritten)
+    _emit_query_progress(
+        "[query][rewrite] Rewrite decision done: rewritten=%s",
+        details["rewritten"],
+        event="query_rewrite_done",
+        details=details,
+    )
+    return rewritten, details
+
+
+def _extract_json_from_llm_text(raw_text: str) -> str:
+    """Strip markdown code fences and leading prose that LLMs sometimes prepend.
+
+    Handles the two most common non-compliant output patterns:
+      1. ```json\\n{...}\\n```  — markdown code block
+      2. "Here are the variants:\\n{...}"  — prose prefix before the JSON object
+    Returns the cleaned string; callers still own the json.loads call.
+    """
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
+    if not text.startswith("{"):
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            text = match.group(0)
+    return text
+
+
+def _generate_query_variants(query: str, variant_count: int) -> list[str]:
+    llm = _get_variant_llm()
+    prompt = (
+        f"Sinh {variant_count} biến thể câu hỏi có cùng ý nghĩa để tìm tài liệu. "
+        "Mỗi biến thể dùng từ vựng khác nhau nhưng vẫn đúng ý định ban đầu. "
+        "Trả về JSON hợp lệ dạng: {\"variants\":[\"...\",\"...\"]}.\n\n"
+        f"Câu hỏi gốc: {query}"
+    )
+
+    _emit_query_progress(
+        "[query][multi] Start generating %d variants for '%s'",
+        max(1, variant_count),
+        _preview_text(query),
+        event="multi_query_variants_start",
+        details={
+            "variant_count": max(1, variant_count),
+            "query_preview": _preview_text(query),
+        },
+    )
+
+    started_at = time.perf_counter()
+    raw_text = ""
+    try:
+        response = llm.invoke(prompt)
+        raw_text = str(response.content or "").strip()
+        clean_text = _extract_json_from_llm_text(raw_text)
+        parsed = json.loads(clean_text)
+        raw_variants = parsed.get("variants", []) if isinstance(parsed, dict) else []
+        variants = [str(item).strip() for item in raw_variants if str(item).strip()]
+    except json.JSONDecodeError as exc:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        _emit_query_progress(
+            "[query][multi] JSON parse error after %.2fms — raw preview: %s",
+            elapsed_ms,
+            raw_text[:120],
+            event="multi_query_variants_json_error",
+            details={
+                "elapsed_ms": elapsed_ms,
+                "query_preview": _preview_text(query),
+                "raw_preview": raw_text[:200],
+                "error": str(exc),
+            },
+        )
+        return []
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        _emit_query_progress(
+            "[query][multi] Variant generation failed after %.2fms: %s",
+            elapsed_ms,
+            str(exc),
+            event="multi_query_variants_error",
+            details={
+                "elapsed_ms": elapsed_ms,
+                "query_preview": _preview_text(query),
+                "error": str(exc),
+            },
+        )
+        return []
+
+    deduped: list[str] = []
+    seen: set[str] = {query.strip().lower()}
+    for variant in variants:
+        normalized = variant.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(variant)
+        if len(deduped) >= max(1, variant_count):
+            break
+
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    _emit_query_progress(
+        "[query][multi] Generated %d/%d variants in %.2fms",
+        len(deduped),
+        max(1, variant_count),
+        elapsed_ms,
+        event="multi_query_variants_done",
+        details={
+            "elapsed_ms": elapsed_ms,
+            "query_preview": _preview_text(query),
+            "variant_count_requested": max(1, variant_count),
+            "variant_count_generated": len(deduped),
+            "variants_preview": [_preview_text(item) for item in deduped],
+        },
+    )
+    return deduped
+
+
+def _rrf_merge_ranked_lists(
+    ranked_lists: list[list[int]],
+    top_k: int,
+) -> tuple[list[int], dict[int, float]]:
+    non_empty_lists = [items for items in ranked_lists if items]
+    if not non_empty_lists:
+        return [], {}
+
+    rrf_k = max(1, settings.hybrid_rrf_k)
+    scores: dict[int, float] = defaultdict(float)
+    for ranked in non_empty_lists:
+        for rank, chunk_id in enumerate(ranked, start=1):
+            scores[chunk_id] += 1.0 / (rrf_k + rank)
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    merged_ids = [chunk_id for chunk_id, _ in ranked[:top_k]]
+    _emit_query_progress(
+        "[query][multi] RRF merged %d ranked lists into %d parent ids",
+        len(non_empty_lists),
+        len(merged_ids),
+        event="multi_query_rrf_merge",
+        details={
+            "input_list_count": len(non_empty_lists),
+            "output_count": len(merged_ids),
+            "output_ids": merged_ids,
+        },
+    )
+    return merged_ids, scores
+
+
+def _vector_parent_candidates_multi_query(
+    queries: list[str],
+    top_k: int,
+    document_ids: list[int] | None,
+) -> tuple[list[int], dict[int, str]]:
+    filtered_queries = [item for item in queries if item.strip()]
+    if not filtered_queries:
+        _emit_query_progress(
+            "[query][multi] Skip multi-query vector search because query list is empty",
+            event="multi_query_vector_skip",
+            details={"reason": "empty_query_list"},
+        )
+        return [], {}
+
+    if len(filtered_queries) == 1:
+        _emit_query_progress(
+            "[query][multi] Single query mode, fallback to standard vector search",
+            event="multi_query_vector_single_mode",
+            details={"query_preview": _preview_text(filtered_queries[0])},
+        )
+        return _vector_parent_candidates(filtered_queries[0], top_k, document_ids)
+
+    max_workers = min(max(1, settings.multi_query_max_workers), len(filtered_queries))
+    _emit_query_progress(
+        "[query][multi] Parallel vector search start: queries=%d, workers=%d",
+        len(filtered_queries),
+        max_workers,
+        event="multi_query_vector_start",
+        details={
+            "query_count": len(filtered_queries),
+            "queries": [_preview_text(item) for item in filtered_queries],
+            "workers": max_workers,
+            "top_k": top_k,
+            "document_filter": document_ids or [],
+        },
+    )
+
+    ranked_lists: list[list[int]] = []
+    parent_child_type: dict[int, str] = {}
+    query_to_result: dict[str, list[int]] = {}
+    query_elapsed_ms: dict[str, float] = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        query_start_ts = {variant_query: time.perf_counter() for variant_query in filtered_queries}
+        future_map = {
+            executor.submit(_vector_parent_candidates, variant_query, top_k, document_ids): variant_query
+            for variant_query in filtered_queries
+        }
+        for future in as_completed(future_map):
+            variant_query = future_map[future]
+            ids, child_type = future.result()
+            query_elapsed_ms[variant_query] = round((time.perf_counter() - query_start_ts[variant_query]) * 1000, 2)
+            ranked_lists.append(ids)
+            query_to_result[variant_query] = ids
+            for chunk_id, child_label in child_type.items():
+                if chunk_id not in parent_child_type:
+                    parent_child_type[chunk_id] = child_label
+
+    probe_multiplier = max(1, settings.hybrid_probe_multiplier)
+    probe_k = max(top_k * probe_multiplier, top_k)
+    merged_ids, _ = _rrf_merge_ranked_lists(ranked_lists, probe_k)
+
+    _emit_query_progress(
+        "[query][multi] Multi-query vector candidates done: queries=%d, merged=%d",
+        len(filtered_queries),
+        len(merged_ids),
+        event="multi_query_vector_done",
+        details={
+            "queries": filtered_queries,
+            "query_results": {q: _preview_ids(ids) for q, ids in query_to_result.items()},
+            "query_elapsed_ms": query_elapsed_ms,
+            "merged_parent_ids": merged_ids,
+        },
+    )
+
+    return merged_ids, parent_child_type
+
+
 
 def load_index_if_available() -> bool:
     """Check whether Qdrant child collection exists."""
@@ -1050,6 +1423,28 @@ def similarity_search(
     trace_id = f"q-{int(time.time() * 1000)}-{uuid4().hex[:8]}"
     token = _query_trace_id_ctx.set(trace_id)
     try:
+        effective_query, rewrite_details = _maybe_rewrite_query(query)
+        vector_queries = [effective_query]
+        if settings.multi_query_enabled:
+            variants = _generate_query_variants(effective_query, settings.multi_query_variants)
+            vector_queries.extend(variants)
+
+        _emit_query_progress(
+            "[query] Query pipeline: original_terms=%d, effective_terms=%d, vector_queries=%d",
+            len(_lookup_terms(query)),
+            len(_lookup_terms(effective_query)),
+            len(vector_queries),
+            event="query_pipeline_summary",
+            details={
+                "original_query_preview": _preview_text(query),
+                "effective_query_preview": _preview_text(effective_query),
+                "original_term_count": len(_lookup_terms(query)),
+                "effective_term_count": len(_lookup_terms(effective_query)),
+                "vector_queries": [_preview_text(item) for item in vector_queries],
+                "multi_query_enabled": settings.multi_query_enabled,
+            },
+        )
+
         _emit_query_progress(
             "[query] Start similarity_search: top_k=%d, db_mode=%s, document_filter=%s, query='%s'",
             top_k,
@@ -1062,6 +1457,10 @@ def similarity_search(
                 "db_mode": "hybrid" if db is not None else "vector_only",
                 "document_filter": document_ids or [],
                 "query_preview": _preview_text(query),
+                "effective_query_preview": _preview_text(effective_query),
+                "rewrite": rewrite_details,
+                "multi_query_enabled": settings.multi_query_enabled,
+                "multi_query_count": len(vector_queries),
             },
         )
 
@@ -1074,13 +1473,14 @@ def similarity_search(
             return []
 
         if db is None:
-            vector_only_results = _search_qdrant_children(query, limit=top_k)
+            vector_only_results = _search_qdrant_children(effective_query, limit=top_k)
             _emit_query_progress(
                 "[query] similarity_search done (vector_only): result_count=%d",
                 len(vector_only_results),
                 event="similarity_search_done_vector_only",
                 details={
                     "result_count": len(vector_only_results),
+                    "effective_query_preview": _preview_text(effective_query),
                     "result_preview": [
                         {
                             "parent_chunk_id": _to_int(item.metadata.get("parent_chunk_id")),
@@ -1093,8 +1493,8 @@ def similarity_search(
             )
             return vector_only_results
 
-        vector_parent_ids, parent_child_type = _vector_parent_candidates(
-            query,
+        vector_parent_ids, parent_child_type = _vector_parent_candidates_multi_query(
+            vector_queries,
             top_k,
             document_ids,
         )
