@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import api from "../api";
 
 const CHUNK_PAGE_SIZE = 10;
+const DOCUMENT_PROGRESS_POLL_INTERVAL_MS = 2500;
 
 function DocumentsPage({ onAdminLogout }) {
   const [documents, setDocuments] = useState([]);
@@ -10,6 +11,11 @@ function DocumentsPage({ onAdminLogout }) {
   const [selectedFile, setSelectedFile] = useState(null);
   const [uploadTitle, setUploadTitle] = useState("");
   const [isBusy, setIsBusy] = useState(false);
+  const [busyMessage, setBusyMessage] = useState("");
+  const [activeDocumentAction, setActiveDocumentAction] = useState({
+    documentId: null,
+    action: "",
+  });
   const [error, setError] = useState("");
 
   const [selectedChunkDocumentId, setSelectedChunkDocumentId] = useState(null);
@@ -18,6 +24,7 @@ function DocumentsPage({ onAdminLogout }) {
   const [chunkOffset, setChunkOffset] = useState(0);
   const [isChunksBusy, setIsChunksBusy] = useState(false);
   const [chunksError, setChunksError] = useState("");
+  const isPollingRef = useRef(false);
 
   const totalChunks = useMemo(
     () => documents.reduce((sum, item) => sum + (item.chunk_count || 0), 0),
@@ -27,6 +34,11 @@ function DocumentsPage({ onAdminLogout }) {
   const selectedChunkDocument = useMemo(
     () => documents.find((item) => item.id === selectedChunkDocumentId) || null,
     [documents, selectedChunkDocumentId]
+  );
+
+  const hasIndexingDocuments = useMemo(
+    () => documents.some((item) => item.status === "indexing"),
+    [documents]
   );
 
   const chunkRangeStart = chunkTotal === 0 ? 0 : chunkOffset + 1;
@@ -42,15 +54,38 @@ function DocumentsPage({ onAdminLogout }) {
     setChunksError("");
   }
 
-  async function fetchDocuments() {
+  async function fetchDocuments(options = {}) {
+    const { syncDrafts = true } = options;
     const response = await api.get("/documents");
     setDocuments(response.data);
 
-    const nextDrafts = {};
-    response.data.forEach((item) => {
-      nextDrafts[item.id] = item.title;
-    });
-    setTitleDrafts(nextDrafts);
+    if (syncDrafts) {
+      const nextDrafts = {};
+      response.data.forEach((item) => {
+        nextDrafts[item.id] = item.title;
+      });
+      setTitleDrafts(nextDrafts);
+    } else {
+      setTitleDrafts((prev) => {
+        const merged = { ...prev };
+        const aliveIds = new Set(response.data.map((item) => item.id));
+
+        response.data.forEach((item) => {
+          if (merged[item.id] === undefined) {
+            merged[item.id] = item.title;
+          }
+        });
+
+        Object.keys(merged).forEach((key) => {
+          const id = Number(key);
+          if (!aliveIds.has(id)) {
+            delete merged[key];
+          }
+        });
+
+        return merged;
+      });
+    }
 
     if (selectedChunkDocumentId && !response.data.some((item) => item.id === selectedChunkDocumentId)) {
       closeChunksInspector();
@@ -86,6 +121,7 @@ function DocumentsPage({ onAdminLogout }) {
     if (!selectedFile) return;
 
     setIsBusy(true);
+    setBusyMessage("Dang upload tai lieu...");
     setError("");
 
     try {
@@ -105,6 +141,7 @@ function DocumentsPage({ onAdminLogout }) {
       setError(typeof detail === "string" ? detail : "Khong the upload tai lieu.");
     } finally {
       setIsBusy(false);
+      setBusyMessage("");
     }
   }
 
@@ -113,6 +150,7 @@ function DocumentsPage({ onAdminLogout }) {
     if (!title) return;
 
     setIsBusy(true);
+    setBusyMessage("Dang cap nhat tieu de...");
     setError("");
     try {
       await api.put(`/documents/${documentId}`, { title });
@@ -122,14 +160,36 @@ function DocumentsPage({ onAdminLogout }) {
       setError(typeof detail === "string" ? detail : "Khong the cap nhat tieu de.");
     } finally {
       setIsBusy(false);
+      setBusyMessage("");
+    }
+  }
+
+  async function parseDocument(documentId) {
+    setIsBusy(true);
+    setBusyMessage("Buoc A: Dang parse PDF sang markdown va luu disk...");
+    setActiveDocumentAction({ documentId, action: "parse" });
+    setError("");
+    try {
+      await api.post(`/documents/${documentId}/parse`);
+      await fetchDocuments();
+    } catch (err) {
+      const detail = err?.response?.data?.detail;
+      setError(typeof detail === "string" ? detail : "Khong the parse tai lieu.");
+    } finally {
+      setIsBusy(false);
+      setBusyMessage("");
+      setActiveDocumentAction({ documentId: null, action: "" });
     }
   }
 
   async function embedDocument(documentId) {
     setIsBusy(true);
+    setBusyMessage("Buoc B: Dang load markdown da parse de chunking + embedding...");
+    setActiveDocumentAction({ documentId, action: "embed" });
     setError("");
     try {
       await api.post(`/documents/${documentId}/embed`);
+      setBusyMessage("Buoc B: Da queue embedding/upsert, dang dong bo giao dien...");
       await fetchDocuments();
       if (selectedChunkDocumentId === documentId) {
         await fetchDocumentChunks(documentId, 0);
@@ -139,11 +199,14 @@ function DocumentsPage({ onAdminLogout }) {
       setError(typeof detail === "string" ? detail : "Khong the embed tai lieu.");
     } finally {
       setIsBusy(false);
+      setBusyMessage("");
+      setActiveDocumentAction({ documentId: null, action: "" });
     }
   }
 
   async function deleteDocument(documentId) {
     setIsBusy(true);
+    setBusyMessage("Dang xoa tai lieu...");
     setError("");
     try {
       await api.delete(`/documents/${documentId}`);
@@ -156,11 +219,13 @@ function DocumentsPage({ onAdminLogout }) {
       setError(typeof detail === "string" ? detail : "Khong the xoa tai lieu.");
     } finally {
       setIsBusy(false);
+      setBusyMessage("");
     }
   }
 
   async function rebuildIndex() {
     setIsBusy(true);
+    setBusyMessage("Dang queue rebuild index tu markdown da parse...");
     setError("");
     try {
       await api.post("/documents/reindex");
@@ -169,6 +234,7 @@ function DocumentsPage({ onAdminLogout }) {
       setError(typeof detail === "string" ? detail : "Khong the rebuild index.");
     } finally {
       setIsBusy(false);
+      setBusyMessage("");
     }
   }
 
@@ -193,6 +259,33 @@ function DocumentsPage({ onAdminLogout }) {
     fetchDocuments().catch(() => setError("Khong the tai danh sach tai lieu."));
   }, []);
 
+  useEffect(() => {
+    if (!hasIndexingDocuments) {
+      return;
+    }
+
+    const poll = async () => {
+      if (isPollingRef.current) {
+        return;
+      }
+
+      isPollingRef.current = true;
+      try {
+        await fetchDocuments({ syncDrafts: false });
+      } catch {
+        // Polling should stay silent; user-facing errors are handled by explicit actions.
+      } finally {
+        isPollingRef.current = false;
+      }
+    };
+
+    poll();
+    const timer = window.setInterval(poll, DOCUMENT_PROGRESS_POLL_INTERVAL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [hasIndexingDocuments]);
+
   return (
     <div className="admin-docs-shell">
       <header className="admin-docs-head">
@@ -216,11 +309,17 @@ function DocumentsPage({ onAdminLogout }) {
           <div className="panel-actions">
             <span className="muted">Tai lieu: {documents.length}</span>
             <span className="muted">Tong chunks: {totalChunks}</span>
+            {hasIndexingDocuments ? <span className="muted">Dang polling tien trinh...</span> : null}
             <button onClick={rebuildIndex} disabled={isBusy}>
               Rebuild index
             </button>
           </div>
         </div>
+
+        <p className="muted step-hint">
+          Luong 2 buoc: Buoc A Parse 1 lan (PDF -&gt; markdown, luu disk) -&gt; Buoc B tai su dung markdown de chunking,
+          parent-child, summary/questions/keywords, embedding va upsert.
+        </p>
 
         <form className="upload-form" onSubmit={uploadDocument}>
           <input
@@ -248,7 +347,9 @@ function DocumentsPage({ onAdminLogout }) {
                 <th>File goc</th>
                 <th>Status</th>
                 <th>Chunks</th>
-                <th>Hanh dong</th>
+                <th>Buoc A</th>
+                <th>Buoc B</th>
+                <th>Khac</th>
               </tr>
             </thead>
             <tbody>
@@ -270,9 +371,20 @@ function DocumentsPage({ onAdminLogout }) {
                     <button onClick={() => saveTitle(doc.id)} disabled={isBusy}>
                       Save
                     </button>
-                    <button onClick={() => embedDocument(doc.id)} disabled={isBusy}>
-                      Embed
+                    <button onClick={() => parseDocument(doc.id)} disabled={isBusy}>
+                      {isBusy && activeDocumentAction.documentId === doc.id && activeDocumentAction.action === "parse"
+                        ? "Dang parse..."
+                        : "Parse markdown"}
                     </button>
+                  </td>
+                  <td className="row-actions">
+                    <button onClick={() => embedDocument(doc.id)} disabled={isBusy}>
+                      {isBusy && activeDocumentAction.documentId === doc.id && activeDocumentAction.action === "embed"
+                        ? "Dang load markdown..."
+                        : "Embed tu markdown"}
+                    </button>
+                  </td>
+                  <td className="row-actions">
                     <button onClick={() => handleChunkToggle(doc)} disabled={isBusy || isChunksBusy}>
                       {selectedChunkDocumentId === doc.id ? "Hide chunks" : "View chunks"}
                     </button>
@@ -367,6 +479,7 @@ function DocumentsPage({ onAdminLogout }) {
         ) : null}
 
         {error ? <p className="error-text">{error}</p> : null}
+        {isBusy && busyMessage ? <p className="muted busy-text">{busyMessage}</p> : null}
       </div>
     </div>
   );

@@ -943,6 +943,17 @@ button.danger {
   margin: 0 auto;
 }
 
+.step-hint {
+  margin: 0 0 14px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.busy-text {
+  margin-top: 12px;
+  font-weight: 600;
+}
+
 .chunk-inspector {
   margin-top: 18px;
   border-top: 1px dashed #cfd5e2;

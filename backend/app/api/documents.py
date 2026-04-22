@@ -21,9 +21,20 @@ from sqlalchemy.orm import Session
 from ..core.settings import settings
 from ..db import SessionLocal, get_db
 from ..models import AdminUser, ChunkMetadataCache, Document, DocumentChunk, DocumentIndexState
-from ..schemas import DocumentChunkListResponse, DocumentChunkRead, DocumentRead, DocumentUpdate, EmbedDocumentResponse
+from ..schemas import (
+    DocumentChunkListResponse,
+    DocumentChunkRead,
+    DocumentRead,
+    DocumentUpdate,
+    EmbedDocumentResponse,
+    ParseDocumentResponse,
+)
 from ..services.chunk_metadata import build_hyq_children, build_structured_chunk_metadata_batch
-from ..services.document_processing import load_source_documents, split_source_documents
+from ..services.document_processing import (
+    load_documents_from_parsed_markdown,
+    parse_source_to_markdown,
+    split_source_documents,
+)
 from .auth import require_admin
 from ..services.rag_runtime import delete_vectors_by_document_id, get_embeddings, upsert_child_documents
 
@@ -144,6 +155,83 @@ def _compute_file_hash(file_path: Path) -> str:
     return digest.hexdigest()
 
 
+def _parsed_markdown_dir() -> Path:
+    return settings.storage_dir / "parsed_markdown"
+
+
+def _parsed_markdown_path(document_id: int) -> Path:
+    return _parsed_markdown_dir() / f"{document_id}.md"
+
+
+def _parsed_markdown_meta_path(document_id: int) -> Path:
+    return _parsed_markdown_dir() / f"{document_id}.meta.json"
+
+
+def _load_parsed_markdown_meta(document_id: int) -> dict[str, Any] | None:
+    meta_path = _parsed_markdown_meta_path(document_id)
+    if not meta_path.exists():
+        return None
+
+    try:
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _save_parsed_markdown(
+    *,
+    document_id: int,
+    markdown: str,
+    file_hash: str,
+    source_parser: str,
+    source_type: str,
+    source_file_path: Path,
+) -> tuple[Path, Path]:
+    cache_dir = _parsed_markdown_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    markdown_path = _parsed_markdown_path(document_id)
+    meta_path = _parsed_markdown_meta_path(document_id)
+    markdown_path.write_text(markdown.strip() + "\n", encoding="utf-8")
+
+    meta_payload = {
+        "document_id": document_id,
+        "file_hash": file_hash,
+        "source_parser": source_parser,
+        "source_type": source_type,
+        "source_file_path": str(source_file_path),
+        "parsed_markdown_path": str(markdown_path),
+        "updated_at_utc": datetime.utcnow().isoformat(),
+    }
+    meta_path.write_text(
+        json.dumps(meta_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return markdown_path, meta_path
+
+
+def _delete_parsed_markdown(document_id: int) -> None:
+    for path in (_parsed_markdown_path(document_id), _parsed_markdown_meta_path(document_id)):
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                continue
+
+
+def _normalize_source_parser(value: Any) -> str:
+    parser = str(value or "").strip().lower()
+    return parser or "legacy"
+
+
+def _normalize_source_type(value: Any) -> str:
+    source_type = str(value or "").strip().lower()
+    return source_type or "text"
+
+
 def _compute_chunk_fingerprint(
     *,
     chunk_text: str,
@@ -260,10 +348,18 @@ def _build_document_chunks_for_indexing(
     original_filename: str,
     file_path: Path,
     file_hash: str,
+    parsed_markdown_path: Path,
+    source_parser: str,
+    source_type: str,
 ) -> tuple[list[DocumentChunk], list[tuple[str, str]], list[dict[str, Any]]]:
     load_started_at = time.perf_counter()
-    with _timed_progress("load_source_documents", document_id=document_id):
-        loaded_documents = load_source_documents(file_path)
+    with _timed_progress("load_parsed_markdown", document_id=document_id):
+        loaded_documents = load_documents_from_parsed_markdown(
+            parsed_markdown_path,
+            source_file_path=file_path,
+            source_parser=source_parser,
+            source_type=source_type,
+        )
     load_elapsed = time.perf_counter() - load_started_at
     _emit_progress(
         "[embed_document][bg] Loaded %d source document blocks for document_id=%s",
@@ -635,7 +731,7 @@ def _save_index_state(
             if document is None:
                 return
 
-            document.status = "embedded" if indexed_parent_chunks > 0 else "uploaded"
+            document.status = "embedded" if indexed_parent_chunks > 0 else "parsed"
             db.add(document)
 
             index_state = db.get(DocumentIndexState, document_id)
@@ -661,7 +757,13 @@ def _save_index_state(
             time.sleep(0.4 * (attempt + 1))
 
 
-def _run_document_indexing_job(document_id: int, file_hash: str) -> None:
+def _run_document_indexing_job(
+    document_id: int,
+    file_hash: str,
+    parsed_markdown_path_raw: str,
+    source_parser: str,
+    source_type: str,
+) -> None:
     db = SessionLocal()
     started_at = time.perf_counter()
 
@@ -676,6 +778,10 @@ def _run_document_indexing_job(document_id: int, file_hash: str) -> None:
         if not file_path.exists():
             raise RuntimeError(f"Stored file does not exist for document_id={document_id}")
 
+        parsed_markdown_path = Path(parsed_markdown_path_raw)
+        if not parsed_markdown_path.exists():
+            raise RuntimeError(f"Parsed markdown not found for document_id={document_id}")
+
         _emit_progress(
             "[embed_document][bg] Start indexing document_id=%s file='%s'",
             document_id,
@@ -689,6 +795,9 @@ def _run_document_indexing_job(document_id: int, file_hash: str) -> None:
                 original_filename=original_filename,
                 file_path=file_path,
                 file_hash=file_hash,
+                parsed_markdown_path=parsed_markdown_path,
+                source_parser=source_parser,
+                source_type=source_type,
             )
         chunk_rows, metadata_cache_payloads, precomputed_child_rows = new_chunks
 
@@ -983,9 +1092,83 @@ def delete_document(
     if file_path.exists():
         file_path.unlink()
 
+    _delete_parsed_markdown(document_id)
+
     _emit_progress(
         "[delete_document] Deleted document_id=%s from DB and VectorDB.",
         document_id,
+    )
+
+
+@router.post(
+    "/{document_id}/parse",
+    response_model=ParseDocumentResponse,
+)
+def parse_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
+) -> ParseDocumentResponse:
+    """Step A: Parse source file to markdown once and persist to disk."""
+
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    file_path = settings.uploads_dir / document.stored_filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Stored file does not exist.")
+
+    file_hash = _compute_file_hash(file_path)
+    cached_meta = _load_parsed_markdown_meta(document_id)
+    markdown_path = _parsed_markdown_path(document_id)
+    if (
+        cached_meta is not None
+        and markdown_path.exists()
+        and str(cached_meta.get("file_hash") or "") == file_hash
+    ):
+        return ParseDocumentResponse(
+            document_id=document_id,
+            parsed_markdown_path=str(markdown_path),
+            parser=_normalize_source_parser(cached_meta.get("source_parser")),
+            source_type=_normalize_source_type(cached_meta.get("source_type")),
+            reused=True,
+        )
+
+    try:
+        markdown, source_parser, source_type = parse_source_to_markdown(file_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not markdown.strip():
+        raise HTTPException(status_code=422, detail="Parsed markdown is empty.")
+
+    markdown_path, _ = _save_parsed_markdown(
+        document_id=document_id,
+        markdown=markdown,
+        file_hash=file_hash,
+        source_parser=source_parser,
+        source_type=source_type,
+        source_file_path=file_path,
+    )
+
+    if document.status != "embedded":
+        document.status = "parsed"
+        db.add(document)
+        db.commit()
+
+    _emit_progress(
+        "[parse_document] Parsed markdown saved for document_id=%s at %s",
+        document_id,
+        markdown_path,
+    )
+
+    return ParseDocumentResponse(
+        document_id=document_id,
+        parsed_markdown_path=str(markdown_path),
+        parser=source_parser,
+        source_type=source_type,
+        reused=False,
     )
 
 
@@ -1014,6 +1197,24 @@ def embed_document(
         raise HTTPException(status_code=404, detail="Stored file does not exist.")
 
     file_hash = _compute_file_hash(file_path)
+    parsed_meta = _load_parsed_markdown_meta(document_id)
+    parsed_markdown_path = _parsed_markdown_path(document_id)
+
+    if parsed_meta is None or not parsed_markdown_path.exists():
+        raise HTTPException(
+            status_code=409,
+            detail="Parsed markdown not found. Run Step A (parse) first.",
+        )
+
+    if str(parsed_meta.get("file_hash") or "") != file_hash:
+        raise HTTPException(
+            status_code=409,
+            detail="Source file changed. Run Step A (parse) again before embedding.",
+        )
+
+    source_parser = _normalize_source_parser(parsed_meta.get("source_parser"))
+    source_type = _normalize_source_type(parsed_meta.get("source_type"))
+
     existing_index_state = db.get(DocumentIndexState, document_id)
     if (
         existing_index_state is not None
@@ -1040,7 +1241,14 @@ def embed_document(
     db.add(document)
     db.commit()
 
-    background_tasks.add_task(_run_document_indexing_job, document_id, file_hash)
+    background_tasks.add_task(
+        _run_document_indexing_job,
+        document_id,
+        file_hash,
+        str(parsed_markdown_path),
+        source_parser,
+        source_type,
+    )
     _emit_progress(
         "[embed_document] Queued background indexing for document_id=%s",
         document_id,
@@ -1071,7 +1279,14 @@ def rebuild_global_index(
         if not file_path.exists():
             continue
 
+        parsed_meta = _load_parsed_markdown_meta(document.id)
+        if parsed_meta is None or not _parsed_markdown_path(document.id).exists():
+            continue
+
         current_hash = _compute_file_hash(file_path)
+        if str(parsed_meta.get("file_hash") or "") != current_hash:
+            continue
+
         tracked = state_by_document_id.get(document.id)
         if tracked is not None and tracked.file_hash == current_hash and document.status == "embedded":
             continue
@@ -1098,9 +1313,21 @@ def rebuild_global_index(
         if target_document.status == "indexing":
             continue
 
+        parsed_meta = _load_parsed_markdown_meta(document_id)
+        parsed_markdown_path = _parsed_markdown_path(document_id)
+        if parsed_meta is None or not parsed_markdown_path.exists():
+            continue
+
         target_document.status = "indexing"
         db.add(target_document)
-        background_tasks.add_task(_run_document_indexing_job, document_id, file_hash)
+        background_tasks.add_task(
+            _run_document_indexing_job,
+            document_id,
+            file_hash,
+            str(parsed_markdown_path),
+            _normalize_source_parser(parsed_meta.get("source_parser")),
+            _normalize_source_type(parsed_meta.get("source_type")),
+        )
         queued_documents += 1
 
     db.commit()

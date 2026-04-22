@@ -240,6 +240,29 @@ def _get_marker_models() -> dict[str, Any]:
     return _marker_models
 
 
+def _render_pdf_with_marker(file_path: Path) -> tuple[str, dict[str, Any]]:
+    try:
+        from marker.converters.pdf import PdfConverter
+    except ImportError as exc:  # pragma: no cover - depends on optional package
+        raise ValueError(
+            "PDF_PARSER_MODE=marker requires marker-pdf to be installed in backend venv. "
+            "Run: pip install marker-pdf"
+        ) from exc
+
+    converter = PdfConverter(
+        artifact_dict=_get_marker_models(),
+        config={
+            "paginate_output": True,
+            "extract_images": False,
+        },
+    )
+
+    rendered = converter(str(file_path))
+    markdown = str(getattr(rendered, "markdown", "") or "").strip()
+    marker_metadata = getattr(rendered, "metadata", {}) or {}
+    return markdown, marker_metadata
+
+
 def _marker_page_stats(metadata: dict[str, Any]) -> dict[int, dict[str, Any]]:
     page_stats = metadata.get("page_stats")
     if not isinstance(page_stats, list):
@@ -385,28 +408,10 @@ def _write_header_split_output_log(
 
 
 def _load_pdf_with_marker(file_path: Path) -> list[Document]:
-    try:
-        from marker.converters.pdf import PdfConverter
-    except ImportError as exc:  # pragma: no cover - depends on optional package
-        raise ValueError(
-            "PDF_PARSER_MODE=marker requires marker-pdf to be installed in backend venv. "
-            "Run: pip install marker-pdf"
-        ) from exc
-
-    converter = PdfConverter(
-        artifact_dict=_get_marker_models(),
-        config={
-            "paginate_output": True,
-            "extract_images": False,
-        },
-    )
-
-    rendered = converter(str(file_path))
-    markdown = str(getattr(rendered, "markdown", "") or "").strip()
+    markdown, marker_metadata = _render_pdf_with_marker(file_path)
     if not markdown:
         return []
 
-    marker_metadata = getattr(rendered, "metadata", {}) or {}
     page_stats = _marker_page_stats(marker_metadata)
     pages = _split_marker_pages(markdown)
     log_path = _write_markdown_output_log(
@@ -473,6 +478,105 @@ def _load_text_or_markdown(file_path: Path) -> list[Document]:
         metadata.setdefault("source_page", 1)
         item.metadata = metadata
     return loaded
+
+
+def _markdown_documents_for_pdf(
+    markdown: str,
+    *,
+    source: str,
+    source_parser: str,
+) -> list[Document]:
+    pages = _split_marker_pages(markdown)
+    if not pages:
+        return [
+            Document(
+                page_content=markdown,
+                metadata={
+                    "source": source,
+                    "source_parser": source_parser,
+                    "source_type": "pdf",
+                },
+            )
+        ]
+
+    return [
+        Document(
+            page_content=page_text,
+            metadata={
+                "source": source,
+                "source_parser": source_parser,
+                "source_type": "pdf",
+                "source_page": marker_page_id + 1,
+                "marker_page_id": marker_page_id,
+            },
+        )
+        for marker_page_id, page_text in pages
+        if page_text.strip()
+    ]
+
+
+def parse_source_to_markdown(file_path: Path) -> tuple[str, str, str]:
+    """Parse one source file to markdown text and return parser/source metadata."""
+
+    suffix = file_path.suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported file extension: {suffix}. Supported extensions: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+        )
+
+    if suffix == ".pdf":
+        if settings.pdf_parser_mode == "marker":
+            markdown, _ = _render_pdf_with_marker(file_path)
+            return markdown.strip(), "marker", "pdf"
+
+        pages = _load_pdf_with_legacy_parser(file_path)
+        markdown = "\n\n".join(str(item.page_content or "").strip() for item in pages if str(item.page_content or "").strip())
+        return markdown.strip(), "legacy", "pdf"
+
+    if suffix == ".md":
+        markdown = file_path.read_text(encoding="utf-8")
+        return markdown.strip(), "legacy", "text"
+
+    loaded = _load_text_or_markdown(file_path)
+    markdown = "\n\n".join(str(item.page_content or "").strip() for item in loaded if str(item.page_content or "").strip())
+    return markdown.strip(), "legacy", "text"
+
+
+def load_documents_from_parsed_markdown(
+    markdown_path: Path,
+    *,
+    source_file_path: Path,
+    source_parser: str,
+    source_type: str,
+) -> list[Document]:
+    """Load split-ready documents from parsed markdown generated in Step A."""
+
+    markdown = markdown_path.read_text(encoding="utf-8").strip()
+    if not markdown:
+        return []
+
+    source = str(source_file_path)
+    normalized_source_type = source_type.strip().lower()
+    normalized_parser = source_parser.strip().lower()
+
+    if normalized_source_type == "pdf":
+        return _markdown_documents_for_pdf(
+            markdown,
+            source=source,
+            source_parser=normalized_parser or "marker",
+        )
+
+    return [
+        Document(
+            page_content=markdown,
+            metadata={
+                "source": source,
+                "source_parser": normalized_parser or "legacy",
+                "source_type": "text",
+                "source_page": 1,
+            },
+        )
+    ]
 
 
 def _recursive_split(
