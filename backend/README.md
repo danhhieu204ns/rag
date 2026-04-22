@@ -3,7 +3,7 @@
 ## Features
 
 - Document CRUD and upload API
-- Embedding/chunking pipeline for uploaded documents
+- Async incremental indexing pipeline per document (BackgroundTasks)
 - Dual PDF parser mode via env (`legacy` or `marker`)
 - Structured chunk metadata schema for hybrid search:
 	- `source_info` (file, page, doc_type)
@@ -11,10 +11,17 @@
 	- `search_optimization` (entities, organizations, dates, document_codes)
 	- `admin_tags` (security_level, department)
 - HyQ enrichment at indexing time (`summary` + hypothetical `questions`)
+- HyQ LLM batching for metadata generation
+- Metadata cache in SQLite (`chunk_metadata_cache`) keyed by `document_id + file_hash + chunk_fingerprint`
 - Parent-child retrieval: child vectors are indexed, parent chunk text is returned to LLM
 - Hybrid retrieval (vector + keyword) with reciprocal-rank-fusion
 - Qdrant as vector store backend (local mode by default, remote mode optional)
 - Chat query endpoint with persistent chat memory
+
+## Auth Model
+
+- Document APIs (`/api/documents/*`) require admin JWT Bearer token.
+- Chat APIs (`/api/chat/*`) are public in current implementation.
 
 ## Run
 
@@ -55,6 +62,9 @@ Optional tuning:
 - `METADATA_MODEL` (default: fallback to `HYQ_MODEL`, then `LLM_MODEL`)
 - `METADATA_OLLAMA_NUM_THREAD` (default: fallback to `OLLAMA_NUM_THREAD`)
 - `METADATA_OLLAMA_NUM_PREDICT` (default: `256`)
+- `METADATA_LLM_BATCH_SIZE` (default: `8`, số chunk gọi LLM mỗi lượt)
+- `METADATA_LLM_BATCH_MAX_CHARS` (default: `12000`, ngưỡng ký tự prompt cho mỗi batch)
+- `VECTOR_BATCH_SIZE` (default: `64`, can increase to `128` if RAM allows)
 - `HYQ_SUMMARY_WORDS` (default: `50`)
 - `HYQ_QUESTIONS_PER_CHUNK` (default: `3`)
 - `HYBRID_VECTOR_RRF_WEIGHT` (default: `1.0`)
@@ -106,6 +116,29 @@ METADATA_OLLAMA_NUM_PREDICT=192
 ```
 
 Embedding model is served via Ollama using `langchain-ollama`.
+
+## Async Indexing Behavior
+
+- `POST /api/documents/{document_id}/embed` now queues background indexing and returns `202 Accepted` immediately.
+- `POST /api/documents/reindex` now queues pending documents in background instead of blocking request time.
+- Document `status` transitions: `uploaded` -> `indexing` -> `embedded` (or `index_failed` when background task fails).
+- Qdrant upsert is executed with async write mode (`wait=false`) for faster ingestion throughput.
+- Incremental vector updates are scoped per `document_id` (no collection recreate in upload/embed flow).
+- Immediate response semantics:
+	- queued embed: `chunks_created=0`, `indexed_chunks=0`
+	- unchanged file hash and already embedded: returns cached counts without re-indexing
+
+## Metadata Optimization
+
+- HyQ LLM calls are now batched: multiple chunks are grouped into one inference call to reduce Ollama I/O overhead.
+- Metadata is cached per `document_id + file_hash + chunk_fingerprint` in SQLite table `chunk_metadata_cache`.
+- Re-indexing the same content reuses cached metadata and skips repeated LLM generation.
+
+## Operational Notes
+
+- BackgroundTasks are in-process jobs. If backend restarts during indexing, in-flight jobs may stop.
+- `POST /api/documents/reindex` is used to queue pending documents again after restart/failure.
+- Increasing `METADATA_LLM_BATCH_SIZE` and `VECTOR_BATCH_SIZE` can improve throughput but may increase RAM/VRAM usage.
 
 ## Optimizations Applied for Indexing
 

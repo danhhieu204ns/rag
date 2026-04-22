@@ -3,14 +3,13 @@ import axios from "axios";
 const TOKEN_KEY = "rag_admin_token";
 
 function resolveApiBaseUrl() {
-  const raw = (import.meta.env.VITE_API_BASE_URL || "http://10.20.2.60:8000").trim();
+  const raw = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").trim();
   const noTrailingSlash = raw.replace(/\/+$/, "");
   return noTrailingSlash.endsWith("/api") ? noTrailingSlash : `${noTrailingSlash}/api`;
 }
 
 const api = axios.create({
   baseURL: resolveApiBaseUrl(),
-  baseURL: import.meta.env.VITE_API_BASE_URL || "http://10.20.2.60:8000/api",
   timeout: 120000,
 });
 

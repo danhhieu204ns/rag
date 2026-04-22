@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import time
 import unicodedata
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 from collections import defaultdict
 from typing import Any
 
@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from qdrant_client import QdrantClient
+from qdrant_client.http import models as qdrant_models
 from qdrant_client.http.models import Distance, PointStruct, VectorParams
 from sqlalchemy.orm import Session
 
@@ -25,7 +26,6 @@ from ..models import ChatMessage, DocumentChunk
 from .chunk_metadata import build_hyq_children, build_keyword_blob, extract_document_codes
 
 logger = logging.getLogger(__name__)
-_EMBED_BATCH_SIZE = 16
 _QUERY_LOG_FILE_NAME = "query_trace.json"
 _LEGACY_QUERY_LOG_FILE_NAME = "query_trace.jsonl"
 
@@ -256,10 +256,68 @@ def _clear_qdrant_collection(client: QdrantClient) -> None:
         client.delete_collection(collection_name=settings.qdrant_collection_name)
 
 
+def delete_vectors_by_document_id(document_id: int) -> None:
+    """Delete all child vectors in Qdrant for one document id."""
+
+    client = _get_qdrant_client()
+    if not _qdrant_collection_exists(client):
+        _emit_reindex_progress(
+            "[vector-delete] Collection '%s' not found. Skip document_id=%s.",
+            settings.qdrant_collection_name,
+            document_id,
+        )
+        return
+
+    document_filter = qdrant_models.Filter(
+        must=[
+            qdrant_models.FieldCondition(
+                key="document_id",
+                match=qdrant_models.MatchValue(value=document_id),
+            )
+        ]
+    )
+
+    # Compatibility: older qdrant-client may require FilterSelector explicitly.
+    try:
+        client.delete(
+            collection_name=settings.qdrant_collection_name,
+            points_selector=document_filter,
+            wait=True,
+        )
+    except TypeError:
+        client.delete(
+            collection_name=settings.qdrant_collection_name,
+            points_selector=qdrant_models.FilterSelector(filter=document_filter),
+            wait=True,
+        )
+
+    _emit_reindex_progress(
+        "[vector-delete] Deleted vectors for document_id=%s in collection '%s'.",
+        document_id,
+        settings.qdrant_collection_name,
+    )
+
+
 def _serialize_qdrant_payload(metadata: dict[str, object], child_text: str) -> dict[str, object]:
     payload = dict(metadata)
     payload["child_text"] = child_text
     return json.loads(json.dumps(payload, ensure_ascii=False))
+
+
+def _stable_child_point_id(metadata: dict[str, object]) -> str:
+    """Build deterministic UUID so upsert overwrites previous child vectors."""
+
+    parent_chunk_id = _to_int(metadata.get("parent_chunk_id")) or 0
+    child_type = str(metadata.get("child_type") or "summary")
+    child_index = _to_int(metadata.get("child_index")) or 0
+
+    raw = (
+        f"{settings.qdrant_collection_name}|"
+        f"parent:{parent_chunk_id}|"
+        f"type:{child_type}|"
+        f"index:{child_index}"
+    )
+    return str(uuid5(NAMESPACE_URL, raw))
 
 
 def _search_qdrant_children(query: str, limit: int) -> list[Document]:
@@ -357,13 +415,25 @@ def _search_qdrant_children(query: str, limit: int) -> list[Document]:
     return documents
 
 
-def _rebuild_qdrant_collection_with_batch_embeddings(documents: list[Document]) -> int:
+def _upsert_qdrant_collection_with_batch_embeddings(
+    documents: list[Document],
+    *,
+    purge_document_ids: list[int] | None = None,
+) -> int:
     texts = [item.page_content for item in documents]
     metadatas = [dict(item.metadata or {}) for item in documents]
+
+    unique_document_ids = sorted({int(item) for item in (purge_document_ids or [])})
+    for document_id in unique_document_ids:
+        delete_vectors_by_document_id(document_id)
+
+    if not texts:
+        return 0
+
     embeddings_client = get_embeddings()
 
     total = len(texts)
-    batch_size = max(1, _EMBED_BATCH_SIZE)
+    batch_size = max(1, settings.vector_batch_size)
     batch_count = (total + batch_size - 1) // batch_size
 
     all_vectors_dict: dict[int, list[list[float]]] = {}
@@ -400,15 +470,20 @@ def _rebuild_qdrant_collection_with_batch_embeddings(documents: list[Document]) 
         return 0
 
     client = _get_qdrant_client()
-    _clear_qdrant_collection(client)
 
     vector_size = len(all_vectors[0])
-    client.create_collection(
-        collection_name=settings.qdrant_collection_name,
-        vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
-    )
+    if not _qdrant_collection_exists(client):
+        client.create_collection(
+            collection_name=settings.qdrant_collection_name,
+            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+        )
+        _emit_reindex_progress(
+            "[reindex] Created collection '%s' with vector_size=%d",
+            settings.qdrant_collection_name,
+            vector_size,
+        )
 
-    upsert_batch_size = max(1, _EMBED_BATCH_SIZE)
+    upsert_batch_size = max(1, settings.vector_batch_size)
     upsert_batch_count = (total + upsert_batch_size - 1) // upsert_batch_size
     for batch_index, start in enumerate(range(0, total, upsert_batch_size), start=1):
         end = min(start + upsert_batch_size, total)
@@ -417,7 +492,7 @@ def _rebuild_qdrant_collection_with_batch_embeddings(documents: list[Document]) 
         for idx in range(start, end):
             points.append(
                 PointStruct(
-                    id=idx + 1,
+                    id=_stable_child_point_id(metadatas[idx]),
                     vector=all_vectors[idx],
                     payload=_serialize_qdrant_payload(metadatas[idx], texts[idx]),
                 )
@@ -426,7 +501,7 @@ def _rebuild_qdrant_collection_with_batch_embeddings(documents: list[Document]) 
         client.upsert(
             collection_name=settings.qdrant_collection_name,
             points=points,
-            wait=True,
+            wait=False,
         )
         _emit_reindex_progress(
             "[reindex] Upserted child docs %d/%d (batch %d/%d)",
@@ -802,17 +877,17 @@ def load_index_if_available() -> bool:
 
 
 def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
-    """Rebuild global Qdrant collection from all chunks available in database."""
+    """Incrementally upsert Qdrant vectors from the provided parent chunks."""
 
     started_at = time.perf_counter()
-    client = _get_qdrant_client()
 
     if not chunks:
-        _emit_reindex_progress("[reindex] No chunks found. Clearing Qdrant collection.")
-        _clear_qdrant_collection(client)
+        _emit_reindex_progress("[reindex] No chunks provided for incremental upsert.")
         return 0
 
-    _emit_reindex_progress("[reindex] Start rebuilding Qdrant from %d parent chunks.", len(chunks))
+    _emit_reindex_progress("[reindex] Start incremental upsert from %d parent chunks.", len(chunks))
+
+    touched_document_ids = sorted({chunk.document_id for chunk in chunks})
 
     documents: list[Document] = []
     for chunk in chunks:
@@ -843,8 +918,7 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
             )
 
     if not documents:
-        _emit_reindex_progress("[reindex] No child documents generated. Clearing Qdrant collection.")
-        _clear_qdrant_collection(client)
+        _emit_reindex_progress("[reindex] No child documents generated for incremental upsert.")
         return 0
 
     _emit_reindex_progress(
@@ -853,7 +927,10 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
         settings.embedding_model_name,
     )
 
-    indexed_count = _rebuild_qdrant_collection_with_batch_embeddings(documents)
+    indexed_count = _upsert_qdrant_collection_with_batch_embeddings(
+        documents,
+        purge_document_ids=touched_document_ids,
+    )
 
     elapsed = time.perf_counter() - started_at
     _emit_reindex_progress(

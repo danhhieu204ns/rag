@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import hashlib
 import json
 import logging
 import shutil
@@ -9,19 +10,19 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.exc import OperationalError
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..core.settings import settings
-from ..db import get_db
-from ..models import AdminUser, Document, DocumentChunk
+from ..db import SessionLocal, get_db
+from ..models import AdminUser, ChunkMetadataCache, Document, DocumentChunk, DocumentIndexState
 from ..schemas import DocumentChunkListResponse, DocumentChunkRead, DocumentRead, DocumentUpdate, EmbedDocumentResponse
-from ..services.chunk_metadata import build_structured_chunk_metadata
+from ..services.chunk_metadata import build_structured_chunk_metadata_batch
 from ..services.document_processing import load_source_documents, split_source_documents
 from .auth import require_admin
-from ..services.rag_runtime import rebuild_index_from_chunks
+from ..services.rag_runtime import delete_vectors_by_document_id, rebuild_index_from_chunks
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
@@ -104,6 +105,99 @@ def _parse_source_metadata(raw_json: str | None) -> dict[str, Any] | None:
     return payload
 
 
+def _compute_file_hash(file_path: Path) -> str:
+    digest = hashlib.sha256()
+    with file_path.open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _compute_chunk_fingerprint(
+    *,
+    chunk_text: str,
+    raw_metadata: dict[str, Any],
+    source_page: int | None,
+    source_kind: str,
+) -> str:
+    payload = {
+        "chunk_text": chunk_text,
+        "source_page": source_page,
+        "source_kind": source_kind,
+        "raw_metadata": _json_safe_value(raw_metadata),
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _load_metadata_cache(
+    *,
+    db: Session,
+    document_id: int,
+    file_hash: str,
+    chunk_fingerprints: list[str],
+) -> dict[str, dict[str, Any]]:
+    if not chunk_fingerprints:
+        return {}
+
+    rows = (
+        db.query(ChunkMetadataCache)
+        .filter(ChunkMetadataCache.document_id == document_id)
+        .filter(ChunkMetadataCache.file_hash == file_hash)
+        .filter(ChunkMetadataCache.chunk_fingerprint.in_(chunk_fingerprints))
+        .all()
+    )
+
+    cache_map: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        parsed = _parse_source_metadata(row.metadata_json)
+        if parsed is None:
+            continue
+        cache_map[row.chunk_fingerprint] = parsed
+    return cache_map
+
+
+def _save_metadata_cache(
+    *,
+    db: Session,
+    document_id: int,
+    file_hash: str,
+    cached_payloads: list[tuple[str, str]],
+) -> None:
+    write_attempts = 3
+    for attempt in range(write_attempts):
+        try:
+            db.query(ChunkMetadataCache).filter(
+                ChunkMetadataCache.document_id == document_id,
+                ChunkMetadataCache.file_hash == file_hash,
+            ).delete(synchronize_session=False)
+
+            if cached_payloads:
+                rows = [
+                    ChunkMetadataCache(
+                        document_id=document_id,
+                        file_hash=file_hash,
+                        chunk_fingerprint=fingerprint,
+                        metadata_json=metadata_json,
+                    )
+                    for fingerprint, metadata_json in cached_payloads
+                ]
+                db.add_all(rows)
+
+            db.commit()
+            return
+        except OperationalError as exc:
+            db.rollback()
+            if "database is locked" not in str(exc).lower() or attempt == write_attempts - 1:
+                raise RuntimeError(
+                    "Database is busy while saving metadata cache. Please retry after a few seconds."
+                ) from exc
+            time.sleep(0.4 * (attempt + 1))
+
+
 
 def _to_document_read(document: Document, chunk_count: int) -> DocumentRead:
     return DocumentRead(
@@ -129,6 +223,307 @@ def _to_document_chunk_read(chunk: DocumentChunk) -> DocumentChunkRead:
         source_metadata=_parse_source_metadata(chunk.source_metadata_json),
         created_at=chunk.created_at,
     )
+
+
+def _build_document_chunks_for_indexing(
+    *,
+    db: Session,
+    document_id: int,
+    original_filename: str,
+    file_path: Path,
+    file_hash: str,
+) -> tuple[list[DocumentChunk], list[tuple[str, str]]]:
+    loaded_documents = load_source_documents(file_path)
+    _emit_progress(
+        "[embed_document][bg] Loaded %d source document blocks for document_id=%s",
+        len(loaded_documents),
+        document_id,
+    )
+    split_documents = split_source_documents(
+        loaded_documents,
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
+    )
+    _emit_progress(
+        "[embed_document][bg] Split into %d chunks for document_id=%s",
+        len(split_documents),
+        document_id,
+    )
+
+    candidates: list[dict[str, Any]] = []
+    for item in split_documents:
+        text = item.page_content.strip()
+        if not text:
+            continue
+
+        item_metadata = dict(item.metadata or {})
+        source_page = _extract_source_page(item_metadata)
+        source_kind = _extract_source_kind(item_metadata, file_path.suffix.lower())
+        chunk_index = len(candidates)
+        fingerprint = _compute_chunk_fingerprint(
+            chunk_text=text,
+            raw_metadata=item_metadata,
+            source_page=source_page,
+            source_kind=source_kind,
+        )
+        candidates.append(
+            {
+                "chunk_index": chunk_index,
+                "chunk_text": text,
+                "raw_metadata": item_metadata,
+                "source_page": source_page,
+                "source_kind": source_kind,
+                "fingerprint": fingerprint,
+            }
+        )
+
+    metadata_cache = _load_metadata_cache(
+        db=db,
+        document_id=document_id,
+        file_hash=file_hash,
+        chunk_fingerprints=[str(item["fingerprint"]) for item in candidates],
+    )
+    cached_count = sum(1 for item in candidates if item["fingerprint"] in metadata_cache)
+
+    _emit_progress(
+        "[embed_document][bg] Preparing metadata for %d chunks (cache_hit=%d, document_id=%s)",
+        len(candidates),
+        cached_count,
+        document_id,
+    )
+
+    prepared_metadata: list[dict[str, Any] | None] = [None] * len(candidates)
+    uncached_candidates: list[dict[str, Any]] = []
+
+    for item in candidates:
+        cached_metadata = metadata_cache.get(str(item["fingerprint"]))
+        if cached_metadata is not None:
+            prepared_metadata[int(item["chunk_index"])] = cached_metadata
+            continue
+        uncached_candidates.append(item)
+
+    if uncached_candidates:
+        generated_metadata = build_structured_chunk_metadata_batch(
+            document_id=document_id,
+            file_name=original_filename,
+            chunks=[
+                {
+                    "chunk_index": item["chunk_index"],
+                    "source_page": item["source_page"],
+                    "raw_metadata": item["raw_metadata"],
+                    "chunk_text": item["chunk_text"],
+                }
+                for item in uncached_candidates
+            ],
+        )
+
+        for idx, item in enumerate(uncached_candidates):
+            prepared_metadata[int(item["chunk_index"])] = generated_metadata[idx]
+
+    if any(item is None for item in prepared_metadata):
+        raise RuntimeError("Failed to build chunk metadata for all chunks.")
+
+    new_chunks: list[DocumentChunk] = []
+    cached_payloads: list[tuple[str, str]] = []
+    for item in candidates:
+        chunk_index = int(item["chunk_index"])
+        structured_metadata = prepared_metadata[chunk_index]
+        if structured_metadata is None:
+            continue
+
+        text = str(item["chunk_text"])
+        source_page = _to_int(item["source_page"])
+        source_kind = str(item["source_kind"])
+        serialized = _serialize_source_metadata(structured_metadata)
+        if serialized is not None:
+            cached_payloads.append((str(item["fingerprint"]), serialized))
+
+        new_chunks.append(
+            DocumentChunk(
+                document_id=document_id,
+                chunk_index=chunk_index,
+                content=text,
+                source_page=source_page,
+                source_kind=source_kind,
+                source_metadata_json=serialized,
+            )
+        )
+
+    return new_chunks, cached_payloads
+
+
+def _write_document_chunks(
+    *,
+    db: Session,
+    document_id: int,
+    new_chunks: list[DocumentChunk],
+) -> None:
+    write_attempts = 3
+    for attempt in range(write_attempts):
+        try:
+            target_document = db.get(Document, document_id)
+            if target_document is None:
+                raise RuntimeError("Document not found while writing chunks.")
+
+            _emit_progress(
+                "[embed_document][bg] Writing chunks to DB document_id=%s (attempt=%d/%d, chunks=%d)",
+                document_id,
+                attempt + 1,
+                write_attempts,
+                len(new_chunks),
+            )
+            db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete(
+                synchronize_session=False
+            )
+
+            if new_chunks:
+                db.add_all(new_chunks)
+
+            db.commit()
+            _emit_progress("[embed_document][bg] DB write committed for document_id=%s", document_id)
+            return
+        except OperationalError as exc:
+            db.rollback()
+            if "database is locked" not in str(exc).lower() or attempt == write_attempts - 1:
+                raise RuntimeError(
+                    "Database is busy while embedding document. Please retry after a few seconds."
+                ) from exc
+            time.sleep(0.4 * (attempt + 1))
+
+
+def _save_index_state(
+    *,
+    db: Session,
+    document_id: int,
+    file_hash: str,
+    indexed_parent_chunks: int,
+    indexed_child_chunks: int,
+) -> None:
+    write_attempts = 3
+    for attempt in range(write_attempts):
+        try:
+            document = db.get(Document, document_id)
+            if document is None:
+                return
+
+            document.status = "embedded" if indexed_parent_chunks > 0 else "uploaded"
+            db.add(document)
+
+            index_state = db.get(DocumentIndexState, document_id)
+            if index_state is None:
+                index_state = DocumentIndexState(
+                    document_id=document_id,
+                    file_hash=file_hash,
+                )
+
+            index_state.file_hash = file_hash
+            index_state.indexed_parent_chunks = indexed_parent_chunks
+            index_state.indexed_child_chunks = indexed_child_chunks
+            index_state.indexed_at = datetime.utcnow()
+            db.add(index_state)
+            db.commit()
+            return
+        except OperationalError as exc:
+            db.rollback()
+            if "database is locked" not in str(exc).lower() or attempt == write_attempts - 1:
+                raise RuntimeError(
+                    "Database is busy while saving index state. Please retry after a few seconds."
+                ) from exc
+            time.sleep(0.4 * (attempt + 1))
+
+
+def _run_document_indexing_job(document_id: int, file_hash: str) -> None:
+    db = SessionLocal()
+    started_at = time.perf_counter()
+
+    try:
+        document = db.get(Document, document_id)
+        if document is None:
+            _emit_progress("[embed_document][bg] Skip missing document_id=%s", document_id)
+            return
+
+        original_filename = document.original_filename
+        file_path = settings.uploads_dir / document.stored_filename
+        if not file_path.exists():
+            raise RuntimeError(f"Stored file does not exist for document_id={document_id}")
+
+        _emit_progress(
+            "[embed_document][bg] Start indexing document_id=%s file='%s'",
+            document_id,
+            original_filename,
+        )
+
+        new_chunks = _build_document_chunks_for_indexing(
+            db=db,
+            document_id=document_id,
+            original_filename=original_filename,
+            file_path=file_path,
+            file_hash=file_hash,
+        )
+        chunk_rows, metadata_cache_payloads = new_chunks
+
+        _write_document_chunks(
+            db=db,
+            document_id=document_id,
+            new_chunks=chunk_rows,
+        )
+
+        _save_metadata_cache(
+            db=db,
+            document_id=document_id,
+            file_hash=file_hash,
+            cached_payloads=metadata_cache_payloads,
+        )
+
+        document_chunks = (
+            db.query(DocumentChunk)
+            .filter(DocumentChunk.document_id == document_id)
+            .order_by(DocumentChunk.id.asc())
+            .all()
+        )
+        db.expunge_all()
+        db.rollback()
+
+        if document_chunks:
+            indexed_count = rebuild_index_from_chunks(document_chunks)
+        else:
+            delete_vectors_by_document_id(document_id)
+            indexed_count = 0
+
+        _save_index_state(
+            db=db,
+            document_id=document_id,
+            file_hash=file_hash,
+            indexed_parent_chunks=len(document_chunks),
+            indexed_child_chunks=indexed_count,
+        )
+
+        elapsed = time.perf_counter() - started_at
+        _emit_progress(
+            "[embed_document][bg] Completed document_id=%s chunks_created=%s indexed_children=%s elapsed=%.2fs",
+            document_id,
+            len(chunk_rows),
+            indexed_count,
+            elapsed,
+        )
+    except Exception as exc:
+        db.rollback()
+        _emit_progress(
+            "[embed_document][bg] Failed document_id=%s root_cause=%s",
+            document_id,
+            exc,
+        )
+
+        try:
+            failed_document = db.get(Document, document_id)
+            if failed_document is not None:
+                failed_document.status = "index_failed"
+                db.add(failed_document)
+                db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
 
 
 @router.get("", response_model=list[DocumentRead])
@@ -271,275 +666,166 @@ def delete_document(
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
 ) -> None:
-    """Delete document metadata, source file, and rebuild global vector index."""
+    """Delete one document from DB, source storage, and VectorDB."""
 
     document = db.get(Document, document_id)
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found.")
 
-    file_path = settings.uploads_dir / document.stored_filename
-    if file_path.exists():
-        file_path.unlink()
-
-    db.delete(document)
-    db.commit()
-
-    remaining_chunks = db.query(DocumentChunk).order_by(DocumentChunk.id.asc()).all()
-    _emit_progress(
-        "[delete_document] Rebuilding global index after deleting document_id=%s (remaining_parent_chunks=%s).",
-        document_id,
-        len(remaining_chunks),
-    )
-    db.expunge_all()
-    db.rollback()
-    rebuild_index_from_chunks(remaining_chunks)
-
-
-@router.post("/{document_id}/embed", response_model=EmbedDocumentResponse)
-def embed_document(
-    document_id: int,
-    db: Session = Depends(get_db),
-    _: AdminUser = Depends(require_admin),
-) -> EmbedDocumentResponse:
-    """Create chunks for one document and rebuild global Qdrant index."""
-
-    document = db.get(Document, document_id)
-    if document is None:
-        raise HTTPException(status_code=404, detail="Document not found.")
-
-    original_filename = document.original_filename
-    stored_filename = document.stored_filename
-    started_at = time.perf_counter()
-    _emit_progress(
-        "[embed_document] Start embedding document_id=%s file='%s'",
-        document_id,
-        original_filename,
-    )
-    # Release transaction early before expensive OCR/chunking work.
-    db.rollback()
-
-    file_path = settings.uploads_dir / stored_filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Stored file does not exist.")
-
     try:
-        loaded_documents = load_source_documents(file_path)
-        _emit_progress(
-            "[embed_document] Loaded %d source document blocks for document_id=%s",
-            len(loaded_documents),
-            document_id,
-        )
-        split_documents = split_source_documents(
-            loaded_documents,
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
-        )
-        _emit_progress(
-            "[embed_document] Split into %d chunks for document_id=%s",
-            len(split_documents),
-            document_id,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    candidates: list[tuple[int, str, dict[str, Any], int | None, str]] = []
-    for item in split_documents:
-        text = item.page_content.strip()
-        if not text:
-            continue
-
-        item_metadata = dict(item.metadata or {})
-        source_page = _extract_source_page(item_metadata)
-        source_kind = _extract_source_kind(item_metadata, file_path.suffix.lower())
-        candidates.append((len(candidates), text, item_metadata, source_page, source_kind))
-
-    metadata_workers = max(1, settings.metadata_max_workers)
-    _emit_progress(
-        "[embed_document] Preparing metadata for %d chunks with workers=%d (document_id=%s)",
-        len(candidates),
-        metadata_workers,
-        document_id,
-    )
-
-    prepared_rows: list[tuple[str, int | None, str, dict[str, Any]] | None] = [None] * len(candidates)
-
-    def _build_metadata_row(
-        candidate: tuple[int, str, dict[str, Any], int | None, str],
-    ) -> tuple[int, tuple[str, int | None, str, dict[str, Any]]]:
-        chunk_index, text, item_metadata, source_page, source_kind = candidate
-        structured_metadata = build_structured_chunk_metadata(
-            document_id=document_id,
-            chunk_index=chunk_index,
-            file_name=original_filename,
-            source_page=source_page,
-            raw_metadata=item_metadata,
-            chunk_text=text,
-        )
-        return chunk_index, (text, source_page, source_kind, structured_metadata)
-
-    if metadata_workers <= 1 or len(candidates) <= 1:
-        for processed_count, candidate in enumerate(candidates, start=1):
-            chunk_index, payload = _build_metadata_row(candidate)
-            prepared_rows[chunk_index] = payload
-            if processed_count % 20 == 0 or processed_count == len(candidates):
-                _emit_progress(
-                    "[embed_document] Prepared chunk metadata %d/%d for document_id=%s",
-                    processed_count,
-                    len(candidates),
-                    document_id,
-                )
-    else:
-        with ThreadPoolExecutor(max_workers=metadata_workers) as executor:
-            futures = [executor.submit(_build_metadata_row, candidate) for candidate in candidates]
-            processed_count = 0
-
-            for future in as_completed(futures):
-                chunk_index, payload = future.result()
-                prepared_rows[chunk_index] = payload
-                processed_count += 1
-
-                if processed_count % 20 == 0 or processed_count == len(candidates):
-                    _emit_progress(
-                        "[embed_document] Prepared chunk metadata %d/%d for document_id=%s",
-                        processed_count,
-                        len(candidates),
-                        document_id,
-                    )
-
-    if any(item is None for item in prepared_rows):
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to build chunk metadata for all chunks.",
-        )
-
-    new_chunks: list[DocumentChunk] = []
-    for chunk_index, payload in enumerate(prepared_rows):
-        if payload is None:
-            continue
-
-        text, source_page, source_kind, structured_metadata = payload
-        new_chunks.append(
-            DocumentChunk(
-                document_id=document_id,
-                chunk_index=chunk_index,
-                content=text,
-                source_page=source_page,
-                source_kind=source_kind,
-                source_metadata_json=_serialize_source_metadata(structured_metadata),
-            )
-        )
-
-    write_attempts = 3
-    for attempt in range(write_attempts):
-        try:
-            target_document = db.get(Document, document_id)
-            if target_document is None:
-                raise HTTPException(status_code=404, detail="Document not found.")
-
-            _emit_progress(
-                "[embed_document] Writing chunks to DB document_id=%s (attempt=%d/%d, chunks=%d)",
-                document_id,
-                attempt + 1,
-                write_attempts,
-                len(new_chunks),
-            )
-            db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete(
-                synchronize_session=False
-            )
-
-            if new_chunks:
-                db.add_all(new_chunks)
-
-            target_document.status = "embedded" if new_chunks else "uploaded"
-            db.add(target_document)
-            db.commit()
-            _emit_progress("[embed_document] DB write committed for document_id=%s", document_id)
-            break
-        except OperationalError as exc:
-            db.rollback()
-            _emit_progress(
-                "[embed_document] DB locked on document_id=%s (attempt=%d/%d)",
-                document_id,
-                attempt + 1,
-                write_attempts,
-            )
-            if "database is locked" not in str(exc).lower() or attempt == write_attempts - 1:
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Database is busy while embedding document. "
-                        "Please retry after a few seconds."
-                    ),
-                ) from exc
-            time.sleep(0.4 * (attempt + 1))
-
-    all_chunks = db.query(DocumentChunk).order_by(DocumentChunk.id.asc()).all()
-    _emit_progress(
-        "[embed_document] Rebuilding Qdrant from %d parent chunks after embedding document_id=%s",
-        len(all_chunks),
-        document_id,
-    )
-    db.expunge_all()
-    db.rollback()
-    try:
-        indexed_count = rebuild_index_from_chunks(all_chunks)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        delete_vectors_by_document_id(document_id)
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Failed to rebuild Qdrant collection using Ollama embeddings. "
-                f"base_url={settings.ollama_base_url}, embedding_model={settings.embedding_model_name}. "
-                f"Root cause: {exc}"
-            ),
+            detail=f"Failed to delete vectors for document_id={document_id}. Root cause: {exc}",
         ) from exc
 
-    elapsed = time.perf_counter() - started_at
+    file_path = settings.uploads_dir / document.stored_filename
+
+    try:
+        db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete(
+            synchronize_session=False
+        )
+        db.delete(document)
+        db.commit()
+    except OperationalError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Database is busy while deleting document. Please retry after a few seconds.",
+        ) from exc
+
+    if file_path.exists():
+        file_path.unlink()
+
     _emit_progress(
-        "[embed_document] Completed document_id=%s chunks_created=%s indexed_children=%s elapsed=%.2fs",
+        "[delete_document] Deleted document_id=%s from DB and VectorDB.",
         document_id,
-        len(new_chunks),
-        indexed_count,
-        elapsed,
+    )
+
+
+@router.post(
+    "/{document_id}/embed",
+    response_model=EmbedDocumentResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def embed_document(
+    document_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
+) -> EmbedDocumentResponse:
+    """Queue one document for background HyQ + embedding indexing."""
+
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    if document.status == "indexing":
+        raise HTTPException(status_code=409, detail="Document is already indexing.")
+
+    file_path = settings.uploads_dir / document.stored_filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Stored file does not exist.")
+
+    file_hash = _compute_file_hash(file_path)
+    existing_index_state = db.get(DocumentIndexState, document_id)
+    if (
+        existing_index_state is not None
+        and existing_index_state.file_hash == file_hash
+        and document.status == "embedded"
+    ):
+        parent_chunk_count = (
+            db.query(func.count(DocumentChunk.id))
+            .filter(DocumentChunk.document_id == document_id)
+            .scalar()
+            or 0
+        )
+        _emit_progress(
+            "[embed_document] Skip document_id=%s because file_hash is unchanged and already indexed.",
+            document_id,
+        )
+        return EmbedDocumentResponse(
+            document_id=document_id,
+            chunks_created=int(parent_chunk_count),
+            indexed_chunks=int(existing_index_state.indexed_child_chunks),
+        )
+
+    document.status = "indexing"
+    db.add(document)
+    db.commit()
+
+    background_tasks.add_task(_run_document_indexing_job, document_id, file_hash)
+    _emit_progress(
+        "[embed_document] Queued background indexing for document_id=%s",
+        document_id,
     )
 
     return EmbedDocumentResponse(
         document_id=document_id,
-        chunks_created=len(new_chunks),
-        indexed_chunks=indexed_count,
+        chunks_created=0,
+        indexed_chunks=0,
     )
 
 
 @router.post("/reindex", response_model=EmbedDocumentResponse)
 def rebuild_global_index(
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
 ) -> EmbedDocumentResponse:
-    """Rebuild global vector index from all saved chunks."""
+    """Queue pending documents for background incremental indexing."""
 
-    all_chunks = db.query(DocumentChunk).order_by(DocumentChunk.id.asc()).all()
+    documents = db.query(Document).order_by(Document.id.asc()).all()
+    indexed_state_rows = db.query(DocumentIndexState).all()
+    state_by_document_id = {row.document_id: row for row in indexed_state_rows}
+
+    pending: list[tuple[int, str]] = []
+    for document in documents:
+        file_path = settings.uploads_dir / document.stored_filename
+        if not file_path.exists():
+            continue
+
+        current_hash = _compute_file_hash(file_path)
+        tracked = state_by_document_id.get(document.id)
+        if tracked is not None and tracked.file_hash == current_hash and document.status == "embedded":
+            continue
+        pending.append((document.id, current_hash))
+
     _emit_progress(
-        "[rebuild_global_index] Triggered with %d parent chunks.",
-        len(all_chunks),
+        "[rebuild_global_index] Pending documents for incremental indexing: %d",
+        len(pending),
     )
-    db.expunge_all()
-    db.rollback()
-    try:
-        indexed_count = rebuild_index_from_chunks(all_chunks)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Failed to rebuild Qdrant collection using Ollama embeddings. "
-                f"base_url={settings.ollama_base_url}, embedding_model={settings.embedding_model_name}. "
-                f"Root cause: {exc}"
-            ),
-        ) from exc
+
+    if not pending:
+        return EmbedDocumentResponse(
+            document_id=0,
+            chunks_created=0,
+            indexed_chunks=0,
+        )
+
+    queued_documents = 0
+
+    for document_id, file_hash in pending:
+        target_document = db.get(Document, document_id)
+        if target_document is None:
+            continue
+        if target_document.status == "indexing":
+            continue
+
+        target_document.status = "indexing"
+        db.add(target_document)
+        background_tasks.add_task(_run_document_indexing_job, document_id, file_hash)
+        queued_documents += 1
+
+    db.commit()
+    _emit_progress(
+        "[rebuild_global_index] Queued %d documents for background indexing.",
+        queued_documents,
+    )
+
     return EmbedDocumentResponse(
         document_id=0,
-        chunks_created=indexed_count,
-        indexed_chunks=indexed_count,
+        chunks_created=queued_documents,
+        indexed_chunks=0,
     )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -39,6 +39,12 @@ class Document(Base):
         back_populates="document",
         cascade="all, delete-orphan",
     )
+    index_state: Mapped[DocumentIndexState | None] = relationship(
+        "DocumentIndexState",
+        back_populates="document",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
 
 class DocumentChunk(Base):
@@ -54,6 +60,52 @@ class DocumentChunk(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     document: Mapped[Document] = relationship("Document", back_populates="chunks")
+
+
+class DocumentIndexState(Base):
+    __tablename__ = "document_index_states"
+
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    indexed_parent_chunks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    indexed_child_chunks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    indexed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    document: Mapped[Document] = relationship("Document", back_populates="index_state")
+
+
+class ChunkMetadataCache(Base):
+    __tablename__ = "chunk_metadata_cache"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id",
+            "file_hash",
+            "chunk_fingerprint",
+            name="uq_chunk_metadata_cache_document_hash_fp",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    chunk_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
 
 
 class ChatSession(Base):
