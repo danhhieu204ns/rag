@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -125,6 +126,7 @@ def list_messages(session_id: int, db: Session = Depends(get_db)) -> list[ChatMe
 def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> ChatQueryResponse:
     """Run one RAG query, save both user and assistant messages."""
 
+    request_started_at = time.perf_counter()
     user_text = payload.message.strip()
     top_k = payload.top_k or settings.retriever_k
 
@@ -137,6 +139,7 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
     )
 
     session: ChatSession | None = None
+    session_stage_started_at = time.perf_counter()
     if payload.session_id is not None:
         session = db.get(ChatSession, payload.session_id)
         if session is None:
@@ -164,7 +167,13 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
             db.refresh(session)
 
         _emit_query_progress("[chat.query] Use existing session: session_id=%d", session.id)
+    _emit_query_progress(
+        "[timing][chat.query] DONE step=resolve_session session_id=%d elapsed_ms=%.2f",
+        session.id,
+        (time.perf_counter() - session_stage_started_at) * 1000,
+    )
 
+    save_user_started_at = time.perf_counter()
     user_message = ChatMessage(
         session_id=session.id,
         role="user",
@@ -174,7 +183,13 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
     db.add(user_message)
     db.commit()
     _emit_query_progress("[chat.query] Saved user message: session_id=%d", session.id)
+    _emit_query_progress(
+        "[timing][chat.query] DONE step=save_user_message session_id=%d elapsed_ms=%.2f",
+        session.id,
+        (time.perf_counter() - save_user_started_at) * 1000,
+    )
 
+    history_started_at = time.perf_counter()
     history = (
         db.query(ChatMessage)
         .filter(ChatMessage.session_id == session.id)
@@ -182,7 +197,14 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
         .all()
     )
     _emit_query_progress("[chat.query] Loaded history messages: count=%d", len(history))
+    _emit_query_progress(
+        "[timing][chat.query] DONE step=load_history session_id=%d count=%d elapsed_ms=%.2f",
+        session.id,
+        len(history),
+        (time.perf_counter() - history_started_at) * 1000,
+    )
 
+    retrieval_started_at = time.perf_counter()
     retrieved_docs = similarity_search(
         user_text,
         top_k=top_k,
@@ -190,7 +212,14 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
         document_ids=payload.document_ids,
     )
     _emit_query_progress("[chat.query] Retrieved context docs: count=%d", len(retrieved_docs))
+    _emit_query_progress(
+        "[timing][chat.query] DONE step=similarity_search session_id=%d count=%d elapsed_ms=%.2f",
+        session.id,
+        len(retrieved_docs),
+        (time.perf_counter() - retrieval_started_at) * 1000,
+    )
 
+    answer_started_at = time.perf_counter()
     try:
         answer = generate_answer(
             question=user_text,
@@ -201,10 +230,24 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
     except Exception as exc:  # pragma: no cover - external API/network failure
         _emit_query_progress("[chat.query] Generate answer failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    _emit_query_progress(
+        "[timing][chat.query] DONE step=generate_answer session_id=%d answer_len=%d elapsed_ms=%.2f",
+        session.id,
+        len(answer),
+        (time.perf_counter() - answer_started_at) * 1000,
+    )
 
+    source_payload_started_at = time.perf_counter()
     sources = build_sources(retrieved_docs)
     _emit_query_progress("[chat.query] Built sources payload: count=%d", len(sources))
+    _emit_query_progress(
+        "[timing][chat.query] DONE step=build_sources session_id=%d count=%d elapsed_ms=%.2f",
+        session.id,
+        len(sources),
+        (time.perf_counter() - source_payload_started_at) * 1000,
+    )
 
+    save_assistant_started_at = time.perf_counter()
     assistant_message = ChatMessage(
         session_id=session.id,
         role="assistant",
@@ -217,6 +260,16 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Chat
     db.add(session)
     db.commit()
     _emit_query_progress("[chat.query] Completed request: session_id=%d", session.id)
+    _emit_query_progress(
+        "[timing][chat.query] DONE step=save_assistant_message session_id=%d elapsed_ms=%.2f",
+        session.id,
+        (time.perf_counter() - save_assistant_started_at) * 1000,
+    )
+    _emit_query_progress(
+        "[timing][chat.query] DONE step=request_total session_id=%d elapsed_ms=%.2f",
+        session.id,
+        (time.perf_counter() - request_started_at) * 1000,
+    )
 
     return ChatQueryResponse(
         session_id=session.id,

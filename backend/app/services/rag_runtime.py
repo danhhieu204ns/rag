@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 import json
@@ -11,7 +12,7 @@ import time
 import unicodedata
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from collections import defaultdict
-from typing import Any
+from typing import Any, Iterator
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -205,6 +206,45 @@ def _emit_query_progress(
             "message": raw_text,
             **(details or {}),
         },
+    )
+
+
+@contextmanager
+def _timed_query_step(
+    step: str,
+    *,
+    event_prefix: str,
+    details: dict[str, Any] | None = None,
+) -> Iterator[None]:
+    started_at = time.perf_counter()
+    base_details = dict(details or {})
+    _emit_query_progress(
+        "[timing][query] START step=%s",
+        step,
+        event=f"{event_prefix}_start",
+        details={"step": step, **base_details},
+    )
+    try:
+        yield
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        _emit_query_progress(
+            "[timing][query] FAIL step=%s elapsed_ms=%.2f error=%s",
+            step,
+            elapsed_ms,
+            str(exc),
+            event=f"{event_prefix}_error",
+            details={"step": step, "elapsed_ms": elapsed_ms, "error": str(exc), **base_details},
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    _emit_query_progress(
+        "[timing][query] DONE step=%s elapsed_ms=%.2f",
+        step,
+        elapsed_ms,
+        event=f"{event_prefix}_done",
+        details={"step": step, "elapsed_ms": elapsed_ms, **base_details},
     )
 
 
@@ -416,7 +456,12 @@ def _search_qdrant_children(query: str, limit: int) -> list[Document]:
         },
     )
 
-    query_vector = get_embeddings().embed_query(query)
+    with _timed_query_step(
+        "embed_query_vector",
+        event_prefix="qdrant_embed_query",
+        details={"limit": limit},
+    ):
+        query_vector = get_embeddings().embed_query(query)
     _emit_query_progress(
         "[query][qdrant] Query vector dimension=%d",
         len(query_vector),
@@ -425,24 +470,29 @@ def _search_qdrant_children(query: str, limit: int) -> list[Document]:
     )
 
     points: list[object]
-    if hasattr(client, "query_points"):
-        query_response = client.query_points(
-            collection_name=settings.qdrant_collection_name,
-            query=query_vector,
-            limit=limit,
-            with_payload=True,
-        )
-        points = list(getattr(query_response, "points", []) or [])
-    else:
-        # Backward compatibility for older qdrant-client versions.
-        points = list(
-            client.search(
+    with _timed_query_step(
+        "qdrant_query_points",
+        event_prefix="qdrant_query_points",
+        details={"limit": limit},
+    ):
+        if hasattr(client, "query_points"):
+            query_response = client.query_points(
                 collection_name=settings.qdrant_collection_name,
-                query_vector=query_vector,
+                query=query_vector,
                 limit=limit,
                 with_payload=True,
             )
-        )
+            points = list(getattr(query_response, "points", []) or [])
+        else:
+            # Backward compatibility for older qdrant-client versions.
+            points = list(
+                client.search(
+                    collection_name=settings.qdrant_collection_name,
+                    query_vector=query_vector,
+                    limit=limit,
+                    with_payload=True,
+                )
+            )
 
     documents: list[Document] = []
     point_summaries: list[dict[str, object]] = []
@@ -804,26 +854,36 @@ def _keyword_parent_candidates(
         )
         return []
 
-    chunk_query = db.query(DocumentChunk)
-    if document_ids:
-        chunk_query = chunk_query.filter(DocumentChunk.document_id.in_([int(item) for item in document_ids]))
-    candidates = chunk_query.order_by(DocumentChunk.id.asc()).all()
+    with _timed_query_step(
+        "load_keyword_candidates_from_db",
+        event_prefix="keyword_candidates_db",
+        details={"document_filter": document_ids or []},
+    ):
+        chunk_query = db.query(DocumentChunk)
+        if document_ids:
+            chunk_query = chunk_query.filter(DocumentChunk.document_id.in_([int(item) for item in document_ids]))
+        candidates = chunk_query.order_by(DocumentChunk.id.asc()).all()
 
     scored: list[tuple[int, float]] = []
     scored_chunks: dict[int, DocumentChunk] = {}
-    for candidate in candidates:
-        metadata = _compact_source_metadata(candidate.source_metadata_json)
-        score = _keyword_match_score(
-            query_terms=query_terms,
-            query_codes=query_codes,
-            metadata=metadata,
-            content=candidate.content,
-        )
-        if score <= 0:
-            continue
+    with _timed_query_step(
+        "score_keyword_candidates",
+        event_prefix="keyword_candidates_score",
+        details={"candidate_count": len(candidates)},
+    ):
+        for candidate in candidates:
+            metadata = _compact_source_metadata(candidate.source_metadata_json)
+            score = _keyword_match_score(
+                query_terms=query_terms,
+                query_codes=query_codes,
+                metadata=metadata,
+                content=candidate.content,
+            )
+            if score <= 0:
+                continue
 
-        scored.append((candidate.id, score))
-        scored_chunks[candidate.id] = candidate
+            scored.append((candidate.id, score))
+            scored_chunks[candidate.id] = candidate
 
     scored.sort(key=lambda item: (item[1], -item[0]), reverse=True)
 
@@ -1518,12 +1578,18 @@ def similarity_search(
 
     trace_id = f"q-{int(time.time() * 1000)}-{uuid4().hex[:8]}"
     token = _query_trace_id_ctx.set(trace_id)
+    started_at = time.perf_counter()
     try:
-        effective_query, rewrite_details = _maybe_rewrite_query(query)
-        vector_queries = [effective_query]
-        if settings.multi_query_enabled:
-            variants = _generate_query_variants(effective_query, settings.multi_query_variants)
-            vector_queries.extend(variants)
+        with _timed_query_step(
+            "prepare_effective_query",
+            event_prefix="similarity_prepare_query",
+            details={"top_k": top_k, "db_mode": "hybrid" if db is not None else "vector_only"},
+        ):
+            effective_query, rewrite_details = _maybe_rewrite_query(query)
+            vector_queries = [effective_query]
+            if settings.multi_query_enabled:
+                variants = _generate_query_variants(effective_query, settings.multi_query_variants)
+                vector_queries.extend(variants)
 
         _emit_query_progress(
             "[query] Query pipeline: original_terms=%d, effective_terms=%d, vector_queries=%d",
@@ -1560,7 +1626,13 @@ def similarity_search(
             },
         )
 
-        if not load_index_if_available():
+        with _timed_query_step(
+            "check_index_available",
+            event_prefix="similarity_check_index",
+        ):
+            index_available = load_index_if_available()
+
+        if not index_available:
             _emit_query_progress(
                 "[query] similarity_search stop: index not available",
                 event="similarity_search_stop",
@@ -1569,7 +1641,12 @@ def similarity_search(
             return []
 
         if db is None:
-            vector_only_results = _search_qdrant_children(effective_query, limit=top_k)
+            with _timed_query_step(
+                "vector_only_search",
+                event_prefix="similarity_vector_only",
+                details={"top_k": top_k},
+            ):
+                vector_only_results = _search_qdrant_children(effective_query, limit=top_k)
             _emit_query_progress(
                 "[query] similarity_search done (vector_only): result_count=%d",
                 len(vector_only_results),
@@ -1589,20 +1666,39 @@ def similarity_search(
             )
             return vector_only_results
 
-        vector_parent_ids, parent_child_type = _vector_parent_candidates_multi_query(
-            vector_queries,
-            top_k,
-            document_ids,
-        )
-        keyword_parent_ids = _keyword_parent_candidates(
-            query,
-            top_k,
-            db,
-            document_ids,
-        )
+        with _timed_query_step(
+            "vector_parent_candidates_multi_query",
+            event_prefix="similarity_vector_candidates",
+            details={"query_count": len(vector_queries), "top_k": top_k},
+        ):
+            vector_parent_ids, parent_child_type = _vector_parent_candidates_multi_query(
+                vector_queries,
+                top_k,
+                document_ids,
+            )
 
-        semantic_chunk_rows = _load_chunks_by_ids(db, vector_parent_ids)
-        keyword_chunk_rows = _load_chunks_by_ids(db, keyword_parent_ids)
+        with _timed_query_step(
+            "keyword_parent_candidates",
+            event_prefix="similarity_keyword_candidates",
+            details={"top_k": top_k},
+        ):
+            keyword_parent_ids = _keyword_parent_candidates(
+                query,
+                top_k,
+                db,
+                document_ids,
+            )
+
+        with _timed_query_step(
+            "load_candidate_chunks",
+            event_prefix="similarity_load_candidate_chunks",
+            details={
+                "semantic_parent_count": len(vector_parent_ids),
+                "keyword_parent_count": len(keyword_parent_ids),
+            },
+        ):
+            semantic_chunk_rows = _load_chunks_by_ids(db, vector_parent_ids)
+            keyword_chunk_rows = _load_chunks_by_ids(db, keyword_parent_ids)
         semantic_chunk_by_id = {item.id: item for item in semantic_chunk_rows}
         keyword_chunk_by_id = {item.id: item for item in keyword_chunk_rows}
 
@@ -1644,7 +1740,12 @@ def similarity_search(
         )
 
         merge_k = settings.reranker_candidate_pool if settings.reranker_enabled else top_k
-        merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, merge_k)
+        with _timed_query_step(
+            "rrf_merge_candidates",
+            event_prefix="similarity_rrf_merge",
+            details={"merge_k": merge_k},
+        ):
+            merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, merge_k)
         if not merged_parent_ids:
             _emit_query_progress(
                 "[query] similarity_search stop: no merged parent ids",
@@ -1653,30 +1754,45 @@ def similarity_search(
             )
             return []
 
-        chunks = _load_chunks_by_ids(db, merged_parent_ids)
+        with _timed_query_step(
+            "load_merged_chunks",
+            event_prefix="similarity_load_merged_chunks",
+            details={"merged_count": len(merged_parent_ids)},
+        ):
+            chunks = _load_chunks_by_ids(db, merged_parent_ids)
         vector_set = set(vector_parent_ids)
         keyword_set = set(keyword_parent_ids)
 
         results: list[Document] = []
-        for chunk in chunks:
-            if chunk.id in vector_set and chunk.id in keyword_set:
-                retrieval_mode = "hybrid"
-            elif chunk.id in keyword_set:
-                retrieval_mode = "keyword"
-            else:
-                retrieval_mode = "vector"
+        with _timed_query_step(
+            "build_context_documents",
+            event_prefix="similarity_build_context_documents",
+            details={"chunk_count": len(chunks)},
+        ):
+            for chunk in chunks:
+                if chunk.id in vector_set and chunk.id in keyword_set:
+                    retrieval_mode = "hybrid"
+                elif chunk.id in keyword_set:
+                    retrieval_mode = "keyword"
+                else:
+                    retrieval_mode = "vector"
 
-            results.append(
-                _chunk_to_context_document(
-                    chunk,
-                    retrieval_mode=retrieval_mode,
-                    retrieval_score=scores.get(chunk.id),
-                    child_type=parent_child_type.get(chunk.id),
+                results.append(
+                    _chunk_to_context_document(
+                        chunk,
+                        retrieval_mode=retrieval_mode,
+                        retrieval_score=scores.get(chunk.id),
+                        child_type=parent_child_type.get(chunk.id),
+                    )
                 )
-            )
 
         if settings.reranker_enabled and len(results) > top_k:
-            final_results = rerank_documents(query, results, top_k)
+            with _timed_query_step(
+                "rerank_documents",
+                event_prefix="similarity_rerank",
+                details={"input_count": len(results), "top_k": top_k},
+            ):
+                final_results = rerank_documents(query, results, top_k)
         else:
             final_results = results[:top_k]
         
@@ -1728,6 +1844,17 @@ def similarity_search(
 
         return final_results
     finally:
+        total_elapsed_ms = (time.perf_counter() - started_at) * 1000
+        _emit_query_progress(
+            "[timing][query] DONE step=similarity_search_total elapsed_ms=%.2f",
+            total_elapsed_ms,
+            event="similarity_search_total",
+            details={
+                "elapsed_ms": total_elapsed_ms,
+                "top_k": top_k,
+                "db_mode": "hybrid" if db is not None else "vector_only",
+            },
+        )
         _query_trace_id_ctx.reset(token)
 
 
@@ -1767,54 +1894,68 @@ def generate_answer(
 ) -> str:
     """Generate answer from question, retrieval context, and chat history."""
 
-    llm = get_llm()
+    with _timed_query_step(
+        "load_chat_llm",
+        event_prefix="generate_answer_load_llm",
+    ):
+        llm = get_llm()
 
-    history_block = "\n".join(
-        f"{message.role.upper()}: {message.content}" for message in history_messages[-8:]
-    )
+    with _timed_query_step(
+        "build_history_block",
+        event_prefix="generate_answer_history",
+        details={"history_count": len(history_messages)},
+    ):
+        history_block = "\n".join(
+            f"{message.role.upper()}: {message.content}" for message in history_messages[-8:]
+        )
 
-    context_lines: list[str] = []
-    for index, doc in enumerate(context_docs, start=1):
-        source_metadata = doc.metadata.get("source_metadata")
-        source_info = source_metadata.get("source_info") if isinstance(source_metadata, dict) else None
-        context = source_metadata.get("context") if isinstance(source_metadata, dict) else None
-        search_optimization = source_metadata.get("search_optimization") if isinstance(source_metadata, dict) else None
+    with _timed_query_step(
+        "build_context_block",
+        event_prefix="generate_answer_context",
+        details={"context_doc_count": len(context_docs)},
+    ):
+        context_lines: list[str] = []
+        for index, doc in enumerate(context_docs, start=1):
+            source_metadata = doc.metadata.get("source_metadata")
+            source_info = source_metadata.get("source_info") if isinstance(source_metadata, dict) else None
+            context = source_metadata.get("context") if isinstance(source_metadata, dict) else None
+            search_optimization = source_metadata.get("search_optimization") if isinstance(source_metadata, dict) else None
 
-        meta_parts: list[str] = []
-        if isinstance(source_info, dict):
-            if source_info.get("file_name"):
-                meta_parts.append(f"file={source_info.get('file_name')}")
-            if source_info.get("page_number"):
-                meta_parts.append(f"page={source_info.get('page_number')}")
-            if source_info.get("doc_type"):
-                meta_parts.append(f"doc_type={source_info.get('doc_type')}")
+            meta_parts: list[str] = []
+            if isinstance(source_info, dict):
+                if source_info.get("file_name"):
+                    meta_parts.append(f"file={source_info.get('file_name')}")
+                if source_info.get("page_number"):
+                    meta_parts.append(f"page={source_info.get('page_number')}")
+                if source_info.get("doc_type"):
+                    meta_parts.append(f"doc_type={source_info.get('doc_type')}")
 
-        if isinstance(context, dict):
-            if context.get("h2"):
-                meta_parts.append(f"h2={context.get('h2')}")
-            if context.get("h3"):
-                meta_parts.append(f"h3={context.get('h3')}")
+            if isinstance(context, dict):
+                if context.get("h2"):
+                    meta_parts.append(f"h2={context.get('h2')}")
+                if context.get("h3"):
+                    meta_parts.append(f"h3={context.get('h3')}")
 
-        if isinstance(search_optimization, dict):
-            document_codes = search_optimization.get("document_codes")
-            if isinstance(document_codes, list) and document_codes:
-                meta_parts.append(f"document_codes={', '.join(str(item) for item in document_codes[:3])}")
+            if isinstance(search_optimization, dict):
+                document_codes = search_optimization.get("document_codes")
+                if isinstance(document_codes, list) and document_codes:
+                    meta_parts.append(f"document_codes={', '.join(str(item) for item in document_codes[:3])}")
 
-        retrieval_mode = doc.metadata.get("retrieval_mode")
-        if retrieval_mode is not None:
-            meta_parts.append(f"retrieval={retrieval_mode}")
+            retrieval_mode = doc.metadata.get("retrieval_mode")
+            if retrieval_mode is not None:
+                meta_parts.append(f"retrieval={retrieval_mode}")
 
-        prefix = f"[Chunk {index}]"
-        if meta_parts:
-            prefix += " " + " | ".join(meta_parts)
+            prefix = f"[Chunk {index}]"
+            if meta_parts:
+                prefix += " " + " | ".join(meta_parts)
 
-        context_lines.append(prefix)
-        context_lines.append(doc.page_content)
+            context_lines.append(prefix)
+            context_lines.append(doc.page_content)
 
-    context_block = "\n\n".join(context_lines)
+        context_block = "\n\n".join(context_lines)
 
-    if not context_block:
-        context_block = "No retrieved context available."
+        if not context_block:
+            context_block = "No retrieved context available."
 
     prompt = (
         "Bạn là Tử Kỳ, một người bạn đồng hành cùng học hỏi về kiến thức công nghệ.\n"
@@ -1828,7 +1969,15 @@ def generate_answer(
         "Trả lời:"
     )
 
-    response = llm.invoke(prompt)
+    with _timed_query_step(
+        "invoke_chat_llm",
+        event_prefix="generate_answer_invoke_llm",
+        details={
+            "question_preview": _preview_text(question),
+            "context_doc_count": len(context_docs),
+        },
+    ):
+        response = llm.invoke(prompt)
     if hasattr(response, "content"):
         return str(response.content)
     return str(response)

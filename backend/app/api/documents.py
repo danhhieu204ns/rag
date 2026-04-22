@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime
 import hashlib
 import json
@@ -10,7 +11,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.exc import OperationalError
@@ -34,6 +35,31 @@ def _emit_progress(message: str, *args: object) -> None:
     text = message % args if args else message
     logger.info(text)
     print(text, flush=True)
+
+
+@contextmanager
+def _timed_progress(step: str, *, document_id: int | None = None) -> Iterator[None]:
+    started_at = time.perf_counter()
+    document_suffix = f" document_id={document_id}" if document_id is not None else ""
+    _emit_progress("[timing][embed_document] START step=%s%s", step, document_suffix)
+    try:
+        yield
+    except Exception:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        _emit_progress(
+            "[timing][embed_document] FAIL step=%s%s elapsed_ms=%.2f",
+            step,
+            document_suffix,
+            elapsed_ms,
+        )
+        raise
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    _emit_progress(
+        "[timing][embed_document] DONE step=%s%s elapsed_ms=%.2f",
+        step,
+        document_suffix,
+        elapsed_ms,
+    )
 
 
 def _to_int(value: Any) -> int | None:
@@ -236,7 +262,8 @@ def _build_document_chunks_for_indexing(
     file_hash: str,
 ) -> tuple[list[DocumentChunk], list[tuple[str, str]], list[dict[str, Any]]]:
     load_started_at = time.perf_counter()
-    loaded_documents = load_source_documents(file_path)
+    with _timed_progress("load_source_documents", document_id=document_id):
+        loaded_documents = load_source_documents(file_path)
     load_elapsed = time.perf_counter() - load_started_at
     _emit_progress(
         "[embed_document][bg] Loaded %d source document blocks for document_id=%s",
@@ -268,11 +295,12 @@ def _build_document_chunks_for_indexing(
     )
 
     split_started_at = time.perf_counter()
-    split_documents = split_source_documents(
-        loaded_documents,
-        chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
-    )
+    with _timed_progress("split_source_documents", document_id=document_id):
+        split_documents = split_source_documents(
+            loaded_documents,
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+        )
     split_elapsed = time.perf_counter() - split_started_at
     _emit_progress(
         "[embed_document][bg] Split into %d chunks for document_id=%s",
@@ -329,12 +357,13 @@ def _build_document_chunks_for_indexing(
             }
         )
 
-    metadata_cache = _load_metadata_cache(
-        db=db,
-        document_id=document_id,
-        file_hash=file_hash,
-        chunk_fingerprints=[str(item["fingerprint"]) for item in candidates],
-    )
+    with _timed_progress("load_metadata_cache", document_id=document_id):
+        metadata_cache = _load_metadata_cache(
+            db=db,
+            document_id=document_id,
+            file_hash=file_hash,
+            chunk_fingerprints=[str(item["fingerprint"]) for item in candidates],
+        )
     cached_count = sum(1 for item in candidates if item["fingerprint"] in metadata_cache)
     uncached_count = len(candidates) - cached_count
     cache_ratio = (cached_count / len(candidates) * 100.0) if candidates else 0.0
@@ -379,6 +408,8 @@ def _build_document_chunks_for_indexing(
     async def _prepare_with_overlap() -> None:
         if not candidates:
             return
+
+        prepare_started_at = time.perf_counter()
 
         llm_batch_size = max(1, settings.metadata_llm_batch_size)
         batches: list[list[dict[str, Any]]] = [
@@ -467,8 +498,18 @@ def _build_document_chunks_for_indexing(
         metadata_future = loop.run_in_executor(None, _prepare_batch_metadata, batches[0])
 
         for batch_index in range(len(batches)):
+            metadata_batch_started_at = time.perf_counter()
             prepared_batch = await metadata_future
+            metadata_batch_elapsed_ms = (time.perf_counter() - metadata_batch_started_at) * 1000
+            _emit_progress(
+                "[timing][embed_document] DONE step=prepare_batch_metadata batch=%d/%d document_id=%s elapsed_ms=%.2f",
+                batch_index + 1,
+                len(batches),
+                document_id,
+                metadata_batch_elapsed_ms,
+            )
 
+            child_embedding_started_at = time.perf_counter()
             child_embedding_future = loop.run_in_executor(
                 None,
                 _embed_children_from_batch,
@@ -482,10 +523,31 @@ def _build_document_chunks_for_indexing(
                     batches[batch_index + 1],
                 )
 
-            precomputed_child_rows.extend(await child_embedding_future)
+            embedded_rows = await child_embedding_future
+            child_embedding_elapsed_ms = (time.perf_counter() - child_embedding_started_at) * 1000
+            _emit_progress(
+                "[timing][embed_document] DONE step=embed_children_from_batch batch=%d/%d document_id=%s rows=%d elapsed_ms=%.2f",
+                batch_index + 1,
+                len(batches),
+                document_id,
+                len(embedded_rows),
+                child_embedding_elapsed_ms,
+            )
+
+            precomputed_child_rows.extend(embedded_rows)
+
+        prepare_elapsed_ms = (time.perf_counter() - prepare_started_at) * 1000
+        _emit_progress(
+            "[timing][embed_document] DONE step=prepare_with_overlap document_id=%s batches=%d child_rows=%d elapsed_ms=%.2f",
+            document_id,
+            len(batches),
+            len(precomputed_child_rows),
+            prepare_elapsed_ms,
+        )
 
     if uncached_candidates or candidates:
-        asyncio.run(_prepare_with_overlap())
+        with _timed_progress("prepare_metadata_and_child_embeddings", document_id=document_id):
+            asyncio.run(_prepare_with_overlap())
 
     if any(item is None for item in prepared_metadata):
         raise RuntimeError("Failed to build chunk metadata for all chunks.")
@@ -620,36 +682,40 @@ def _run_document_indexing_job(document_id: int, file_hash: str) -> None:
             original_filename,
         )
 
-        new_chunks = _build_document_chunks_for_indexing(
-            db=db,
-            document_id=document_id,
-            original_filename=original_filename,
-            file_path=file_path,
-            file_hash=file_hash,
-        )
+        with _timed_progress("build_document_chunks_for_indexing", document_id=document_id):
+            new_chunks = _build_document_chunks_for_indexing(
+                db=db,
+                document_id=document_id,
+                original_filename=original_filename,
+                file_path=file_path,
+                file_hash=file_hash,
+            )
         chunk_rows, metadata_cache_payloads, precomputed_child_rows = new_chunks
 
-        _write_document_chunks(
-            db=db,
-            document_id=document_id,
-            new_chunks=chunk_rows,
-        )
+        with _timed_progress("write_document_chunks", document_id=document_id):
+            _write_document_chunks(
+                db=db,
+                document_id=document_id,
+                new_chunks=chunk_rows,
+            )
 
-        _save_metadata_cache(
-            db=db,
-            document_id=document_id,
-            file_hash=file_hash,
-            cached_payloads=metadata_cache_payloads,
-        )
+        with _timed_progress("save_metadata_cache", document_id=document_id):
+            _save_metadata_cache(
+                db=db,
+                document_id=document_id,
+                file_hash=file_hash,
+                cached_payloads=metadata_cache_payloads,
+            )
 
-        document_chunks = (
-            db.query(DocumentChunk)
-            .filter(DocumentChunk.document_id == document_id)
-            .order_by(DocumentChunk.id.asc())
-            .all()
-        )
-        db.expunge_all()
-        db.rollback()
+        with _timed_progress("reload_document_chunks_after_write", document_id=document_id):
+            document_chunks = (
+                db.query(DocumentChunk)
+                .filter(DocumentChunk.document_id == document_id)
+                .order_by(DocumentChunk.id.asc())
+                .all()
+            )
+            db.expunge_all()
+            db.rollback()
 
         if document_chunks:
             chunk_by_index = {int(chunk.chunk_index): chunk for chunk in document_chunks}
@@ -691,28 +757,31 @@ def _run_document_indexing_job(document_id: int, file_hash: str) -> None:
 
             from langchain_core.documents import Document as LCDocument
 
-            indexed_count = upsert_child_documents(
-                [
-                    LCDocument(
-                        page_content=item["page_content"],
-                        metadata=item["metadata"],
-                    )
-                    for item in child_documents
-                ],
-                purge_document_ids=[document_id],
-                precomputed_vectors=child_vectors,
-            )
+            with _timed_progress("upsert_child_documents", document_id=document_id):
+                indexed_count = upsert_child_documents(
+                    [
+                        LCDocument(
+                            page_content=item["page_content"],
+                            metadata=item["metadata"],
+                        )
+                        for item in child_documents
+                    ],
+                    purge_document_ids=[document_id],
+                    precomputed_vectors=child_vectors,
+                )
         else:
-            delete_vectors_by_document_id(document_id)
+            with _timed_progress("delete_vectors_by_document_id", document_id=document_id):
+                delete_vectors_by_document_id(document_id)
             indexed_count = 0
 
-        _save_index_state(
-            db=db,
-            document_id=document_id,
-            file_hash=file_hash,
-            indexed_parent_chunks=len(document_chunks),
-            indexed_child_chunks=indexed_count,
-        )
+        with _timed_progress("save_index_state", document_id=document_id):
+            _save_index_state(
+                db=db,
+                document_id=document_id,
+                file_hash=file_hash,
+                indexed_parent_chunks=len(document_chunks),
+                indexed_child_chunks=indexed_count,
+            )
 
         elapsed = time.perf_counter() - started_at
         _emit_progress(

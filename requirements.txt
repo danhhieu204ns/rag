@@ -44,3 +44,44 @@ marker-pdf
 
 
 NOTE: Cài đặt Ollama để chạy ở http://localhost:11434, sau đó cài đặt Ollama Python SDK bằng lệnh `pip install ollama`.
+
+thay đổi: với mỗi chunk: thực hiện yêu 3 cầu sau trong cùng một request:
+trích xuất emtity
+tóm tắt
+đặt 3 câu hỏi giả định theo 
+
+mỗi request, xử lí đồng thời 2 chunk
+model: gemma3:1b
+
+có thể tham khảo prompt dưới đây, có thể chỉnh sửa nếu chưa hợp lý
+You are building a RAG index.
+
+For each text chunk, generate:
+- a short summary (1-2 sentences)
+- 3 different search questions
+- 5 to 8 important keywords or keyphrases
+
+Requirements:
+- Use only the given text.
+- The summary must be concise and factual.
+- Questions should reflect realistic search intents.
+- Questions must be different from each other.
+- Keywords should be specific, informative, and useful for retrieval.
+- Prefer noun phrases, named entities, technical terms, and important concepts.
+- Avoid generic keywords such as "information", "topic", "text", "example".
+- Do not include duplicate or near-duplicate keywords.
+
+Return ONLY valid JSON.
+
+Output format:
+[
+  {
+    "summary": "...",
+    "questions": ["...", "...", "..."],
+    "keywords": ["...", "...", "..."]
+  }
+]
+
+Chunks:
+1. {chunk_1}
+2. {chunk_2}
