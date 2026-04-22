@@ -441,13 +441,14 @@ def _upsert_qdrant_collection_with_batch_embeddings(
     def process_batch(batch_index: int, start: int) -> tuple[int, int, int, list[list[float]], float]:
         end = min(start + batch_size, total)
         batch_started_at = time.perf_counter()
+        _emit_reindex_progress("[reindex] Submitting batch %d/%d to Ollama (start=%d, size=%d)", batch_index, batch_count, start, end - start)
         batch_vectors = embeddings_client.embed_documents(texts[start:end])
         elapsed = time.perf_counter() - batch_started_at
         return batch_index, start, end, batch_vectors, elapsed
 
     batches = list(enumerate(range(0, total, batch_size), start=1))
     
-    with ThreadPoolExecutor(max_workers=settings.ollama_num_thread) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         future_to_batch = {executor.submit(process_batch, batch_index, start): (batch_index, start) for batch_index, start in batches}
         for future in as_completed(future_to_batch):
             batch_index, start, end, batch_vectors, elapsed = future.result()
