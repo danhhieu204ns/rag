@@ -140,8 +140,8 @@ def get_settings() -> Settings:
 
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
 
-    hyq_use_llm = _bool_env("HYQ_USE_LLM", False)
-    hyq_model = _string_env("HYQ_MODEL", "")
+    hyq_use_llm = _bool_env("HYQ_USE_LLM", True)
+    hyq_model = _string_env("HYQ_MODEL", "gemma3:1b")
     ollama_num_thread = max(1, _int_env("OLLAMA_NUM_THREAD", 8))
     metadata_ollama_num_thread = max(1, _int_env("METADATA_OLLAMA_NUM_THREAD", ollama_num_thread))
     metadata_ollama_num_predict = max(64, _int_env("METADATA_OLLAMA_NUM_PREDICT", 256))
@@ -187,7 +187,7 @@ def get_settings() -> Settings:
         metadata_ollama_num_thread=metadata_ollama_num_thread,
         metadata_ollama_num_predict=metadata_ollama_num_predict,
         metadata_max_workers=metadata_max_workers,
-        metadata_llm_batch_size=max(1, _int_env("METADATA_LLM_BATCH_SIZE", 8)),
+        metadata_llm_batch_size=max(1, _int_env("METADATA_LLM_BATCH_SIZE", 2)),
         metadata_llm_batch_max_chars=max(2000, _int_env("METADATA_LLM_BATCH_MAX_CHARS", 12000)),
         vector_batch_size=max(1, _int_env("VECTOR_BATCH_SIZE", 64)),
         hyq_summary_words=_int_env("HYQ_SUMMARY_WORDS", 50),
