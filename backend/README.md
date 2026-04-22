@@ -12,6 +12,7 @@
 	- `admin_tags` (security_level, department)
 - HyQ enrichment at indexing time (`summary` + hypothetical `questions`)
 - HyQ LLM batching for metadata generation
+- Overlapped ingest pipeline: metadata/HyQ batch `N+1` can run while embedding batch `N` is in-flight
 - Metadata cache in SQLite (`chunk_metadata_cache`) keyed by `document_id + file_hash + chunk_fingerprint`
 - Parent-child retrieval: child vectors are indexed, parent chunk text is returned to LLM
 - Hybrid retrieval (vector + keyword) with reciprocal-rank-fusion

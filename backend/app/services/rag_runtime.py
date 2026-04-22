@@ -13,7 +13,6 @@ from collections import defaultdict
 from typing import Any
 
 from langchain_core.documents import Document
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from qdrant_client import QdrantClient
@@ -419,6 +418,7 @@ def _upsert_qdrant_collection_with_batch_embeddings(
     documents: list[Document],
     *,
     purge_document_ids: list[int] | None = None,
+    precomputed_vectors: list[list[float]] | None = None,
 ) -> int:
     texts = [item.page_content for item in documents]
     metadatas = [dict(item.metadata or {}) for item in documents]
@@ -430,28 +430,29 @@ def _upsert_qdrant_collection_with_batch_embeddings(
     if not texts:
         return 0
 
-    embeddings_client = get_embeddings()
-
     total = len(texts)
-    batch_size = max(1, settings.vector_batch_size)
-    batch_count = (total + batch_size - 1) // batch_size
+    all_vectors: list[list[float]] = []
+    if precomputed_vectors is not None:
+        if len(precomputed_vectors) != total:
+            raise RuntimeError(
+                "Precomputed vectors length does not match document count for upsert."
+            )
+        all_vectors = precomputed_vectors
+        _emit_reindex_progress(
+            "[reindex] Using %d precomputed child vectors.",
+            len(all_vectors),
+        )
+    else:
+        embeddings_client = get_embeddings()
+        batch_size = max(1, settings.vector_batch_size)
+        batch_count = (total + batch_size - 1) // batch_size
 
-    all_vectors_dict: dict[int, list[list[float]]] = {}
-    
-    def process_batch(batch_index: int, start: int) -> tuple[int, int, int, list[list[float]], float]:
-        end = min(start + batch_size, total)
-        batch_started_at = time.perf_counter()
-        batch_vectors = embeddings_client.embed_documents(texts[start:end])
-        elapsed = time.perf_counter() - batch_started_at
-        return batch_index, start, end, batch_vectors, elapsed
-
-    batches = list(enumerate(range(0, total, batch_size), start=1))
-    
-    with ThreadPoolExecutor(max_workers=settings.ollama_num_thread) as executor:
-        future_to_batch = {executor.submit(process_batch, batch_index, start): (batch_index, start) for batch_index, start in batches}
-        for future in as_completed(future_to_batch):
-            batch_index, start, end, batch_vectors, elapsed = future.result()
-            all_vectors_dict[start] = batch_vectors
+        for batch_index, start in enumerate(range(0, total, batch_size), start=1):
+            end = min(start + batch_size, total)
+            batch_started_at = time.perf_counter()
+            batch_vectors = embeddings_client.embed_documents(texts[start:end])
+            all_vectors.extend(batch_vectors)
+            elapsed = time.perf_counter() - batch_started_at
 
             _emit_reindex_progress(
                 "[reindex] Embedded child docs %d/%d (batch %d/%d, %.2fs)",
@@ -461,10 +462,6 @@ def _upsert_qdrant_collection_with_batch_embeddings(
                 batch_count,
                 elapsed,
             )
-
-    all_vectors: list[list[float]] = []
-    for _, start in batches:
-        all_vectors.extend(all_vectors_dict[start])
 
     if not all_vectors:
         return 0
@@ -512,6 +509,21 @@ def _upsert_qdrant_collection_with_batch_embeddings(
         )
 
     return total
+
+
+def upsert_child_documents(
+    documents: list[Document],
+    *,
+    purge_document_ids: list[int] | None = None,
+    precomputed_vectors: list[list[float]] | None = None,
+) -> int:
+    """Upsert prepared child documents, optionally reusing precomputed vectors."""
+
+    return _upsert_qdrant_collection_with_batch_embeddings(
+        documents,
+        purge_document_ids=purge_document_ids,
+        precomputed_vectors=precomputed_vectors,
+    )
 
 
 def _load_chunks_by_ids(db: Session, chunk_ids: list[int]) -> list[DocumentChunk]:

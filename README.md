@@ -77,9 +77,9 @@ Nếu service hoạt động, lệnh sẽ trả về danh sách models (JSON).
 
 ```bash
 ollama pull llama3.1:8b
+ollama pull bge-m3
+ollama pull llama3.2:3b
 ```
-
-Embedding `bge-m3` được tải trực tiếp trong Python ở lần chạy đầu tiên.
 
 ## 5) Cài đặt và chạy
 
