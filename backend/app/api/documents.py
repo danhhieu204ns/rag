@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 import hashlib
 import json
@@ -19,10 +20,10 @@ from ..core.settings import settings
 from ..db import SessionLocal, get_db
 from ..models import AdminUser, ChunkMetadataCache, Document, DocumentChunk, DocumentIndexState
 from ..schemas import DocumentChunkListResponse, DocumentChunkRead, DocumentRead, DocumentUpdate, EmbedDocumentResponse
-from ..services.chunk_metadata import build_structured_chunk_metadata_batch
+from ..services.chunk_metadata import build_hyq_children, build_structured_chunk_metadata_batch
 from ..services.document_processing import load_source_documents, split_source_documents
 from .auth import require_admin
-from ..services.rag_runtime import delete_vectors_by_document_id, rebuild_index_from_chunks
+from ..services.rag_runtime import delete_vectors_by_document_id, get_embeddings, upsert_child_documents
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
@@ -232,7 +233,7 @@ def _build_document_chunks_for_indexing(
     original_filename: str,
     file_path: Path,
     file_hash: str,
-) -> tuple[list[DocumentChunk], list[tuple[str, str]]]:
+) -> tuple[list[DocumentChunk], list[tuple[str, str]], list[dict[str, Any]]]:
     loaded_documents = load_source_documents(file_path)
     _emit_progress(
         "[embed_document][bg] Loaded %d source document blocks for document_id=%s",
@@ -302,23 +303,118 @@ def _build_document_chunks_for_indexing(
             continue
         uncached_candidates.append(item)
 
-    if uncached_candidates:
-        generated_metadata = build_structured_chunk_metadata_batch(
-            document_id=document_id,
-            file_name=original_filename,
-            chunks=[
-                {
-                    "chunk_index": item["chunk_index"],
-                    "source_page": item["source_page"],
-                    "raw_metadata": item["raw_metadata"],
-                    "chunk_text": item["chunk_text"],
-                }
-                for item in uncached_candidates
-            ],
-        )
+    precomputed_child_rows: list[dict[str, Any]] = []
 
-        for idx, item in enumerate(uncached_candidates):
-            prepared_metadata[int(item["chunk_index"])] = generated_metadata[idx]
+    async def _prepare_with_overlap() -> None:
+        if not candidates:
+            return
+
+        llm_batch_size = max(1, settings.metadata_llm_batch_size)
+        batches: list[list[dict[str, Any]]] = [
+            candidates[start : start + llm_batch_size]
+            for start in range(0, len(candidates), llm_batch_size)
+        ]
+
+        loop = asyncio.get_running_loop()
+        embeddings_client = get_embeddings()
+
+        def _prepare_batch_metadata(batch: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+            uncached_batch = [item for item in batch if prepared_metadata[int(item["chunk_index"])] is None]
+            generated_by_chunk_index: dict[int, dict[str, Any]] = {}
+
+            if uncached_batch:
+                generated = build_structured_chunk_metadata_batch(
+                    document_id=document_id,
+                    file_name=original_filename,
+                    chunks=[
+                        {
+                            "chunk_index": item["chunk_index"],
+                            "source_page": item["source_page"],
+                            "raw_metadata": item["raw_metadata"],
+                            "chunk_text": item["chunk_text"],
+                        }
+                        for item in uncached_batch
+                    ],
+                )
+                for idx, item in enumerate(uncached_batch):
+                    generated_by_chunk_index[int(item["chunk_index"])] = generated[idx]
+
+            prepared_batch: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for item in batch:
+                chunk_index = int(item["chunk_index"])
+                structured_metadata = prepared_metadata[chunk_index]
+                if structured_metadata is None:
+                    structured_metadata = generated_by_chunk_index.get(chunk_index)
+                if structured_metadata is None:
+                    raise RuntimeError(
+                        f"Failed to build chunk metadata for chunk_index={chunk_index}."
+                    )
+
+                prepared_metadata[chunk_index] = structured_metadata
+                prepared_batch.append((item, structured_metadata))
+
+            return prepared_batch
+
+        def _embed_children_from_batch(
+            prepared_batch: list[tuple[dict[str, Any], dict[str, Any]]],
+        ) -> list[dict[str, Any]]:
+            payload_rows: list[dict[str, Any]] = []
+            texts: list[str] = []
+
+            for candidate_item, structured_metadata in prepared_batch:
+                chunk_text = str(candidate_item["chunk_text"])
+                child_chunks = build_hyq_children(structured_metadata, chunk_text)
+                for child_index, (child_type, child_text) in enumerate(child_chunks):
+                    row = {
+                        "document_id": document_id,
+                        "chunk_index": int(candidate_item["chunk_index"]),
+                        "source_page": _to_int(candidate_item.get("source_page")),
+                        "source_kind": str(candidate_item.get("source_kind") or ""),
+                        "source_metadata": structured_metadata,
+                        "child_type": child_type,
+                        "child_index": child_index,
+                        "child_text": child_text,
+                    }
+                    payload_rows.append(row)
+                    texts.append(child_text)
+
+            if not texts:
+                return []
+
+            vectors = embeddings_client.embed_documents(texts)
+            if len(vectors) != len(payload_rows):
+                raise RuntimeError("Child embedding count mismatch while building index payload.")
+
+            for idx, vector in enumerate(vectors):
+                payload_rows[idx]["vector"] = vector
+
+            return payload_rows
+
+        if not batches:
+            return
+
+        metadata_future = loop.run_in_executor(None, _prepare_batch_metadata, batches[0])
+
+        for batch_index in range(len(batches)):
+            prepared_batch = await metadata_future
+
+            child_embedding_future = loop.run_in_executor(
+                None,
+                _embed_children_from_batch,
+                prepared_batch,
+            )
+
+            if batch_index + 1 < len(batches):
+                metadata_future = loop.run_in_executor(
+                    None,
+                    _prepare_batch_metadata,
+                    batches[batch_index + 1],
+                )
+
+            precomputed_child_rows.extend(await child_embedding_future)
+
+    if uncached_candidates or candidates:
+        asyncio.run(_prepare_with_overlap())
 
     if any(item is None for item in prepared_metadata):
         raise RuntimeError("Failed to build chunk metadata for all chunks.")
@@ -349,7 +445,7 @@ def _build_document_chunks_for_indexing(
             )
         )
 
-    return new_chunks, cached_payloads
+    return new_chunks, cached_payloads, precomputed_child_rows
 
 
 def _write_document_chunks(
@@ -460,7 +556,7 @@ def _run_document_indexing_job(document_id: int, file_hash: str) -> None:
             file_path=file_path,
             file_hash=file_hash,
         )
-        chunk_rows, metadata_cache_payloads = new_chunks
+        chunk_rows, metadata_cache_payloads, precomputed_child_rows = new_chunks
 
         _write_document_chunks(
             db=db,
@@ -485,7 +581,56 @@ def _run_document_indexing_job(document_id: int, file_hash: str) -> None:
         db.rollback()
 
         if document_chunks:
-            indexed_count = rebuild_index_from_chunks(document_chunks)
+            chunk_by_index = {int(chunk.chunk_index): chunk for chunk in document_chunks}
+            child_documents = []
+            child_vectors: list[list[float]] = []
+
+            for row in precomputed_child_rows:
+                chunk_index = _to_int(row.get("chunk_index"))
+                if chunk_index is None:
+                    continue
+
+                parent_chunk = chunk_by_index.get(chunk_index)
+                if parent_chunk is None:
+                    continue
+
+                child_documents.append(
+                    {
+                        "page_content": str(row.get("child_text") or ""),
+                        "metadata": {
+                            "document_id": parent_chunk.document_id,
+                            "chunk_id": parent_chunk.id,
+                            "parent_chunk_id": parent_chunk.id,
+                            "chunk_index": parent_chunk.chunk_index,
+                            "source_page": parent_chunk.source_page,
+                            "source_kind": parent_chunk.source_kind,
+                            "source_metadata": row.get("source_metadata") if isinstance(row.get("source_metadata"), dict) else {},
+                            "child_type": str(row.get("child_type") or "summary"),
+                            "child_index": _to_int(row.get("child_index")) or 0,
+                        },
+                    }
+                )
+
+                vector = row.get("vector")
+                if isinstance(vector, list):
+                    child_vectors.append(vector)
+
+            if len(child_documents) != len(child_vectors):
+                raise RuntimeError("Precomputed child vectors are incomplete for indexing.")
+
+            from langchain_core.documents import Document as LCDocument
+
+            indexed_count = upsert_child_documents(
+                [
+                    LCDocument(
+                        page_content=item["page_content"],
+                        metadata=item["metadata"],
+                    )
+                    for item in child_documents
+                ],
+                purge_document_ids=[document_id],
+                precomputed_vectors=child_vectors,
+            )
         else:
             delete_vectors_by_document_id(document_id)
             indexed_count = 0

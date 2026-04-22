@@ -13,7 +13,6 @@ from collections import defaultdict
 from typing import Any
 
 from langchain_core.documents import Document
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from qdrant_client import QdrantClient
@@ -35,6 +34,57 @@ _llm: ChatOllama | None = None
 _variant_llm: ChatOllama | None = None
 _reranker: Any = None
 _query_trace_id_ctx: ContextVar[str] = ContextVar("query_trace_id", default="-")
+
+
+class SentenceTransformerEmbeddings(Embeddings):
+    """SentenceTransformer-based embeddings with fixed max_length and optional fp16."""
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        max_length: int,
+        use_fp16: bool,
+        batch_size: int,
+        device: str,
+    ) -> None:
+        from sentence_transformers import SentenceTransformer
+        import torch
+
+        resolved_device = device.strip().lower() if device else "auto"
+        if resolved_device == "auto":
+            resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.model = SentenceTransformer(model_name, device=resolved_device)
+        self.model.max_seq_length = max_length
+        self.batch_size = max(1, batch_size)
+        self.use_fp16 = bool(use_fp16)
+        self.device = resolved_device
+
+        if self.use_fp16 and resolved_device.startswith("cuda"):
+            self.model.half()
+        elif self.use_fp16:
+            logger.warning(
+                "EMBEDDING_USE_FP16=true but embedding device is '%s'. fp16 is skipped.",
+                resolved_device,
+            )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+
+        vectors = self.model.encode(
+            [str(item or "") for item in texts],
+            batch_size=self.batch_size,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+            show_progress_bar=False,
+        )
+        return vectors.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        vectors = self.embed_documents([text])
+        return vectors[0] if vectors else []
 
 
 def _json_safe_value(value: Any) -> Any:
@@ -421,6 +471,7 @@ def _upsert_qdrant_collection_with_batch_embeddings(
     documents: list[Document],
     *,
     purge_document_ids: list[int] | None = None,
+    precomputed_vectors: list[list[float]] | None = None,
 ) -> int:
     texts = [item.page_content for item in documents]
     metadatas = [dict(item.metadata or {}) for item in documents]
@@ -432,29 +483,29 @@ def _upsert_qdrant_collection_with_batch_embeddings(
     if not texts:
         return 0
 
-    embeddings_client = get_embeddings()
-
     total = len(texts)
-    batch_size = max(1, settings.vector_batch_size)
-    batch_count = (total + batch_size - 1) // batch_size
+    all_vectors: list[list[float]] = []
+    if precomputed_vectors is not None:
+        if len(precomputed_vectors) != total:
+            raise RuntimeError(
+                "Precomputed vectors length does not match document count for upsert."
+            )
+        all_vectors = precomputed_vectors
+        _emit_reindex_progress(
+            "[reindex] Using %d precomputed child vectors.",
+            len(all_vectors),
+        )
+    else:
+        embeddings_client = get_embeddings()
+        batch_size = max(1, settings.vector_batch_size)
+        batch_count = (total + batch_size - 1) // batch_size
 
-    all_vectors_dict: dict[int, list[list[float]]] = {}
-    
-    def process_batch(batch_index: int, start: int) -> tuple[int, int, int, list[list[float]], float]:
-        end = min(start + batch_size, total)
-        batch_started_at = time.perf_counter()
-        _emit_reindex_progress("[reindex] Submitting batch %d/%d to Ollama (start=%d, size=%d)", batch_index, batch_count, start, end - start)
-        batch_vectors = embeddings_client.embed_documents(texts[start:end])
-        elapsed = time.perf_counter() - batch_started_at
-        return batch_index, start, end, batch_vectors, elapsed
-
-    batches = list(enumerate(range(0, total, batch_size), start=1))
-    
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_to_batch = {executor.submit(process_batch, batch_index, start): (batch_index, start) for batch_index, start in batches}
-        for future in as_completed(future_to_batch):
-            batch_index, start, end, batch_vectors, elapsed = future.result()
-            all_vectors_dict[start] = batch_vectors
+        for batch_index, start in enumerate(range(0, total, batch_size), start=1):
+            end = min(start + batch_size, total)
+            batch_started_at = time.perf_counter()
+            batch_vectors = embeddings_client.embed_documents(texts[start:end])
+            all_vectors.extend(batch_vectors)
+            elapsed = time.perf_counter() - batch_started_at
 
             _emit_reindex_progress(
                 "[reindex] Embedded child docs %d/%d (batch %d/%d, %.2fs)",
@@ -464,10 +515,6 @@ def _upsert_qdrant_collection_with_batch_embeddings(
                 batch_count,
                 elapsed,
             )
-
-    all_vectors: list[list[float]] = []
-    for _, start in batches:
-        all_vectors.extend(all_vectors_dict[start])
 
     if not all_vectors:
         return 0
@@ -515,6 +562,21 @@ def _upsert_qdrant_collection_with_batch_embeddings(
         )
 
     return total
+
+
+def upsert_child_documents(
+    documents: list[Document],
+    *,
+    purge_document_ids: list[int] | None = None,
+    precomputed_vectors: list[list[float]] | None = None,
+) -> int:
+    """Upsert prepared child documents, optionally reusing precomputed vectors."""
+
+    return _upsert_qdrant_collection_with_batch_embeddings(
+        documents,
+        purge_document_ids=purge_document_ids,
+        precomputed_vectors=precomputed_vectors,
+    )
 
 
 def _load_chunks_by_ids(db: Session, chunk_ids: list[int]) -> list[DocumentChunk]:
@@ -844,12 +906,28 @@ def get_embeddings() -> Embeddings:
     global _embeddings
 
     if _embeddings is None:
-        _embeddings = OllamaEmbeddings(
-            model=settings.embedding_model_name,
-            base_url=settings.ollama_base_url,
-            num_thread=settings.ollama_num_thread,
-            client_kwargs={"timeout": 180},
-        )
+        backend = settings.embedding_backend.strip().lower()
+        if backend == "sentence-transformers":
+            try:
+                _embeddings = SentenceTransformerEmbeddings(
+                    model_name=settings.embedding_model_name,
+                    max_length=settings.embedding_max_length,
+                    use_fp16=settings.embedding_use_fp16,
+                    batch_size=settings.embedding_batch_size,
+                    device=settings.embedding_device,
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Embedding backend 'sentence-transformers' requires package 'sentence-transformers'."
+                ) from exc
+        else:
+            _embeddings = OllamaEmbeddings(
+                model=settings.embedding_model_name,
+                base_url=settings.ollama_base_url,
+                num_thread=settings.ollama_num_thread,
+                keep_alive=settings.embedding_keep_alive,
+                client_kwargs={"timeout": 180},
+            )
 
     return _embeddings
 
@@ -866,10 +944,22 @@ def get_llm() -> ChatOllama:
             base_url=settings.ollama_base_url,
             temperature=settings.llm_temperature,
             num_thread=settings.ollama_num_thread,
+            num_ctx=settings.llm_num_ctx,
+            keep_alive=settings.llm_keep_alive,
         )
     return _llm
 
 
+def warmup_embedding_model() -> None:
+    """Warm embedding model once so Ollama can keep it resident with keep_alive."""
+
+    get_embeddings().embed_documents(["warmup embedding model"])
+
+
+def warmup_chat_model() -> None:
+    """Warm chat model with minimal output to reduce first-request cold start."""
+
+    get_llm().invoke("Trả về đúng 1 từ: OK")
 def _get_variant_llm() -> ChatOllama:
     """Return cached LLM instance for multi-query variant generation.
 
