@@ -82,6 +82,22 @@ def _log_vram_tuning_hints() -> None:
     else:
         logger.info("OLLAMA_MAX_LOADED_MODELS=%s", max_loaded)
 
+    if settings.embedding_backend == "sentence-transformers":
+        logger.info(
+            "Embedding backend=sentence-transformers model='%s' max_length=%d fp16=%s batch_size=%d device=%s",
+            settings.embedding_model_name,
+            settings.embedding_max_length,
+            settings.embedding_use_fp16,
+            settings.embedding_batch_size,
+            settings.embedding_device,
+        )
+    else:
+        logger.info(
+            "Embedding backend=ollama model='%s' keep_alive=%s",
+            settings.embedding_model_name,
+            settings.embedding_keep_alive,
+        )
+
 
 def _warmup_orchestrated_models() -> None:
     if not settings.model_warmup_on_startup:

@@ -45,7 +45,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 Optional tuning:
 
 - `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
+- `EMBEDDING_BACKEND` (default: `ollama`, supports: `ollama`, `sentence-transformers`)
 - `EMBEDDING_MODEL_NAME` (default: `BAAI/bge-m3`)
+- `EMBEDDING_MAX_LENGTH` (default: `512`, only for `sentence-transformers` backend)
+- `EMBEDDING_USE_FP16` (default: `true`, only for `sentence-transformers` backend)
+- `EMBEDDING_BATCH_SIZE` (default: `64`, only for `sentence-transformers` backend)
+- `EMBEDDING_DEVICE` (default: `auto`, values: `auto`, `cuda`, `cpu`)
 - `QDRANT_URL` (default: empty -> local embedded Qdrant)
 - `QDRANT_API_KEY` (default: empty)
 - `QDRANT_COLLECTION_NAME` (default: `global_child_chunks`)
@@ -187,6 +192,22 @@ OLLAMA_FLASH_ATTENTION=1
 ```
 
 Embedding model is served via Ollama using `langchain-ollama`.
+
+For BGE-M3 speed optimization with fixed length + fp16, use:
+
+```env
+EMBEDDING_BACKEND=sentence-transformers
+EMBEDDING_MODEL_NAME=BAAI/bge-m3
+EMBEDDING_MAX_LENGTH=512
+EMBEDDING_USE_FP16=true
+EMBEDDING_BATCH_SIZE=64
+EMBEDDING_DEVICE=auto
+```
+
+Notes:
+
+- `EMBEDDING_MAX_LENGTH` should align with chunk size to avoid extra padding compute.
+- `EMBEDDING_USE_FP16=true` gives best speed on modern RTX GPUs and is ignored on CPU.
 
 ## Async Indexing Behavior
 

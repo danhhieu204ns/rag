@@ -20,7 +20,12 @@ class Settings:
     qdrant_api_key: str
     database_path: Path
     ollama_base_url: str
+    embedding_backend: str
     embedding_model_name: str
+    embedding_max_length: int
+    embedding_use_fp16: bool
+    embedding_batch_size: int
+    embedding_device: str
     pdf_parser_mode: str
     chunk_size: int
     chunk_overlap: int
@@ -143,7 +148,12 @@ def get_settings() -> Settings:
         qdrant_api_key=_string_env("QDRANT_API_KEY", ""),
         database_path=storage_dir / "app.db",
         ollama_base_url=ollama_base_url,
+        embedding_backend=_string_env("EMBEDDING_BACKEND", "ollama").lower(),
         embedding_model_name=_string_env("EMBEDDING_MODEL_NAME", "bge-m3"),
+        embedding_max_length=max(64, _int_env("EMBEDDING_MAX_LENGTH", 512)),
+        embedding_use_fp16=_bool_env("EMBEDDING_USE_FP16", True),
+        embedding_batch_size=max(1, _int_env("EMBEDDING_BATCH_SIZE", 64)),
+        embedding_device=_string_env("EMBEDDING_DEVICE", "auto"),
         pdf_parser_mode=_pdf_parser_mode_env(),
         chunk_size=_int_env("CHUNK_SIZE", 500),
         chunk_overlap=_int_env("CHUNK_OVERLAP", 50),

@@ -34,6 +34,57 @@ _llm: ChatOllama | None = None
 _query_trace_id_ctx: ContextVar[str] = ContextVar("query_trace_id", default="-")
 
 
+class SentenceTransformerEmbeddings(Embeddings):
+    """SentenceTransformer-based embeddings with fixed max_length and optional fp16."""
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        max_length: int,
+        use_fp16: bool,
+        batch_size: int,
+        device: str,
+    ) -> None:
+        from sentence_transformers import SentenceTransformer
+        import torch
+
+        resolved_device = device.strip().lower() if device else "auto"
+        if resolved_device == "auto":
+            resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.model = SentenceTransformer(model_name, device=resolved_device)
+        self.model.max_seq_length = max_length
+        self.batch_size = max(1, batch_size)
+        self.use_fp16 = bool(use_fp16)
+        self.device = resolved_device
+
+        if self.use_fp16 and resolved_device.startswith("cuda"):
+            self.model.half()
+        elif self.use_fp16:
+            logger.warning(
+                "EMBEDDING_USE_FP16=true but embedding device is '%s'. fp16 is skipped.",
+                resolved_device,
+            )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+
+        vectors = self.model.encode(
+            [str(item or "") for item in texts],
+            batch_size=self.batch_size,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+            show_progress_bar=False,
+        )
+        return vectors.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        vectors = self.embed_documents([text])
+        return vectors[0] if vectors else []
+
+
 def _json_safe_value(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -853,13 +904,28 @@ def get_embeddings() -> Embeddings:
     global _embeddings
 
     if _embeddings is None:
-        _embeddings = OllamaEmbeddings(
-            model=settings.embedding_model_name,
-            base_url=settings.ollama_base_url,
-            num_thread=settings.ollama_num_thread,
-            keep_alive=settings.embedding_keep_alive,
-            client_kwargs={"timeout": 180},
-        )
+        backend = settings.embedding_backend.strip().lower()
+        if backend == "sentence-transformers":
+            try:
+                _embeddings = SentenceTransformerEmbeddings(
+                    model_name=settings.embedding_model_name,
+                    max_length=settings.embedding_max_length,
+                    use_fp16=settings.embedding_use_fp16,
+                    batch_size=settings.embedding_batch_size,
+                    device=settings.embedding_device,
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Embedding backend 'sentence-transformers' requires package 'sentence-transformers'."
+                ) from exc
+        else:
+            _embeddings = OllamaEmbeddings(
+                model=settings.embedding_model_name,
+                base_url=settings.ollama_base_url,
+                num_thread=settings.ollama_num_thread,
+                keep_alive=settings.embedding_keep_alive,
+                client_kwargs={"timeout": 180},
+            )
 
     return _embeddings
 
