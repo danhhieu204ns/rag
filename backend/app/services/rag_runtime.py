@@ -15,7 +15,7 @@ from typing import Any
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_ollama import ChatOllama
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
 from qdrant_client.http.models import Distance, PointStruct, VectorParams
@@ -913,35 +913,25 @@ def _rrf_merge(
 
 
 def get_embeddings() -> Embeddings:
-    """Create or return cached Ollama embedding model instance."""
+    """Create or return cached local sentence-transformers embedding instance."""
 
     global _embeddings
 
     if _embeddings is None:
         with _embeddings_lock:
             if _embeddings is None:
-                backend = settings.embedding_backend.strip().lower()
-                if backend == "sentence-transformers":
-                    try:
-                        _embeddings = SentenceTransformerEmbeddings(
-                            model_name=settings.embedding_model_name,
-                            max_length=settings.embedding_max_length,
-                            use_fp16=settings.embedding_use_fp16,
-                            batch_size=settings.embedding_batch_size,
-                            device=settings.embedding_device,
-                        )
-                    except ImportError as exc:
-                        raise RuntimeError(
-                            "Embedding backend 'sentence-transformers' requires package 'sentence-transformers'."
-                        ) from exc
-                else:
-                    _embeddings = OllamaEmbeddings(
-                        model=settings.embedding_model_name,
-                        base_url=settings.ollama_base_url,
-                        num_thread=settings.ollama_num_thread,
-                        keep_alive=settings.embedding_keep_alive,
-                        client_kwargs={"timeout": 180},
+                try:
+                    _embeddings = SentenceTransformerEmbeddings(
+                        model_name=settings.embedding_model_name,
+                        max_length=settings.embedding_max_length,
+                        use_fp16=settings.embedding_use_fp16,
+                        batch_size=settings.embedding_batch_size,
+                        device=settings.embedding_device,
                     )
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "Embedding requires package 'sentence-transformers'."
+                    ) from exc
 
     return _embeddings
 
@@ -967,7 +957,7 @@ def get_llm() -> ChatOllama:
 
 
 def warmup_embedding_model() -> None:
-    """Warm embedding model once so Ollama can keep it resident with keep_alive."""
+    """Warm embedding model once to reduce first-request cold start."""
 
     get_embeddings().embed_documents(["warmup embedding model"])
 
