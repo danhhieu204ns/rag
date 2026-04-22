@@ -31,6 +31,7 @@ _LEGACY_QUERY_LOG_FILE_NAME = "query_trace.jsonl"
 _embeddings: Embeddings | None = None
 _qdrant_client: QdrantClient | None = None
 _llm: ChatOllama | None = None
+_reranker: Any = None
 _query_trace_id_ctx: ContextVar[str] = ContextVar("query_trace_id", default="-")
 
 
@@ -1036,6 +1037,74 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
 
 
 
+def get_reranker() -> Any:
+    """Lazy-load CrossEncoder reranker."""
+    global _reranker
+    if _reranker is None and settings.reranker_enabled:
+        try:
+            from sentence_transformers import CrossEncoder
+            _reranker = CrossEncoder(
+                settings.reranker_model,
+                max_length=512,
+            )
+            logger.info(
+                "[reranker] Loaded CrossEncoder: model=%s",
+                settings.reranker_model,
+            )
+        except ImportError:
+            logger.error(
+                "[reranker] sentence-transformers not installed. "
+                "Run: pip install sentence-transformers"
+            )
+            return None
+        except Exception as e:
+            logger.error("[reranker] Failed to load reranker: %s", str(e))
+            return None
+    return _reranker
+
+
+def rerank_documents(
+    query: str,
+    documents: list[Document],
+    top_k: int,
+) -> list[Document]:
+    """
+    Rerank documents bằng CrossEncoder.
+    
+    Input:  query string + list Document (đã qua RRF)
+    Output: top_k Document được sắp xếp lại theo relevance score
+    """
+    reranker = get_reranker()
+    if reranker is None or not documents:
+        return documents[:top_k]
+
+    pairs = [(query, doc.page_content) for doc in documents]
+    try:
+        scores: list[float] = reranker.predict(pairs).tolist()
+    except Exception as e:
+        logger.error("[reranker] Prediction failed: %s", str(e))
+        return documents[:top_k]
+
+    # Gắn reranker score vào metadata để debug/tracing
+    for doc, score in zip(documents, scores):
+        doc.metadata["reranker_score"] = round(float(score), 4)
+
+    # Sort theo score giảm dần
+    ranked = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)
+    reranked_docs = [doc for doc, _ in ranked[:top_k]]
+    
+    logger.debug(
+        "[reranker] Reranked %d documents to top %d. "
+        "Original top score: %.4f, Reranked top score: %.4f",
+        len(documents),
+        top_k,
+        scores[0] if scores else 0,
+        scores[0] if reranked_docs and "reranker_score" in reranked_docs[0].metadata else 0,
+    )
+    
+    return reranked_docs
+
+
 def similarity_search(
     query: str,
     top_k: int,
@@ -1176,6 +1245,10 @@ def similarity_search(
             )
 
         final_results = results[:top_k]
+        
+        if settings.reranker_enabled and len(results) > top_k:
+            final_results = rerank_documents(query, results, top_k)
+        
         mode_counts: dict[str, int] = defaultdict(int)
         for item in final_results:
             mode = str(item.metadata.get("retrieval_mode") or "unknown")
@@ -1197,6 +1270,7 @@ def similarity_search(
                     "source_kind": str(item.metadata.get("source_kind") or ""),
                     "retrieval_mode": str(item.metadata.get("retrieval_mode") or ""),
                     "retrieval_score": _to_float(item.metadata.get("retrieval_score")),
+                    "reranker_score": _to_float(item.metadata.get("reranker_score")) if settings.reranker_enabled else None,
                     "child_type": str(item.metadata.get("child_type") or ""),
                     "source_metadata": item.metadata.get("source_metadata"),
                     "content": item.page_content,
