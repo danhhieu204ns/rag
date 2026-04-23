@@ -66,6 +66,7 @@ function ChatPage({ user, onLogout }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
+  const [isReceiving, setIsReceiving] = useState(false);
   const [error, setError] = useState("");
   const [isSidebarOpen, setIsSidebarOpen] = useState(() => window.innerWidth >= 769);
   const [searchQuery, setSearchQuery] = useState("");
@@ -126,6 +127,7 @@ function ChatPage({ user, onLogout }) {
     if (!input.trim() || isSending) return;
     setError("");
     setIsSending(true);
+    setIsReceiving(false);
     const userText = input.trim();
     setInput("");
     setMessages((prev) => [
@@ -181,6 +183,7 @@ function ChatPage({ user, onLogout }) {
                     { id: assistantMessageId, role: "assistant", content: "", sources: [] },
                   ]);
                   isAssistantMessageAdded = true;
+                  setIsReceiving(true);
                 }
 
                 if (data.type === 'session') {
@@ -217,6 +220,7 @@ function ChatPage({ user, onLogout }) {
       setError("Không thể gửi câu hỏi hoặc mất kết nối.");
     } finally {
       setIsSending(false);
+      setIsReceiving(false);
     }
   }
 
@@ -400,7 +404,7 @@ function ChatPage({ user, onLogout }) {
                 </div>
               ))}
 
-              {isSending && (
+              {isSending && !isReceiving && (
                 <div className="cgpt-msg cgpt-msg-assistant">
                   <div className="cgpt-assistant-row">
                     <BotAvatar />
