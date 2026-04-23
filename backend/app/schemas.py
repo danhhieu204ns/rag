@@ -50,6 +50,14 @@ class EmbedDocumentResponse(BaseModel):
     indexed_chunks: int
 
 
+class ParseDocumentResponse(BaseModel):
+    document_id: int
+    parsed_markdown_path: str
+    parser: str
+    source_type: str
+    reused: bool
+
+
 class ChunkSourceInfo(BaseModel):
     file_name: str | None = None
     page_number: int | None = Field(default=None, ge=1)

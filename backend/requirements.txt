@@ -8,10 +8,10 @@ langchain-core
 langchain-community
 langchain-text-splitters
 langchain-ollama
+sentence-transformers
 qdrant-client
 pypdf
 python-jose[cryptography]
 bcrypt
 ollama
 marker-pdf
-sentence-transformers>=3.0.0

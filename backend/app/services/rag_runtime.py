@@ -1,21 +1,22 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 import json
 import logging
 from pathlib import Path
 import re
+import threading
 import time
 import unicodedata
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from collections import defaultdict
-from typing import Any
+from typing import Any, Iterator
 
 from langchain_core.documents import Document
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.embeddings import Embeddings
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_ollama import ChatOllama
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
 from qdrant_client.http.models import Distance, PointStruct, VectorParams
@@ -33,8 +34,71 @@ _LEGACY_QUERY_LOG_FILE_NAME = "query_trace.jsonl"
 _embeddings: Embeddings | None = None
 _qdrant_client: QdrantClient | None = None
 _llm: ChatOllama | None = None
+_variant_llm: ChatOllama | None = None
 _reranker: Any = None
 _query_trace_id_ctx: ContextVar[str] = ContextVar("query_trace_id", default="-")
+_embeddings_lock = threading.Lock()
+_llm_lock = threading.Lock()
+
+
+class SentenceTransformerEmbeddings(Embeddings):
+    """SentenceTransformer-based embeddings with fixed max_length and optional fp16."""
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        max_length: int,
+        use_fp16: bool,
+        batch_size: int,
+        device: str,
+    ) -> None:
+        from sentence_transformers import SentenceTransformer
+        import torch
+
+        resolved_device = device.strip().lower() if device else "auto"
+        if resolved_device == "auto":
+            resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        model_kwargs: dict[str, Any] = {}
+        if use_fp16 and resolved_device.startswith("cuda"):
+            model_kwargs["torch_dtype"] = torch.float16
+
+        self.model = SentenceTransformer(
+            model_name,
+            device=resolved_device,
+            model_kwargs=model_kwargs,
+            local_files_only=settings.embedding_local_files_only,
+        )
+        self.model.max_seq_length = max_length
+        self.batch_size = max(1, batch_size)
+        self.use_fp16 = bool(use_fp16)
+        self.device = resolved_device
+
+        if self.use_fp16 and resolved_device.startswith("cuda"):
+            self.model.half()
+        elif self.use_fp16:
+            logger.warning(
+                "EMBEDDING_USE_FP16=true but embedding device is '%s'. fp16 is skipped.",
+                resolved_device,
+            )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+
+        vectors = self.model.encode(
+            [str(item or "") for item in texts],
+            batch_size=self.batch_size,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+            show_progress_bar=False,
+        )
+        return vectors.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        vectors = self.embed_documents([text])
+        return vectors[0] if vectors else []
 
 
 def _json_safe_value(value: Any) -> Any:
@@ -151,6 +215,45 @@ def _emit_query_progress(
             "message": raw_text,
             **(details or {}),
         },
+    )
+
+
+@contextmanager
+def _timed_query_step(
+    step: str,
+    *,
+    event_prefix: str,
+    details: dict[str, Any] | None = None,
+) -> Iterator[None]:
+    started_at = time.perf_counter()
+    base_details = dict(details or {})
+    _emit_query_progress(
+        "[timing][query] START step=%s",
+        step,
+        event=f"{event_prefix}_start",
+        details={"step": step, **base_details},
+    )
+    try:
+        yield
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        _emit_query_progress(
+            "[timing][query] FAIL step=%s elapsed_ms=%.2f error=%s",
+            step,
+            elapsed_ms,
+            str(exc),
+            event=f"{event_prefix}_error",
+            details={"step": step, "elapsed_ms": elapsed_ms, "error": str(exc), **base_details},
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    _emit_query_progress(
+        "[timing][query] DONE step=%s elapsed_ms=%.2f",
+        step,
+        elapsed_ms,
+        event=f"{event_prefix}_done",
+        details={"step": step, "elapsed_ms": elapsed_ms, **base_details},
     )
 
 
@@ -366,7 +469,12 @@ def _search_qdrant_children(query: str, limit: int) -> list[Document]:
         },
     )
 
-    query_vector = get_embeddings().embed_query(query)
+    with _timed_query_step(
+        "embed_query_vector",
+        event_prefix="qdrant_embed_query",
+        details={"limit": limit},
+    ):
+        query_vector = get_embeddings().embed_query(query)
     _emit_query_progress(
         "[query][qdrant] Query vector dimension=%d",
         len(query_vector),
@@ -375,24 +483,29 @@ def _search_qdrant_children(query: str, limit: int) -> list[Document]:
     )
 
     points: list[object]
-    if hasattr(client, "query_points"):
-        query_response = client.query_points(
-            collection_name=settings.qdrant_collection_name,
-            query=query_vector,
-            limit=limit,
-            with_payload=True,
-        )
-        points = list(getattr(query_response, "points", []) or [])
-    else:
-        # Backward compatibility for older qdrant-client versions.
-        points = list(
-            client.search(
+    with _timed_query_step(
+        "qdrant_query_points",
+        event_prefix="qdrant_query_points",
+        details={"limit": limit},
+    ):
+        if hasattr(client, "query_points"):
+            query_response = client.query_points(
                 collection_name=settings.qdrant_collection_name,
-                query_vector=query_vector,
+                query=query_vector,
                 limit=limit,
                 with_payload=True,
             )
-        )
+            points = list(getattr(query_response, "points", []) or [])
+        else:
+            # Backward compatibility for older qdrant-client versions.
+            points = list(
+                client.search(
+                    collection_name=settings.qdrant_collection_name,
+                    query_vector=query_vector,
+                    limit=limit,
+                    with_payload=True,
+                )
+            )
 
     documents: list[Document] = []
     point_summaries: list[dict[str, object]] = []
@@ -433,6 +546,7 @@ def _upsert_qdrant_collection_with_batch_embeddings(
     documents: list[Document],
     *,
     purge_document_ids: list[int] | None = None,
+    precomputed_vectors: list[list[float]] | None = None,
 ) -> int:
     texts = [item.page_content for item in documents]
     metadatas = [dict(item.metadata or {}) for item in documents]
@@ -444,29 +558,29 @@ def _upsert_qdrant_collection_with_batch_embeddings(
     if not texts:
         return 0
 
-    embeddings_client = get_embeddings()
-
     total = len(texts)
-    batch_size = max(1, settings.vector_batch_size)
-    batch_count = (total + batch_size - 1) // batch_size
+    all_vectors: list[list[float]] = []
+    if precomputed_vectors is not None:
+        if len(precomputed_vectors) != total:
+            raise RuntimeError(
+                "Precomputed vectors length does not match document count for upsert."
+            )
+        all_vectors = precomputed_vectors
+        _emit_reindex_progress(
+            "[reindex] Using %d precomputed child vectors.",
+            len(all_vectors),
+        )
+    else:
+        embeddings_client = get_embeddings()
+        batch_size = max(1, settings.vector_batch_size)
+        batch_count = (total + batch_size - 1) // batch_size
 
-    all_vectors_dict: dict[int, list[list[float]]] = {}
-    
-    def process_batch(batch_index: int, start: int) -> tuple[int, int, int, list[list[float]], float]:
-        end = min(start + batch_size, total)
-        batch_started_at = time.perf_counter()
-        _emit_reindex_progress("[reindex] Submitting batch %d/%d to Ollama (start=%d, size=%d)", batch_index, batch_count, start, end - start)
-        batch_vectors = embeddings_client.embed_documents(texts[start:end])
-        elapsed = time.perf_counter() - batch_started_at
-        return batch_index, start, end, batch_vectors, elapsed
-
-    batches = list(enumerate(range(0, total, batch_size), start=1))
-    
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_to_batch = {executor.submit(process_batch, batch_index, start): (batch_index, start) for batch_index, start in batches}
-        for future in as_completed(future_to_batch):
-            batch_index, start, end, batch_vectors, elapsed = future.result()
-            all_vectors_dict[start] = batch_vectors
+        for batch_index, start in enumerate(range(0, total, batch_size), start=1):
+            end = min(start + batch_size, total)
+            batch_started_at = time.perf_counter()
+            batch_vectors = embeddings_client.embed_documents(texts[start:end])
+            all_vectors.extend(batch_vectors)
+            elapsed = time.perf_counter() - batch_started_at
 
             _emit_reindex_progress(
                 "[reindex] Embedded child docs %d/%d (batch %d/%d, %.2fs)",
@@ -476,10 +590,6 @@ def _upsert_qdrant_collection_with_batch_embeddings(
                 batch_count,
                 elapsed,
             )
-
-    all_vectors: list[list[float]] = []
-    for _, start in batches:
-        all_vectors.extend(all_vectors_dict[start])
 
     if not all_vectors:
         return 0
@@ -527,6 +637,21 @@ def _upsert_qdrant_collection_with_batch_embeddings(
         )
 
     return total
+
+
+def upsert_child_documents(
+    documents: list[Document],
+    *,
+    purge_document_ids: list[int] | None = None,
+    precomputed_vectors: list[list[float]] | None = None,
+) -> int:
+    """Upsert prepared child documents, optionally reusing precomputed vectors."""
+
+    return _upsert_qdrant_collection_with_batch_embeddings(
+        documents,
+        purge_document_ids=purge_document_ids,
+        precomputed_vectors=precomputed_vectors,
+    )
 
 
 def _load_chunks_by_ids(db: Session, chunk_ids: list[int]) -> list[DocumentChunk]:
@@ -742,26 +867,36 @@ def _keyword_parent_candidates(
         )
         return []
 
-    chunk_query = db.query(DocumentChunk)
-    if document_ids:
-        chunk_query = chunk_query.filter(DocumentChunk.document_id.in_([int(item) for item in document_ids]))
-    candidates = chunk_query.order_by(DocumentChunk.id.asc()).all()
+    with _timed_query_step(
+        "load_keyword_candidates_from_db",
+        event_prefix="keyword_candidates_db",
+        details={"document_filter": document_ids or []},
+    ):
+        chunk_query = db.query(DocumentChunk)
+        if document_ids:
+            chunk_query = chunk_query.filter(DocumentChunk.document_id.in_([int(item) for item in document_ids]))
+        candidates = chunk_query.order_by(DocumentChunk.id.asc()).all()
 
     scored: list[tuple[int, float]] = []
     scored_chunks: dict[int, DocumentChunk] = {}
-    for candidate in candidates:
-        metadata = _compact_source_metadata(candidate.source_metadata_json)
-        score = _keyword_match_score(
-            query_terms=query_terms,
-            query_codes=query_codes,
-            metadata=metadata,
-            content=candidate.content,
-        )
-        if score <= 0:
-            continue
+    with _timed_query_step(
+        "score_keyword_candidates",
+        event_prefix="keyword_candidates_score",
+        details={"candidate_count": len(candidates)},
+    ):
+        for candidate in candidates:
+            metadata = _compact_source_metadata(candidate.source_metadata_json)
+            score = _keyword_match_score(
+                query_terms=query_terms,
+                query_codes=query_codes,
+                metadata=metadata,
+                content=candidate.content,
+            )
+            if score <= 0:
+                continue
 
-        scored.append((candidate.id, score))
-        scored_chunks[candidate.id] = candidate
+            scored.append((candidate.id, score))
+            scored_chunks[candidate.id] = candidate
 
     scored.sort(key=lambda item: (item[1], -item[0]), reverse=True)
 
@@ -851,17 +986,25 @@ def _rrf_merge(
 
 
 def get_embeddings() -> Embeddings:
-    """Create or return cached Ollama embedding model instance."""
+    """Create or return cached local sentence-transformers embedding instance."""
 
     global _embeddings
 
     if _embeddings is None:
-        _embeddings = OllamaEmbeddings(
-            model=settings.embedding_model_name,
-            base_url=settings.ollama_base_url,
-            num_thread=settings.ollama_num_thread,
-            client_kwargs={"timeout": 180},
-        )
+        with _embeddings_lock:
+            if _embeddings is None:
+                try:
+                    _embeddings = SentenceTransformerEmbeddings(
+                        model_name=settings.embedding_model_name,
+                        max_length=settings.embedding_max_length,
+                        use_fp16=settings.embedding_use_fp16,
+                        batch_size=settings.embedding_batch_size,
+                        device=settings.embedding_device,
+                    )
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "Embedding requires package 'sentence-transformers'."
+                    ) from exc
 
     return _embeddings
 
@@ -873,13 +1016,404 @@ def get_llm() -> ChatOllama:
     global _llm
 
     if _llm is None:
-        _llm = ChatOllama(
-            model=settings.llm_model,
-            base_url=settings.ollama_base_url,
-            temperature=settings.llm_temperature,
-            num_thread=settings.ollama_num_thread,
-        )
+        with _llm_lock:
+            if _llm is None:
+                _llm = ChatOllama(
+                    model=settings.llm_model,
+                    base_url=settings.ollama_base_url,
+                    temperature=settings.llm_temperature,
+                    num_thread=settings.ollama_num_thread,
+                    num_ctx=settings.llm_num_ctx,
+                    keep_alive=settings.llm_keep_alive,
+                )
     return _llm
+
+
+def warmup_embedding_model() -> None:
+    """Warm embedding model once to reduce first-request cold start."""
+
+    get_embeddings().embed_documents(["warmup embedding model"])
+
+
+def warmup_chat_model() -> None:
+    """Warm chat model with minimal output to reduce first-request cold start."""
+
+    get_llm().invoke("Trả về đúng 1 từ: OK")
+def _get_variant_llm() -> ChatOllama:
+    """Return cached LLM instance for multi-query variant generation.
+
+    Uses MULTI_QUERY_MODEL if set, otherwise falls back to the main LLM.
+    Always runs with format="json" to guarantee structured output and
+    eliminate the markdown-wrapper parse failure that affects json.loads.
+    A separate cache avoids sharing state with the answer-generation LLM.
+    """
+    global _variant_llm
+
+    if _variant_llm is None:
+        model = settings.multi_query_model or settings.llm_model
+        _variant_llm = ChatOllama(
+            model=model,
+            base_url=settings.ollama_base_url,
+            temperature=0.0,
+            num_thread=settings.ollama_num_thread,
+            format="json",
+        )
+    return _variant_llm
+
+
+def _should_rewrite_query(query: str) -> tuple[bool, int, str]:
+    terms = _lookup_terms(query)
+    term_count = len(terms)
+    min_terms = max(1, settings.query_rewrite_min_terms)
+    max_terms = max(min_terms, settings.query_rewrite_max_terms)
+    if term_count < min_terms:
+        return False, term_count, "too_short"
+    if term_count >= max_terms:
+        return False, term_count, "already_specific"
+    return True, term_count, "rewrite_window"
+
+
+def _rewrite_query(query: str) -> str:
+    llm = get_llm()
+    prompt = (
+        "Bạn đang hỗ trợ hệ thống tìm kiếm tài liệu khoa học tự nhiên. "
+        "Hãy viết lại câu hỏi sau thành phiên bản đầy đủ hơn, bổ sung các thuật ngữ chuyên môn "
+        "(định luật, công thức, khái niệm vật lý/hóa học/sinh học) nếu phù hợp, "
+        "để tối ưu việc truy xuất tài liệu. "
+        "Giữ nguyên ý nghĩa gốc. Chỉ trả về đúng một câu đã viết lại, không giải thích.\n\n"
+        f"Câu hỏi gốc: {query}\n"
+        "Câu hỏi đã viết lại:"
+    )
+
+    started_at = time.perf_counter()
+    try:
+        response = llm.invoke(prompt)
+        rewritten = str(response.content or "").strip()
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        if not rewritten:
+            _emit_query_progress(
+                "[query][rewrite] Empty rewrite result, fallback to original query (%.2fms)",
+                elapsed_ms,
+                event="query_rewrite_empty",
+                details={
+                    "elapsed_ms": elapsed_ms,
+                    "original_query_preview": _preview_text(query),
+                },
+            )
+            return query
+        rewritten_terms = len(_lookup_terms(rewritten))
+        original_terms = len(_lookup_terms(query))
+        if rewritten_terms < original_terms:
+            _emit_query_progress(
+                "[query][rewrite] Rewritten query has fewer terms (%d < %d), keep original (%.2fms)",
+                rewritten_terms,
+                original_terms,
+                elapsed_ms,
+                event="query_rewrite_rejected",
+                details={
+                    "elapsed_ms": elapsed_ms,
+                    "original_term_count": original_terms,
+                    "rewritten_term_count": rewritten_terms,
+                    "original_query_preview": _preview_text(query),
+                    "rewritten_query_preview": _preview_text(rewritten),
+                },
+            )
+            return query
+        _emit_query_progress(
+            "[query][rewrite] Rewrite success in %.2fms: '%s' => '%s'",
+            elapsed_ms,
+            _preview_text(query),
+            _preview_text(rewritten),
+            event="query_rewrite_success",
+            details={
+                "elapsed_ms": elapsed_ms,
+                "original_term_count": original_terms,
+                "rewritten_term_count": rewritten_terms,
+                "original_query_preview": _preview_text(query),
+                "rewritten_query_preview": _preview_text(rewritten),
+            },
+        )
+        return rewritten
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        _emit_query_progress(
+            "[query][rewrite] Rewrite failed after %.2fms: %s",
+            elapsed_ms,
+            str(exc),
+            event="query_rewrite_error",
+            details={
+                "elapsed_ms": elapsed_ms,
+                "error": str(exc),
+                "original_query_preview": _preview_text(query),
+            },
+        )
+        return query
+
+
+def _maybe_rewrite_query(query: str) -> tuple[str, dict[str, Any]]:
+    should_rewrite, term_count, reason = _should_rewrite_query(query)
+    details: dict[str, Any] = {
+        "enabled": settings.query_rewrite_enabled,
+        "term_count": term_count,
+        "min_terms": settings.query_rewrite_min_terms,
+        "max_terms": settings.query_rewrite_max_terms,
+        "decision_reason": reason,
+        "rewritten": False,
+    }
+
+    if not settings.query_rewrite_enabled:
+        _emit_query_progress(
+            "[query][rewrite] Disabled, skip rewrite (terms=%d)",
+            term_count,
+            event="query_rewrite_skip",
+            details=details,
+        )
+        return query, details
+
+    if settings.multi_query_enabled:
+        details["decision_reason"] = "skipped_multi_query_active"
+        _emit_query_progress(
+            "[query][rewrite] Skip rewrite: multi-query active, variants cover query diversity (terms=%d)",
+            term_count,
+            event="query_rewrite_skip",
+            details=details,
+        )
+        return query, details
+
+    if not should_rewrite:
+        _emit_query_progress(
+            "[query][rewrite] Skip rewrite: reason=%s, terms=%d",
+            reason,
+            term_count,
+            event="query_rewrite_skip",
+            details=details,
+        )
+        return query, details
+
+    rewritten = _rewrite_query(query)
+    details["rewritten"] = rewritten != query
+    details["effective_query_preview"] = _preview_text(rewritten)
+    _emit_query_progress(
+        "[query][rewrite] Rewrite decision done: rewritten=%s",
+        details["rewritten"],
+        event="query_rewrite_done",
+        details=details,
+    )
+    return rewritten, details
+
+
+def _extract_json_from_llm_text(raw_text: str) -> str:
+    """Strip markdown code fences and leading prose that LLMs sometimes prepend.
+
+    Handles the two most common non-compliant output patterns:
+      1. ```json\\n{...}\\n```  — markdown code block
+      2. "Here are the variants:\\n{...}"  — prose prefix before the JSON object
+    Returns the cleaned string; callers still own the json.loads call.
+    """
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
+    if not text.startswith("{"):
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            text = match.group(0)
+    return text
+
+
+def _generate_query_variants(query: str, variant_count: int) -> list[str]:
+    llm = _get_variant_llm()
+    prompt = (
+        f"Bạn đang hỗ trợ hệ thống tìm kiếm tài liệu khoa học tự nhiên (vật lý, hóa học, sinh học, địa lý, ...). "
+        f"Hãy sinh {variant_count} biến thể của câu hỏi dưới đây để tìm kiếm tài liệu hiệu quả hơn. "
+        "Mỗi biến thể dùng từ vựng hoặc thuật ngữ chuyên môn khác nhau nhưng vẫn đúng ý định ban đầu "
+        "(ví dụ: thay tên thông thường bằng thuật ngữ khoa học, hoặc diễn đạt theo hướng định luật/công thức). "
+        "Trả về JSON hợp lệ dạng: {\"variants\":[\"...\",\"...\"]}.\n\n"
+        f"Câu hỏi gốc: {query}"
+    )
+
+    _emit_query_progress(
+        "[query][multi] Start generating %d variants for '%s'",
+        max(1, variant_count),
+        _preview_text(query),
+        event="multi_query_variants_start",
+        details={
+            "variant_count": max(1, variant_count),
+            "query_preview": _preview_text(query),
+        },
+    )
+
+    started_at = time.perf_counter()
+    raw_text = ""
+    try:
+        response = llm.invoke(prompt)
+        raw_text = str(response.content or "").strip()
+        clean_text = _extract_json_from_llm_text(raw_text)
+        parsed = json.loads(clean_text)
+        raw_variants = parsed.get("variants", []) if isinstance(parsed, dict) else []
+        variants = [str(item).strip() for item in raw_variants if str(item).strip()]
+    except json.JSONDecodeError as exc:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        _emit_query_progress(
+            "[query][multi] JSON parse error after %.2fms — raw preview: %s",
+            elapsed_ms,
+            raw_text[:120],
+            event="multi_query_variants_json_error",
+            details={
+                "elapsed_ms": elapsed_ms,
+                "query_preview": _preview_text(query),
+                "raw_preview": raw_text[:200],
+                "error": str(exc),
+            },
+        )
+        return []
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        _emit_query_progress(
+            "[query][multi] Variant generation failed after %.2fms: %s",
+            elapsed_ms,
+            str(exc),
+            event="multi_query_variants_error",
+            details={
+                "elapsed_ms": elapsed_ms,
+                "query_preview": _preview_text(query),
+                "error": str(exc),
+            },
+        )
+        return []
+
+    deduped: list[str] = []
+    seen: set[str] = {query.strip().lower()}
+    for variant in variants:
+        normalized = variant.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(variant)
+        if len(deduped) >= max(1, variant_count):
+            break
+
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    _emit_query_progress(
+        "[query][multi] Generated %d/%d variants in %.2fms",
+        len(deduped),
+        max(1, variant_count),
+        elapsed_ms,
+        event="multi_query_variants_done",
+        details={
+            "elapsed_ms": elapsed_ms,
+            "query_preview": _preview_text(query),
+            "variant_count_requested": max(1, variant_count),
+            "variant_count_generated": len(deduped),
+            "variants_preview": [_preview_text(item) for item in deduped],
+        },
+    )
+    return deduped
+
+
+def _rrf_merge_ranked_lists(
+    ranked_lists: list[list[int]],
+    top_k: int,
+) -> tuple[list[int], dict[int, float]]:
+    non_empty_lists = [items for items in ranked_lists if items]
+    if not non_empty_lists:
+        return [], {}
+
+    rrf_k = max(1, settings.hybrid_rrf_k)
+    scores: dict[int, float] = defaultdict(float)
+    for ranked in non_empty_lists:
+        for rank, chunk_id in enumerate(ranked, start=1):
+            scores[chunk_id] += 1.0 / (rrf_k + rank)
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    merged_ids = [chunk_id for chunk_id, _ in ranked[:top_k]]
+    _emit_query_progress(
+        "[query][multi] RRF merged %d ranked lists into %d parent ids",
+        len(non_empty_lists),
+        len(merged_ids),
+        event="multi_query_rrf_merge",
+        details={
+            "input_list_count": len(non_empty_lists),
+            "output_count": len(merged_ids),
+            "output_ids": merged_ids,
+        },
+    )
+    return merged_ids, scores
+
+
+def _vector_parent_candidates_multi_query(
+    queries: list[str],
+    top_k: int,
+    document_ids: list[int] | None,
+) -> tuple[list[int], dict[int, str]]:
+    filtered_queries = [item for item in queries if item.strip()]
+    if not filtered_queries:
+        _emit_query_progress(
+            "[query][multi] Skip multi-query vector search because query list is empty",
+            event="multi_query_vector_skip",
+            details={"reason": "empty_query_list"},
+        )
+        return [], {}
+
+    if len(filtered_queries) == 1:
+        _emit_query_progress(
+            "[query][multi] Single query mode, fallback to standard vector search",
+            event="multi_query_vector_single_mode",
+            details={"query_preview": _preview_text(filtered_queries[0])},
+        )
+        return _vector_parent_candidates(filtered_queries[0], top_k, document_ids)
+
+    max_workers = min(max(1, settings.multi_query_max_workers), len(filtered_queries))
+    _emit_query_progress(
+        "[query][multi] Parallel vector search start: queries=%d, workers=%d",
+        len(filtered_queries),
+        max_workers,
+        event="multi_query_vector_start",
+        details={
+            "query_count": len(filtered_queries),
+            "queries": [_preview_text(item) for item in filtered_queries],
+            "workers": max_workers,
+            "top_k": top_k,
+            "document_filter": document_ids or [],
+        },
+    )
+
+    ranked_lists: list[list[int]] = []
+    parent_child_type: dict[int, str] = {}
+    query_to_result: dict[str, list[int]] = {}
+    query_elapsed_ms: dict[str, float] = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        query_start_ts = {variant_query: time.perf_counter() for variant_query in filtered_queries}
+        future_map = {
+            executor.submit(_vector_parent_candidates, variant_query, top_k, document_ids): variant_query
+            for variant_query in filtered_queries
+        }
+        for future in as_completed(future_map):
+            variant_query = future_map[future]
+            ids, child_type = future.result()
+            query_elapsed_ms[variant_query] = round((time.perf_counter() - query_start_ts[variant_query]) * 1000, 2)
+            ranked_lists.append(ids)
+            query_to_result[variant_query] = ids
+            for chunk_id, child_label in child_type.items():
+                if chunk_id not in parent_child_type:
+                    parent_child_type[chunk_id] = child_label
+
+    probe_multiplier = max(1, settings.hybrid_probe_multiplier)
+    probe_k = max(top_k * probe_multiplier, top_k)
+    merged_ids, _ = _rrf_merge_ranked_lists(ranked_lists, probe_k)
+
+    _emit_query_progress(
+        "[query][multi] Multi-query vector candidates done: queries=%d, merged=%d",
+        len(filtered_queries),
+        len(merged_ids),
+        event="multi_query_vector_done",
+        details={
+            "queries": filtered_queries,
+            "query_results": {q: _preview_ids(ids) for q, ids in query_to_result.items()},
+            "query_elapsed_ms": query_elapsed_ms,
+            "merged_parent_ids": merged_ids,
+        },
+    )
+
+    return merged_ids, parent_child_type
 
 
 
@@ -1088,7 +1622,35 @@ def similarity_search(
     token = _query_trace_id_ctx.set(trace_id)
     query_started_at = time.perf_counter()
     stage_timings_ms: dict[str, float] = {}
+    started_at = time.perf_counter()
     try:
+        with _timed_query_step(
+            "prepare_effective_query",
+            event_prefix="similarity_prepare_query",
+            details={"top_k": top_k, "db_mode": "hybrid" if db is not None else "vector_only"},
+        ):
+            effective_query, rewrite_details = _maybe_rewrite_query(query)
+            vector_queries = [effective_query]
+            if settings.multi_query_enabled:
+                variants = _generate_query_variants(effective_query, settings.multi_query_variants)
+                vector_queries.extend(variants)
+
+        _emit_query_progress(
+            "[query] Query pipeline: original_terms=%d, effective_terms=%d, vector_queries=%d",
+            len(_lookup_terms(query)),
+            len(_lookup_terms(effective_query)),
+            len(vector_queries),
+            event="query_pipeline_summary",
+            details={
+                "original_query_preview": _preview_text(query),
+                "effective_query_preview": _preview_text(effective_query),
+                "original_term_count": len(_lookup_terms(query)),
+                "effective_term_count": len(_lookup_terms(effective_query)),
+                "vector_queries": [_preview_text(item) for item in vector_queries],
+                "multi_query_enabled": settings.multi_query_enabled,
+            },
+        )
+
         _emit_query_progress(
             "[query] Start similarity_search: top_k=%d, db_mode=%s, document_filter=%s, query='%s'",
             top_k,
@@ -1101,12 +1663,22 @@ def similarity_search(
                 "db_mode": "hybrid" if db is not None else "vector_only",
                 "document_filter": document_ids or [],
                 "query_preview": _preview_text(query),
+                "effective_query_preview": _preview_text(effective_query),
+                "rewrite": rewrite_details,
+                "multi_query_enabled": settings.multi_query_enabled,
+                "multi_query_count": len(vector_queries),
             },
         )
 
         index_check_started_at = time.perf_counter()
         index_available = load_index_if_available()
         stage_timings_ms["index_check"] = _elapsed_ms(index_check_started_at)
+        with _timed_query_step(
+            "check_index_available",
+            event_prefix="similarity_check_index",
+        ):
+            index_available = load_index_if_available()
+
         if not index_available:
             _emit_query_progress(
                 "[query] similarity_search stop: index not available",
@@ -1123,6 +1695,12 @@ def similarity_search(
             vector_only_started_at = time.perf_counter()
             vector_only_results = _search_qdrant_children(query, limit=top_k)
             stage_timings_ms["vector_only_search"] = _elapsed_ms(vector_only_started_at)
+            with _timed_query_step(
+                "vector_only_search",
+                event_prefix="similarity_vector_only",
+                details={"top_k": top_k},
+            ):
+                vector_only_results = _search_qdrant_children(effective_query, limit=top_k)
             _emit_query_progress(
                 "[query] similarity_search done (vector_only): result_count=%d, elapsed=%.2fms",
                 len(vector_only_results),
@@ -1132,6 +1710,7 @@ def similarity_search(
                     "result_count": len(vector_only_results),
                     "stage_timings_ms": stage_timings_ms,
                     "total_elapsed_ms": _elapsed_ms(query_started_at),
+                    "effective_query_preview": _preview_text(effective_query),
                     "result_preview": [
                         {
                             "parent_chunk_id": _to_int(item.metadata.get("parent_chunk_id")),
@@ -1182,6 +1761,39 @@ def similarity_search(
         keyword_chunk_rows = _load_chunks_by_ids(db, keyword_parent_ids)
         stage_timings_ms["load_keyword_chunks"] = _elapsed_ms(load_keyword_chunks_started_at)
 
+        with _timed_query_step(
+            "vector_parent_candidates_multi_query",
+            event_prefix="similarity_vector_candidates",
+            details={"query_count": len(vector_queries), "top_k": top_k},
+        ):
+            vector_parent_ids, parent_child_type = _vector_parent_candidates_multi_query(
+                vector_queries,
+                top_k,
+                document_ids,
+            )
+
+        with _timed_query_step(
+            "keyword_parent_candidates",
+            event_prefix="similarity_keyword_candidates",
+            details={"top_k": top_k},
+        ):
+            keyword_parent_ids = _keyword_parent_candidates(
+                query,
+                top_k,
+                db,
+                document_ids,
+            )
+
+        with _timed_query_step(
+            "load_candidate_chunks",
+            event_prefix="similarity_load_candidate_chunks",
+            details={
+                "semantic_parent_count": len(vector_parent_ids),
+                "keyword_parent_count": len(keyword_parent_ids),
+            },
+        ):
+            semantic_chunk_rows = _load_chunks_by_ids(db, vector_parent_ids)
+            keyword_chunk_rows = _load_chunks_by_ids(db, keyword_parent_ids)
         semantic_chunk_by_id = {item.id: item for item in semantic_chunk_rows}
         keyword_chunk_by_id = {item.id: item for item in keyword_chunk_rows}
 
@@ -1228,6 +1840,12 @@ def similarity_search(
         rrf_started_at = time.perf_counter()
         merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, merge_k)
         stage_timings_ms["rrf_merge"] = _elapsed_ms(rrf_started_at)
+        with _timed_query_step(
+            "rrf_merge_candidates",
+            event_prefix="similarity_rrf_merge",
+            details={"merge_k": merge_k},
+        ):
+            merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, merge_k)
         if not merged_parent_ids:
             _emit_query_progress(
                 "[query] similarity_search stop: no merged parent ids",
@@ -1243,25 +1861,37 @@ def similarity_search(
         load_merged_chunks_started_at = time.perf_counter()
         chunks = _load_chunks_by_ids(db, merged_parent_ids)
         stage_timings_ms["load_merged_chunks"] = _elapsed_ms(load_merged_chunks_started_at)
+        with _timed_query_step(
+            "load_merged_chunks",
+            event_prefix="similarity_load_merged_chunks",
+            details={"merged_count": len(merged_parent_ids)},
+        ):
+            chunks = _load_chunks_by_ids(db, merged_parent_ids)
         vector_set = set(vector_parent_ids)
         keyword_set = set(keyword_parent_ids)
 
         build_context_docs_started_at = time.perf_counter()
         results: list[Document] = []
-        for chunk in chunks:
-            if chunk.id in vector_set and chunk.id in keyword_set:
-                retrieval_mode = "hybrid"
-            elif chunk.id in keyword_set:
-                retrieval_mode = "keyword"
-            else:
-                retrieval_mode = "vector"
+        with _timed_query_step(
+            "build_context_documents",
+            event_prefix="similarity_build_context_documents",
+            details={"chunk_count": len(chunks)},
+        ):
+            for chunk in chunks:
+                if chunk.id in vector_set and chunk.id in keyword_set:
+                    retrieval_mode = "hybrid"
+                elif chunk.id in keyword_set:
+                    retrieval_mode = "keyword"
+                else:
+                    retrieval_mode = "vector"
 
-            results.append(
-                _chunk_to_context_document(
-                    chunk,
-                    retrieval_mode=retrieval_mode,
-                    retrieval_score=scores.get(chunk.id),
-                    child_type=parent_child_type.get(chunk.id),
+                results.append(
+                    _chunk_to_context_document(
+                        chunk,
+                        retrieval_mode=retrieval_mode,
+                        retrieval_score=scores.get(chunk.id),
+                        child_type=parent_child_type.get(chunk.id),
+                    )
                 )
             )
         stage_timings_ms["build_context_documents"] = _elapsed_ms(build_context_docs_started_at)
@@ -1270,6 +1900,12 @@ def similarity_search(
         if settings.reranker_enabled and len(results) > top_k:
             final_results = rerank_documents(query, results, top_k)
             stage_timings_ms["reranker"] = _elapsed_ms(rerank_stage_started_at)
+            with _timed_query_step(
+                "rerank_documents",
+                event_prefix="similarity_rerank",
+                details={"input_count": len(results), "top_k": top_k},
+            ):
+                final_results = rerank_documents(query, results, top_k)
         else:
             final_results = results[:top_k]
             stage_timings_ms["reranker"] = _elapsed_ms(rerank_stage_started_at)
@@ -1349,6 +1985,17 @@ def similarity_search(
 
         return final_results
     finally:
+        total_elapsed_ms = (time.perf_counter() - started_at) * 1000
+        _emit_query_progress(
+            "[timing][query] DONE step=similarity_search_total elapsed_ms=%.2f",
+            total_elapsed_ms,
+            event="similarity_search_total",
+            details={
+                "elapsed_ms": total_elapsed_ms,
+                "top_k": top_k,
+                "db_mode": "hybrid" if db is not None else "vector_only",
+            },
+        )
         _query_trace_id_ctx.reset(token)
 
 
@@ -1388,68 +2035,100 @@ def generate_answer(
 ) -> str:
     """Generate answer from question, retrieval context, and chat history."""
 
-    llm = get_llm()
+    with _timed_query_step(
+        "load_chat_llm",
+        event_prefix="generate_answer_load_llm",
+    ):
+        llm = get_llm()
 
-    history_block = "\n".join(
-        f"{message.role.upper()}: {message.content}" for message in history_messages[-8:]
-    )
+    with _timed_query_step(
+        "build_history_block",
+        event_prefix="generate_answer_history",
+        details={"history_count": len(history_messages)},
+    ):
+        history_block = "\n".join(
+            f"{message.role.upper()}: {message.content}" for message in history_messages[-8:]
+        )
 
-    context_lines: list[str] = []
-    for index, doc in enumerate(context_docs, start=1):
-        source_metadata = doc.metadata.get("source_metadata")
-        source_info = source_metadata.get("source_info") if isinstance(source_metadata, dict) else None
-        context = source_metadata.get("context") if isinstance(source_metadata, dict) else None
-        search_optimization = source_metadata.get("search_optimization") if isinstance(source_metadata, dict) else None
+    with _timed_query_step(
+        "build_context_block",
+        event_prefix="generate_answer_context",
+        details={"context_doc_count": len(context_docs)},
+    ):
+        context_lines: list[str] = []
+        for index, doc in enumerate(context_docs, start=1):
+            source_metadata = doc.metadata.get("source_metadata")
+            source_info = source_metadata.get("source_info") if isinstance(source_metadata, dict) else None
+            context = source_metadata.get("context") if isinstance(source_metadata, dict) else None
+            search_optimization = source_metadata.get("search_optimization") if isinstance(source_metadata, dict) else None
 
-        meta_parts: list[str] = []
-        if isinstance(source_info, dict):
-            if source_info.get("file_name"):
-                meta_parts.append(f"file={source_info.get('file_name')}")
-            if source_info.get("page_number"):
-                meta_parts.append(f"page={source_info.get('page_number')}")
-            if source_info.get("doc_type"):
-                meta_parts.append(f"doc_type={source_info.get('doc_type')}")
+            meta_parts: list[str] = []
+            if isinstance(source_info, dict):
+                if source_info.get("file_name"):
+                    meta_parts.append(f"file={source_info.get('file_name')}")
+                if source_info.get("page_number"):
+                    meta_parts.append(f"page={source_info.get('page_number')}")
+                if source_info.get("doc_type"):
+                    meta_parts.append(f"doc_type={source_info.get('doc_type')}")
 
-        if isinstance(context, dict):
-            if context.get("h2"):
-                meta_parts.append(f"h2={context.get('h2')}")
-            if context.get("h3"):
-                meta_parts.append(f"h3={context.get('h3')}")
+            if isinstance(context, dict):
+                if context.get("h2"):
+                    meta_parts.append(f"h2={context.get('h2')}")
+                if context.get("h3"):
+                    meta_parts.append(f"h3={context.get('h3')}")
 
-        if isinstance(search_optimization, dict):
-            document_codes = search_optimization.get("document_codes")
-            if isinstance(document_codes, list) and document_codes:
-                meta_parts.append(f"document_codes={', '.join(str(item) for item in document_codes[:3])}")
+            if isinstance(search_optimization, dict):
+                document_codes = search_optimization.get("document_codes")
+                if isinstance(document_codes, list) and document_codes:
+                    meta_parts.append(f"document_codes={', '.join(str(item) for item in document_codes[:3])}")
 
-        retrieval_mode = doc.metadata.get("retrieval_mode")
-        if retrieval_mode is not None:
-            meta_parts.append(f"retrieval={retrieval_mode}")
+            retrieval_mode = doc.metadata.get("retrieval_mode")
+            if retrieval_mode is not None:
+                meta_parts.append(f"retrieval={retrieval_mode}")
 
-        prefix = f"[Chunk {index}]"
-        if meta_parts:
-            prefix += " " + " | ".join(meta_parts)
+            prefix = f"[Chunk {index}]"
+            if meta_parts:
+                prefix += " " + " | ".join(meta_parts)
 
-        context_lines.append(prefix)
-        context_lines.append(doc.page_content)
+            context_lines.append(prefix)
+            context_lines.append(doc.page_content)
 
-    context_block = "\n\n".join(context_lines)
+        context_block = "\n\n".join(context_lines)
 
-    if not context_block:
-        context_block = "No retrieved context available."
+        if not context_block:
+            context_block = "No retrieved context available."
 
     prompt = (
-        "Bạn là Tử Kỳ, một người bạn đồng hành cùng học hỏi về kiến thức công nghệ.\n"
-        "Sử dụng đại từ 'mình' và 'bạn' khi trả lời để tạo cảm giác thân thiện và gần gũi.\n"
-        "Use the context to answer accurately and avoid hallucination.\n"
-        "Luôn bắt đầu bằng một lời dẫn dắt liên quan đến câu hỏi.\n"
-        "Nếu không có đủ thông tin trong ngữ cảnh, hãy nói rõ điều đó một cách khéo léo.\n\n"
-        f"Lịch sử trò chuyện:\n{history_block or 'No previous messages.'}\n\n"
-        f"Ngữ cảnh:\n{context_block}\n\n"
-        f"Câu hỏi: {question}\n"
+        "Bạn là một chuyên gia khoa học tự nhiên thân thiện. "
+        "Nhiệm vụ của bạn là giải thích khoa học một cách chính xác, dễ hiểu và gần gũi "
+        "bằng phương pháp suy luận từng bước (Chain of Thought).\n"
+        "Sử dụng đại từ 'mình' và 'bạn' để tạo cảm giác thân thiện như người bạn đồng học.\n"
+        "Ưu tiên sử dụng thông tin trong tài liệu được cung cấp. "
+        "Nếu tài liệu không đủ căn cứ, hãy nói rõ 'mình chưa tìm thấy đủ thông tin trong tài liệu về điều này' "
+        "và tuyệt đối không tự ý thêm kiến thức ngoài nếu mâu thuẫn với tài liệu.\n\n"
+        f"--- LỊCH SỬ TRÒ CHUYỆN ---\n{history_block or 'Chưa có tin nhắn trước đó.'}\n\n"
+        f"--- TÀI LIỆU HỖ TRỢ ---\n{context_block}\n\n"
+        f"--- CÂU HỎI ---\n{question}\n\n"
+        "--- YÊU CẦU TRẢ LỜI ---\n"
+        "Hãy suy luận theo đúng 4 bước sau:\n"
+        "Bước 1 – Phân tích câu hỏi: Xác định các từ khóa chuyên môn và dữ liệu đầu vào quan trọng.\n"
+        "Bước 2 – Truy xuất căn cứ: Liệt kê các định luật, khái niệm hoặc sự kiện khoa học "
+        "có trong tài liệu liên quan đến câu hỏi.\n"
+        "Bước 3 – Suy luận logic: Kết nối dữ liệu và định luật theo trình tự nguyên nhân – kết quả. "
+        "Nếu tài liệu không đủ thông tin, ghi rõ 'không đủ căn cứ'.\n"
+        "Bước 4 – Kết luận cuối cùng: Đưa ra câu trả lời ngắn gọn, dễ hiểu và thân thiện.\n\n"
         "Trả lời:"
     )
 
-    response = llm.invoke(prompt)
+    with _timed_query_step(
+        "invoke_chat_llm",
+        event_prefix="generate_answer_invoke_llm",
+        details={
+            "question_preview": _preview_text(question),
+            "context_doc_count": len(context_docs),
+        },
+    ):
+        response = llm.invoke(prompt)
     if hasattr(response, "content"):
         return str(response.content)
     return str(response)

@@ -21,18 +21,30 @@ class Settings:
     database_path: Path
     ollama_base_url: str
     embedding_model_name: str
+    embedding_max_length: int
+    embedding_use_fp16: bool
+    embedding_batch_size: int
+    embedding_device: str
+    embedding_local_files_only: bool
     pdf_parser_mode: str
     chunk_size: int
     chunk_overlap: int
     retriever_k: int
     llm_model: str
     llm_temperature: float
+    llm_num_ctx: int
+    llm_keep_alive: str
     ollama_num_thread: int
+    metadata_num_ctx: int
+    metadata_keep_alive: str
     hyq_enabled: bool
     hyq_use_llm: bool
     hyq_model: str
     metadata_use_llm: bool
     metadata_model: str
+    metadata_summary_model: str
+    metadata_summary_use_high_accuracy: bool
+    metadata_summary_num_ctx: int
     metadata_ollama_num_thread: int
     metadata_ollama_num_predict: int
     metadata_max_workers: int
@@ -45,6 +57,17 @@ class Settings:
     hybrid_keyword_rrf_weight: float
     hybrid_rrf_k: int
     hybrid_probe_multiplier: int
+    model_warmup_on_startup: bool
+    model_warmup_chat: bool
+    model_warmup_metadata: bool
+    model_warmup_embedding: bool
+    query_rewrite_enabled: bool
+    query_rewrite_min_terms: int
+    query_rewrite_max_terms: int
+    multi_query_enabled: bool
+    multi_query_variants: int
+    multi_query_max_workers: int
+    multi_query_model: str
     # Reranking
     reranker_enabled: bool
     reranker_model: str
@@ -121,8 +144,8 @@ def get_settings() -> Settings:
 
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
 
-    hyq_use_llm = _bool_env("HYQ_USE_LLM", False)
-    hyq_model = _string_env("HYQ_MODEL", "")
+    hyq_use_llm = _bool_env("HYQ_USE_LLM", True)
+    hyq_model = _string_env("HYQ_MODEL", "gemma3:1b")
     ollama_num_thread = max(1, _int_env("OLLAMA_NUM_THREAD", 8))
     metadata_ollama_num_thread = max(1, _int_env("METADATA_OLLAMA_NUM_THREAD", ollama_num_thread))
     metadata_ollama_num_predict = max(64, _int_env("METADATA_OLLAMA_NUM_PREDICT", 256))
@@ -140,23 +163,35 @@ def get_settings() -> Settings:
         qdrant_api_key=_string_env("QDRANT_API_KEY", ""),
         database_path=storage_dir / "app.db",
         ollama_base_url=ollama_base_url,
-        embedding_model_name=_string_env("EMBEDDING_MODEL_NAME", "bge-m3"),
+        embedding_model_name=_string_env("EMBEDDING_MODEL_NAME", "BAAI/bge-m3"),
+        embedding_max_length=max(64, _int_env("EMBEDDING_MAX_LENGTH", 512)),
+        embedding_use_fp16=_bool_env("EMBEDDING_USE_FP16", True),
+        embedding_batch_size=max(1, _int_env("EMBEDDING_BATCH_SIZE", 64)),
+        embedding_device=_string_env("EMBEDDING_DEVICE", "auto"),
+        embedding_local_files_only=_bool_env("EMBEDDING_LOCAL_FILES_ONLY", False),
         pdf_parser_mode=_pdf_parser_mode_env(),
         chunk_size=_int_env("CHUNK_SIZE", 500),
         chunk_overlap=_int_env("CHUNK_OVERLAP", 50),
         retriever_k=_int_env("RETRIEVER_K", 4),
         llm_model=_string_env("LLM_MODEL", "llama3.1:8b"),
         llm_temperature=_float_env("LLM_TEMPERATURE", 0.0),
+        llm_num_ctx=max(512, _int_env("LLM_NUM_CTX", 2048)),
+        llm_keep_alive=_string_env("LLM_KEEP_ALIVE", "10m"),
         ollama_num_thread=ollama_num_thread,
+        metadata_num_ctx=max(512, _int_env("METADATA_NUM_CTX", 1536)),
+        metadata_keep_alive=_string_env("METADATA_KEEP_ALIVE", "-1"),
         hyq_enabled=_bool_env("HYQ_ENABLED", True),
         hyq_use_llm=hyq_use_llm,
         hyq_model=hyq_model,
         metadata_use_llm=_bool_env("METADATA_USE_LLM", hyq_use_llm),
         metadata_model=_string_env("METADATA_MODEL", hyq_model),
+        metadata_summary_model=_string_env("METADATA_SUMMARY_MODEL", ""),
+        metadata_summary_use_high_accuracy=_bool_env("METADATA_SUMMARY_USE_HIGH_ACCURACY", False),
+        metadata_summary_num_ctx=max(512, _int_env("METADATA_SUMMARY_NUM_CTX", 2048)),
         metadata_ollama_num_thread=metadata_ollama_num_thread,
         metadata_ollama_num_predict=metadata_ollama_num_predict,
         metadata_max_workers=metadata_max_workers,
-        metadata_llm_batch_size=max(1, _int_env("METADATA_LLM_BATCH_SIZE", 8)),
+        metadata_llm_batch_size=max(1, _int_env("METADATA_LLM_BATCH_SIZE", 2)),
         metadata_llm_batch_max_chars=max(2000, _int_env("METADATA_LLM_BATCH_MAX_CHARS", 12000)),
         vector_batch_size=max(1, _int_env("VECTOR_BATCH_SIZE", 64)),
         hyq_summary_words=_int_env("HYQ_SUMMARY_WORDS", 50),
@@ -165,6 +200,17 @@ def get_settings() -> Settings:
         hybrid_keyword_rrf_weight=_float_env("HYBRID_KEYWORD_RRF_WEIGHT", 1.2),
         hybrid_rrf_k=_int_env("HYBRID_RRF_K", 60),
         hybrid_probe_multiplier=_int_env("HYBRID_PROBE_MULTIPLIER", 4),
+        model_warmup_on_startup=_bool_env("MODEL_WARMUP_ON_STARTUP", False),
+        model_warmup_chat=_bool_env("MODEL_WARMUP_CHAT", False),
+        model_warmup_metadata=_bool_env("MODEL_WARMUP_METADATA", True),
+        model_warmup_embedding=_bool_env("MODEL_WARMUP_EMBEDDING", True),
+        query_rewrite_enabled=_bool_env("QUERY_REWRITE_ENABLED", False),
+        query_rewrite_min_terms=max(1, _int_env("QUERY_REWRITE_MIN_TERMS", 4)),
+        query_rewrite_max_terms=max(1, _int_env("QUERY_REWRITE_MAX_TERMS", 8)),
+        multi_query_enabled=_bool_env("MULTI_QUERY_ENABLED", False),
+        multi_query_variants=max(1, _int_env("MULTI_QUERY_VARIANTS", 3)),
+        multi_query_max_workers=max(1, _int_env("MULTI_QUERY_MAX_WORKERS", 3)),
+        multi_query_model=_string_env("MULTI_QUERY_MODEL", ""),
         reranker_enabled=_bool_env("RERANKER_ENABLED", False),
         reranker_model=_string_env("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
         reranker_top_k=_int_env("RERANKER_TOP_K", 4),
