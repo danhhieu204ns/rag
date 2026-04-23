@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api.auth import router as auth_router
 from .api.chat import router as chat_router
 from .api.documents import router as documents_router
+from .api.users import router as users_router
 from .core.settings import settings
 from .db import init_db
 from .services.chunk_metadata import warmup_metadata_model
@@ -81,3 +82,4 @@ def health() -> dict[str, str]:
 app.include_router(auth_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
+app.include_router(users_router, prefix="/api")

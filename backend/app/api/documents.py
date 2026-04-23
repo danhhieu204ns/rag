@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from ..core.settings import settings
 from ..core.request_logger import request_logging_context, get_request_logger
 from ..db import SessionLocal, get_db
-from ..models import AdminUser, ChunkMetadataCache, Document, DocumentChunk, DocumentIndexState
+from ..models import ChunkMetadataCache, Document, DocumentChunk, DocumentIndexState
 from ..schemas import (
     DocumentChunkListResponse,
     DocumentChunkRead,

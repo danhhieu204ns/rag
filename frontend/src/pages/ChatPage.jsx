@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import api from "../api";
 
 const IconMenu = () => (
@@ -59,7 +60,7 @@ const BotAvatar = () => (
   </div>
 );
 
-function ChatPage() {
+function ChatPage({ user, onLogout }) {
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -353,7 +354,16 @@ function ChatPage() {
             <span>ViettelRAG</span>
             <IconChevronDown />
           </div>
-          <div className="cgpt-topbar-right" />
+          <div className="cgpt-topbar-right">
+            {user?.role === "admin" && (
+              <Link to="/admin" className="btn-outline ghost-link" style={{ marginRight: "1rem", padding: "0.4rem 0.8rem", fontSize: "0.9rem" }}>
+                Admin Dashboard
+              </Link>
+            )}
+            <button className="ghost-link" onClick={onLogout} aria-label="Đăng xuất" style={{ border: "none", background: "transparent", cursor: "pointer", padding: "0.4rem 0.8rem", fontSize: "0.9rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
+              Đăng xuất
+            </button>
+          </div>
         </header>
 
         {/* Messages */}

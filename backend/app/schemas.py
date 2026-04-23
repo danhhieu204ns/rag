@@ -16,12 +16,23 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
-class AdminUserRead(BaseModel):
+class UserRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     username: str
+    role: str
     is_active: bool
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1)
+    role: str = Field(default="user")
+
+class UserUpdate(BaseModel):
+    password: str | None = Field(default=None, min_length=1)
+    role: str | None = None
+    is_active: bool | None = None
 
 
 class DocumentBase(BaseModel):

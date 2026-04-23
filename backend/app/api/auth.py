@@ -7,19 +7,19 @@ from sqlalchemy.orm import Session
 
 from ..core.security import create_access_token, decode_access_token, verify_password
 from ..db import get_db
-from ..models import AdminUser
-from ..schemas import AdminUserRead, LoginRequest, TokenResponse
+from ..models import User
+from ..schemas import UserRead, LoginRequest, TokenResponse
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def require_admin(
+def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
     db: Session = Depends(get_db),
-) -> AdminUser:
-    """FastAPI dependency — validates Bearer JWT and returns the active admin user."""
+) -> User:
+    """FastAPI dependency — validates Bearer JWT and returns the active user."""
 
     unauthorized = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -38,9 +38,9 @@ def require_admin(
     except JWTError:
         raise unauthorized
 
-    user = db.query(AdminUser).filter(
-        AdminUser.username == username,
-        AdminUser.is_active == True,  # noqa: E712
+    user = db.query(User).filter(
+        User.username == username,
+        User.is_active == True,  # noqa: E712
     ).first()
 
     if user is None:
@@ -48,12 +48,21 @@ def require_admin(
 
     return user
 
+def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    """FastAPI dependency — requires the current user to be an admin."""
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Không có quyền truy cập.",
+        )
+    return current_user
+
 
 @router.post("/login", response_model=TokenResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
     """Authenticate admin and return a JWT access token."""
 
-    user = db.query(AdminUser).filter(AdminUser.username == payload.username).first()
+    user = db.query(User).filter(User.username == payload.username).first()
 
     if user is None or not user.is_active or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(
@@ -65,8 +74,8 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse
     return TokenResponse(access_token=token, token_type="bearer")
 
 
-@router.get("/me", response_model=AdminUserRead)
-def get_me(current_admin: AdminUser = Depends(require_admin)) -> AdminUser:
-    """Return info about the currently authenticated admin."""
+@router.get("/me", response_model=UserRead)
+def get_me(current_user: User = Depends(get_current_user)) -> User:
+    """Return info about the currently authenticated user."""
 
-    return current_admin
+    return current_user

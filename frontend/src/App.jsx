@@ -1,66 +1,89 @@
 import { useEffect, useState } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
-import AdminLoginPage from "./pages/AdminLoginPage";
+import LoginPage from "./pages/LoginPage";
 import ChatPage from "./pages/ChatPage";
 import DocumentsPage from "./pages/DocumentsPage";
+import UsersPage from "./pages/UsersPage";
+import AdminLayout from "./pages/AdminLayout";
 import api, { TOKEN_KEY } from "./api";
 
 function App() {
-  const [isAdminLoggedIn, setIsAdminLoggedIn] = useState(
-    () => Boolean(localStorage.getItem(TOKEN_KEY))
-  );
+  const [user, setUser] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
 
-  // Verify token validity once on mount
   useEffect(() => {
     const token = localStorage.getItem(TOKEN_KEY);
     if (!token) {
-      setIsAdminLoggedIn(false);
+      setUser(null);
+      setIsLoading(false);
       return;
     }
 
     api
       .get("/auth/me")
-      .then(() => setIsAdminLoggedIn(true))
+      .then((res) => {
+        setUser(res.data);
+      })
       .catch(() => {
         localStorage.removeItem(TOKEN_KEY);
-        setIsAdminLoggedIn(false);
+        setUser(null);
+      })
+      .finally(() => {
+        setIsLoading(false);
       });
   }, []);
 
-  function handleAdminLogin(token) {
+  function handleLogin(token, userData) {
     localStorage.setItem(TOKEN_KEY, token);
-    setIsAdminLoggedIn(true);
+    setUser(userData);
   }
 
-  function handleAdminLogout() {
+  function handleLogout() {
     localStorage.removeItem(TOKEN_KEY);
-    setIsAdminLoggedIn(false);
+    setUser(null);
+  }
+
+  if (isLoading) {
+    return <div>Đang tải...</div>;
   }
 
   return (
     <Routes>
-      <Route path="/" element={<Navigate to="/chat" replace />} />
-      <Route path="/chat" element={<ChatPage />} />
+      <Route path="/" element={<Navigate to="/login" replace />} />
       <Route
-        path="/admin/login"
+        path="/chat"
         element={
-          isAdminLoggedIn ? (
-            <Navigate to="/admin/documents" replace />
+          user ? (
+            <ChatPage user={user} onLogout={handleLogout} />
           ) : (
-            <AdminLoginPage onLogin={handleAdminLogin} />
+            <Navigate to="/login" replace />
           )
         }
       />
       <Route
-        path="/admin/documents"
+        path="/login"
         element={
-          isAdminLoggedIn ? (
-            <DocumentsPage onAdminLogout={handleAdminLogout} />
+          user ? (
+            <Navigate to="/chat" replace />
           ) : (
-            <Navigate to="/admin/login" replace />
+            <LoginPage onLogin={handleLogin} />
           )
         }
       />
+      <Route
+        path="/admin"
+        element={
+          user?.role === "admin" ? (
+            <AdminLayout onLogout={handleLogout} />
+          ) : (
+            <Navigate to="/chat" replace />
+          )
+        }
+      >
+        <Route index element={<Navigate to="documents" replace />} />
+        <Route path="documents" element={<DocumentsPage />} />
+        <Route path="users" element={<UsersPage />} />
+      </Route>
       <Route path="*" element={<Navigate to="/chat" replace />} />
     </Routes>
   );

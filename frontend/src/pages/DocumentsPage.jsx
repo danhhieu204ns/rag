@@ -5,7 +5,7 @@ import api from "../api";
 const CHUNK_PAGE_SIZE = 10;
 const DOCUMENT_PROGRESS_POLL_INTERVAL_MS = 2500;
 
-function DocumentsPage({ onAdminLogout }) {
+function DocumentsPage() {
   const [documents, setDocuments] = useState([]);
   const [titleDrafts, setTitleDrafts] = useState({});
   const [selectedFile, setSelectedFile] = useState(null);
@@ -287,21 +287,6 @@ function DocumentsPage({ onAdminLogout }) {
   }, [hasIndexingDocuments]);
 
   return (
-    <div className="admin-docs-shell">
-      <header className="admin-docs-head">
-        <div>
-          <h1>Admin - Quan ly tai lieu</h1>
-          <p>Upload, embed va xem chi tiet chunks/metadata cho kho tri thuc.</p>
-        </div>
-        <div className="admin-docs-top-actions">
-          <Link to="/chat" className="ghost-link">
-            Mo user chat
-          </Link>
-          <button className="danger" onClick={onAdminLogout}>
-            Dang xuat
-          </button>
-        </div>
-      </header>
 
       <div className="panel panel-main admin-docs-panel">
         <div className="panel-head">
@@ -481,7 +466,6 @@ function DocumentsPage({ onAdminLogout }) {
         {error ? <p className="error-text">{error}</p> : null}
         {isBusy && busyMessage ? <p className="muted busy-text">{busyMessage}</p> : null}
       </div>
-    </div>
   );
 }
 

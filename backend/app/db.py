@@ -71,11 +71,31 @@ def get_db() -> Generator[Session, None, None]:
 
 
 
+def _migrate_users_table() -> None:
+    """Migrate admin_users table to users and add role column if necessary."""
+    with engine.begin() as connection:
+        # Check if admin_users exists
+        table_info = connection.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='admin_users'")).fetchone()
+        if table_info:
+            # Rename table
+            connection.execute(text("ALTER TABLE admin_users RENAME TO users"))
+            
+        # Check if users table exists and if it needs the role column
+        table_info = connection.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")).fetchone()
+        if table_info:
+            columns_info = connection.execute(text("PRAGMA table_info(users)")).fetchall()
+            existing_columns = {str(row[1]) for row in columns_info}
+            if "role" not in existing_columns:
+                connection.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'user' NOT NULL"))
+                # Existing users in the old admin_users table were admins
+                connection.execute(text("UPDATE users SET role = 'admin'"))
+
 def init_db() -> None:
     """Create all configured database tables and seed default admin if needed."""
 
     from . import models  # noqa: F401
 
+    _migrate_users_table()
     Base.metadata.create_all(bind=engine)
     _seed_admin()
 
@@ -83,18 +103,19 @@ def init_db() -> None:
 def _seed_admin() -> None:
     """Create default admin account on first run if none exists."""
 
-    from .models import AdminUser
+    from .models import User
     from .core.security import hash_password
 
     db = SessionLocal()
     try:
-        exists = db.query(AdminUser).first()
+        exists = db.query(User).first()
         if exists:
             return
 
-        admin = AdminUser(
+        admin = User(
             username=settings.admin_default_username,
             hashed_password=hash_password(settings.admin_default_password),
+            role="admin",
             is_active=True,
         )
         db.add(admin)

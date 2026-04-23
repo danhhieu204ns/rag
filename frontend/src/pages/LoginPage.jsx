@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import api from "../api";
 
-function AdminLoginPage({ onLogin }) {
+function LoginPage({ onLogin }) {
   const navigate = useNavigate();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -21,8 +21,15 @@ function AdminLoginPage({ onLogin }) {
     setIsLoading(true);
     try {
       const response = await api.post("/auth/login", { username, password });
-      onLogin(response.data.access_token);
-      navigate("/admin/documents", { replace: true });
+      const token = response.data.access_token;
+      
+      // Fetch user details to get role
+      const userRes = await api.get("/auth/me", {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      onLogin(token, userRes.data);
+      navigate("/chat", { replace: true });
     } catch (err) {
       const detail = err?.response?.data?.detail;
       setError(
@@ -45,7 +52,7 @@ function AdminLoginPage({ onLogin }) {
             <span className="brand-red">viettel</span>
             <span className="brand-black">Chatbot</span>
           </h1>
-          <h2>Đăng nhập Admin</h2>
+          <h2>Đăng nhập Hệ thống</h2>
         </div>
 
         <label htmlFor="admin-user">Tên đăng nhập *</label>
@@ -54,7 +61,7 @@ function AdminLoginPage({ onLogin }) {
           type="text"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
-          placeholder="Nhập tài khoản admin"
+          placeholder="Nhập tên đăng nhập"
           autoComplete="username"
           disabled={isLoading}
         />
@@ -71,9 +78,6 @@ function AdminLoginPage({ onLogin }) {
         />
 
         <div className="admin-login-actions">
-          <Link to="/chat" className="btn-outline ghost-link" style={{ textAlign: "center" }}>
-            Quay lại Chat
-          </Link>
           <button type="submit" className="btn-primary" disabled={isLoading}>
             {isLoading ? "Đang đăng nhập..." : "Đăng nhập"}
           </button>
@@ -85,4 +89,4 @@ function AdminLoginPage({ onLogin }) {
   );
 }
 
-export default AdminLoginPage;
+export default LoginPage;
