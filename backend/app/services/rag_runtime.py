@@ -20,6 +20,7 @@ from .rag.retrieval import (
 )
 from .rag.generation import (
     generate_answer,
+    generate_answer_stream,
     build_sources,
     parse_sources,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "similarity_search",
     "rerank_documents",
     "generate_answer",
+    "generate_answer_stream",
     "build_sources",
     "parse_sources",
 ]

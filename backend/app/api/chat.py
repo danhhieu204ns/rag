@@ -6,6 +6,7 @@ from datetime import datetime
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..core.settings import settings
@@ -122,32 +123,35 @@ def list_messages(session_id: int, db: Session = Depends(get_db)) -> list[ChatMe
     return [_message_to_read(message) for message in messages]
 
 
-@router.post("/query", response_model=ChatQueryResponse)
-def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> ChatQueryResponse:
-    """Run one RAG query, save both user and assistant messages."""
+@router.post("/query")
+def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+    """Run one RAG query, save both user and assistant messages, and stream the response."""
 
     user_text = payload.message.strip()
     top_k = payload.top_k or settings.retriever_k
 
-    with request_logging_context(
-        "chat",
-        session=payload.session_id or "new",
-        topk=top_k,
-    ) as req_log:
-        return _run_query_chat(payload, user_text, top_k, db, req_log)
+    # Because StreamingResponse executes the generator lazily, 
+    # we don't wrap the whole return in the context manager, 
+    # but we can do the initial DB setup synchronously if we want, 
+    # or just let the generator handle it.
+    
+    # We will pass a db session and stream directly.
+    return StreamingResponse(
+        _run_query_chat_stream(payload, user_text, top_k, db),
+        media_type="text/event-stream"
+    )
 
 
-def _run_query_chat(
+def _run_query_chat_stream(
     payload: ChatQueryRequest,
     user_text: str,
     top_k: int,
     db: Session,
-    req_log: object,
-) -> ChatQueryResponse:
+):
     request_started_at = time.perf_counter()
 
     _emit_query_progress(
-        "[chat.query] Start request: session_id=%s, top_k=%d, document_filter=%s, message='%s'",
+        "[chat.query] Start stream request: session_id=%s, top_k=%d, document_filter=%s, message='%s'",
         payload.session_id,
         top_k,
         payload.document_ids or [],
@@ -159,7 +163,8 @@ def _run_query_chat(
     if payload.session_id is not None:
         session = db.get(ChatSession, payload.session_id)
         if session is None:
-            raise HTTPException(status_code=404, detail="Session not found.")
+            yield f"data: {json.dumps({'type': 'error', 'detail': 'Session not found.'})}\n\n"
+            return
 
     first_question_title = _build_title_from_first_question(user_text)
 
@@ -183,6 +188,7 @@ def _run_query_chat(
             db.refresh(session)
 
         _emit_query_progress("[chat.query] Use existing session: session_id=%d", session.id)
+    
     _emit_query_progress(
         "[timing][chat.query] DONE step=resolve_session session_id=%d elapsed_ms=%.2f",
         session.id,
@@ -199,11 +205,6 @@ def _run_query_chat(
     db.add(user_message)
     db.commit()
     _emit_query_progress("[chat.query] Saved user message: session_id=%d", session.id)
-    _emit_query_progress(
-        "[timing][chat.query] DONE step=save_user_message session_id=%d elapsed_ms=%.2f",
-        session.id,
-        (time.perf_counter() - save_user_started_at) * 1000,
-    )
 
     history_started_at = time.perf_counter()
     history = (
@@ -213,12 +214,6 @@ def _run_query_chat(
         .all()
     )
     _emit_query_progress("[chat.query] Loaded history messages: count=%d", len(history))
-    _emit_query_progress(
-        "[timing][chat.query] DONE step=load_history session_id=%d count=%d elapsed_ms=%.2f",
-        session.id,
-        len(history),
-        (time.perf_counter() - history_started_at) * 1000,
-    )
 
     retrieval_started_at = time.perf_counter()
     retrieved_docs = similarity_search(
@@ -228,39 +223,37 @@ def _run_query_chat(
         document_ids=payload.document_ids,
     )
     _emit_query_progress("[chat.query] Retrieved context docs: count=%d", len(retrieved_docs))
-    _emit_query_progress(
-        "[timing][chat.query] DONE step=similarity_search session_id=%d count=%d elapsed_ms=%.2f",
-        session.id,
-        len(retrieved_docs),
-        (time.perf_counter() - retrieval_started_at) * 1000,
-    )
 
+    sources = build_sources(retrieved_docs)
+    
+    # Send session info and sources as the first chunks
+    yield f"data: {json.dumps({'type': 'session', 'session_id': session.id})}\n\n"
+    yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
+
+    answer_parts = []
     answer_started_at = time.perf_counter()
+    
     try:
-        answer = generate_answer(
+        from ..services.rag_runtime import generate_answer_stream
+        for chunk in generate_answer_stream(
             question=user_text,
             context_docs=retrieved_docs,
             history_messages=history,
-        )
-        _emit_query_progress("[chat.query] Generated answer: length=%d chars", len(answer))
-    except Exception as exc:  # pragma: no cover - external API/network failure
-        _emit_query_progress("[chat.query] Generate answer failed: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        ):
+            answer_parts.append(chunk)
+            yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+    except Exception as exc:  # pragma: no cover
+        _emit_query_progress("[chat.query] Generate answer stream failed: %s", exc)
+        yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)})}\n\n"
+        return
+
+    answer = "".join(answer_parts)
+    
     _emit_query_progress(
         "[timing][chat.query] DONE step=generate_answer session_id=%d answer_len=%d elapsed_ms=%.2f",
         session.id,
         len(answer),
         (time.perf_counter() - answer_started_at) * 1000,
-    )
-
-    source_payload_started_at = time.perf_counter()
-    sources = build_sources(retrieved_docs)
-    _emit_query_progress("[chat.query] Built sources payload: count=%d", len(sources))
-    _emit_query_progress(
-        "[timing][chat.query] DONE step=build_sources session_id=%d count=%d elapsed_ms=%.2f",
-        session.id,
-        len(sources),
-        (time.perf_counter() - source_payload_started_at) * 1000,
     )
 
     save_assistant_started_at = time.perf_counter()
@@ -275,20 +268,8 @@ def _run_query_chat(
     session.updated_at = datetime.utcnow()
     db.add(session)
     db.commit()
+    
     _emit_query_progress("[chat.query] Completed request: session_id=%d", session.id)
-    _emit_query_progress(
-        "[timing][chat.query] DONE step=save_assistant_message session_id=%d elapsed_ms=%.2f",
-        session.id,
-        (time.perf_counter() - save_assistant_started_at) * 1000,
-    )
-    _emit_query_progress(
-        "[timing][chat.query] DONE step=request_total session_id=%d elapsed_ms=%.2f",
-        session.id,
-        (time.perf_counter() - request_started_at) * 1000,
-    )
+    
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
-    return ChatQueryResponse(
-        session_id=session.id,
-        answer=answer,
-        sources=[SourceItem(**item) for item in sources],
-    )

@@ -136,18 +136,89 @@ function ChatPage() {
       ...prev,
       { id: `pending-${Date.now()}`, role: "user", content: userText, sources: [] },
     ]);
+    
+    let assistantMessageId = `assistant-${Date.now()}`;
+    let isAssistantMessageAdded = false;
+
     try {
-      const response = await api.post("/chat/query", {
-        session_id: activeSessionId,
-        message: userText,
+      const headers = { "Content-Type": "application/json" };
+      const token = localStorage.getItem("rag_admin_token");
+      if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+
+      const response = await fetch(`${api.defaults.baseURL}/chat/query`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          session_id: activeSessionId,
+          message: userText,
+        }),
       });
-      const sessionId = response.data.session_id;
-      setActiveSessionId(sessionId);
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let doneReading = false;
+      let newSessionId = activeSessionId;
+      let buffer = "";
+
+      while (!doneReading) {
+        const { value, done } = await reader.read();
+        doneReading = done;
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || "";
+          
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.substring(6));
+                
+                if (!isAssistantMessageAdded && data.type !== 'error') {
+                  setMessages((prev) => [
+                    ...prev,
+                    { id: assistantMessageId, role: "assistant", content: "", sources: [] },
+                  ]);
+                  isAssistantMessageAdded = true;
+                }
+
+                if (data.type === 'session') {
+                  newSessionId = data.session_id;
+                } else if (data.type === 'sources') {
+                  setMessages(prev => prev.map(msg => 
+                    msg.id === assistantMessageId ? { ...msg, sources: data.sources } : msg
+                  ));
+                } else if (data.type === 'token') {
+                  setMessages(prev => prev.map(msg => 
+                    msg.id === assistantMessageId ? { ...msg, content: msg.content + data.content } : msg
+                  ));
+                } else if (data.type === 'error') {
+                   setError(data.detail || "Có lỗi xảy ra trong quá trình tạo câu trả lời.");
+                } else if (data.type === 'done') {
+                   // finished
+                }
+              } catch (e) {
+                console.error("Error parsing SSE data", e, line);
+              }
+            }
+          }
+        }
+      }
+      
       await fetchSessions();
-      await fetchMessages(sessionId);
+      if (newSessionId && newSessionId !== activeSessionId) {
+        setActiveSessionId(newSessionId); // This triggers fetchMessages
+      } else if (newSessionId) {
+        await fetchMessages(newSessionId);
+      }
     } catch (err) {
-      const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Không thể gửi câu hỏi.");
+      console.error(err);
+      setError("Không thể gửi câu hỏi hoặc mất kết nối.");
     } finally {
       setIsSending(false);
     }
