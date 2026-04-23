@@ -164,17 +164,18 @@ function DocumentsPage() {
     }
   }
 
-  async function parseDocument(documentId) {
+  async function processDocument(documentId) {
     setIsBusy(true);
-    setBusyMessage("Buoc A: Dang parse PDF sang markdown va luu disk...");
-    setActiveDocumentAction({ documentId, action: "parse" });
+    setBusyMessage("Dang bat dau quy trinh indexing (Parse + Embed)...");
+    setActiveDocumentAction({ documentId, action: "process" });
     setError("");
     try {
-      await api.post(`/documents/${documentId}/parse`);
+      await api.post(`/documents/${documentId}/process`);
+      setBusyMessage("Da queue quy trinh indexing, dang theo doi tien do...");
       await fetchDocuments();
     } catch (err) {
       const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Khong the parse tai lieu.");
+      setError(typeof detail === "string" ? detail : "Khong the bat dau quy trinh indexing.");
     } finally {
       setIsBusy(false);
       setBusyMessage("");
@@ -182,27 +183,6 @@ function DocumentsPage() {
     }
   }
 
-  async function embedDocument(documentId) {
-    setIsBusy(true);
-    setBusyMessage("Buoc B: Dang load markdown da parse de chunking + embedding...");
-    setActiveDocumentAction({ documentId, action: "embed" });
-    setError("");
-    try {
-      await api.post(`/documents/${documentId}/embed`);
-      setBusyMessage("Buoc B: Da queue embedding/upsert, dang dong bo giao dien...");
-      await fetchDocuments();
-      if (selectedChunkDocumentId === documentId) {
-        await fetchDocumentChunks(documentId, 0);
-      }
-    } catch (err) {
-      const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Khong the embed tai lieu.");
-    } finally {
-      setIsBusy(false);
-      setBusyMessage("");
-      setActiveDocumentAction({ documentId: null, action: "" });
-    }
-  }
 
   async function deleteDocument(documentId) {
     setIsBusy(true);
@@ -288,184 +268,177 @@ function DocumentsPage() {
 
   return (
 
-      <div className="panel panel-main admin-docs-panel">
-        <div className="panel-head">
-          <h2>Danh sach tai lieu</h2>
-          <div className="panel-actions">
-            <span className="muted">Tai lieu: {documents.length}</span>
-            <span className="muted">Tong chunks: {totalChunks}</span>
-            {hasIndexingDocuments ? <span className="muted">Dang polling tien trinh...</span> : null}
-            <button onClick={rebuildIndex} disabled={isBusy}>
-              Rebuild index
-            </button>
-          </div>
-        </div>
-
-        <p className="muted step-hint">
-          Luong 2 buoc: Buoc A Parse 1 lan (PDF -&gt; markdown, luu disk) -&gt; Buoc B tai su dung markdown de chunking,
-          parent-child, summary/questions/keywords, embedding va upsert.
-        </p>
-
-        <form className="upload-form" onSubmit={uploadDocument}>
-          <input
-            type="file"
-            onChange={(event) => setSelectedFile(event.target.files?.[0] || null)}
-            accept=".pdf,.txt,.md"
-          />
-          <input
-            type="text"
-            placeholder="Title (optional)"
-            value={uploadTitle}
-            onChange={(event) => setUploadTitle(event.target.value)}
-          />
-          <button type="submit" disabled={isBusy || !selectedFile}>
-            {isBusy ? "Dang xu ly..." : "Upload"}
+    <div className="panel panel-main admin-docs-panel">
+      <div className="panel-head">
+        <h2>Danh sach tai lieu</h2>
+        <div className="panel-actions">
+          <span className="muted">Tai lieu: {documents.length}</span>
+          <span className="muted">Tong chunks: {totalChunks}</span>
+          {hasIndexingDocuments ? <span className="muted">Dang polling tien trinh...</span> : null}
+          <button onClick={rebuildIndex} disabled={isBusy}>
+            Rebuild index
           </button>
-        </form>
-
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Tieu de</th>
-                <th>File goc</th>
-                <th>Status</th>
-                <th>Chunks</th>
-                <th>Buoc A</th>
-                <th>Buoc B</th>
-                <th>Khac</th>
-              </tr>
-            </thead>
-            <tbody>
-              {documents.map((doc) => (
-                <tr key={doc.id}>
-                  <td>{doc.id}</td>
-                  <td>
-                    <input
-                      value={titleDrafts[doc.id] || ""}
-                      onChange={(event) =>
-                        setTitleDrafts((prev) => ({ ...prev, [doc.id]: event.target.value }))
-                      }
-                    />
-                  </td>
-                  <td>{doc.original_filename}</td>
-                  <td>{doc.status}</td>
-                  <td>{doc.chunk_count}</td>
-                  <td className="row-actions">
-                    <button onClick={() => saveTitle(doc.id)} disabled={isBusy}>
-                      Save
-                    </button>
-                    <button onClick={() => parseDocument(doc.id)} disabled={isBusy}>
-                      {isBusy && activeDocumentAction.documentId === doc.id && activeDocumentAction.action === "parse"
-                        ? "Dang parse..."
-                        : "Parse markdown"}
-                    </button>
-                  </td>
-                  <td className="row-actions">
-                    <button onClick={() => embedDocument(doc.id)} disabled={isBusy}>
-                      {isBusy && activeDocumentAction.documentId === doc.id && activeDocumentAction.action === "embed"
-                        ? "Dang load markdown..."
-                        : "Embed tu markdown"}
-                    </button>
-                  </td>
-                  <td className="row-actions">
-                    <button onClick={() => handleChunkToggle(doc)} disabled={isBusy || isChunksBusy}>
-                      {selectedChunkDocumentId === doc.id ? "Hide chunks" : "View chunks"}
-                    </button>
-                    <button className="danger" onClick={() => deleteDocument(doc.id)} disabled={isBusy}>
-                      Delete
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
         </div>
-
-        {selectedChunkDocumentId ? (
-          <section className="chunk-inspector">
-            <div className="chunk-inspector-head">
-              <div>
-                <h3>
-                  Chunks - Document #{selectedChunkDocumentId}
-                  {selectedChunkDocument ? `: ${selectedChunkDocument.title}` : ""}
-                </h3>
-                <p className="muted">
-                  Total: {chunkTotal}
-                  {chunkTotal > 0 ? ` | Showing ${chunkRangeStart}-${chunkRangeEnd}` : ""}
-                </p>
-              </div>
-              <div className="chunk-inspector-actions">
-                <button
-                  onClick={() =>
-                    fetchDocumentChunks(
-                      selectedChunkDocumentId,
-                      Math.max(0, chunkOffset - CHUNK_PAGE_SIZE)
-                    )
-                  }
-                  disabled={!canGoChunkPrev || isChunksBusy}
-                >
-                  Prev
-                </button>
-                <button
-                  onClick={() =>
-                    fetchDocumentChunks(selectedChunkDocumentId, chunkOffset + CHUNK_PAGE_SIZE)
-                  }
-                  disabled={!canGoChunkNext || isChunksBusy}
-                >
-                  Next
-                </button>
-                <button className="danger" onClick={closeChunksInspector}>
-                  Close
-                </button>
-              </div>
-            </div>
-
-            {isChunksBusy ? <p className="muted">Dang tai chunks...</p> : null}
-            {chunksError ? <p className="error-text">{chunksError}</p> : null}
-            {!isChunksBusy && !chunksError && chunks.length === 0 ? (
-              <p className="muted">Tai lieu nay chua co chunk. Bam Embed de tao chunks.</p>
-            ) : null}
-
-            <div className="chunk-list">
-              {chunks.map((chunk) => {
-                const metadata = chunk.source_metadata || {};
-                const hasMetadata = Object.keys(metadata).length > 0;
-
-                return (
-                  <article className="chunk-card" key={chunk.id}>
-                    <div className="chunk-card-head">
-                      <strong>Chunk #{chunk.chunk_index}</strong>
-                      <span className="chunk-pill">id {chunk.id}</span>
-                      {chunk.source_page ? <span className="chunk-pill">page {chunk.source_page}</span> : null}
-                      {chunk.source_kind ? <span className="chunk-pill">{chunk.source_kind}</span> : null}
-                      {chunk.created_at ? (
-                        <span className="chunk-pill">{formatChunkDate(chunk.created_at)}</span>
-                      ) : null}
-                    </div>
-
-                    <details open>
-                      <summary>Content</summary>
-                      <pre className="chunk-pre">{chunk.content}</pre>
-                    </details>
-
-                    <details>
-                      <summary>Metadata</summary>
-                      <pre className="chunk-pre">
-                        {hasMetadata ? JSON.stringify(metadata, null, 2) : "{}"}
-                      </pre>
-                    </details>
-                  </article>
-                );
-              })}
-            </div>
-          </section>
-        ) : null}
-
-        {error ? <p className="error-text">{error}</p> : null}
-        {isBusy && busyMessage ? <p className="muted busy-text">{busyMessage}</p> : null}
       </div>
+
+      <form className="upload-form" onSubmit={uploadDocument}>
+        <input
+          type="file"
+          onChange={(event) => setSelectedFile(event.target.files?.[0] || null)}
+          accept=".pdf,.txt,.md"
+        />
+        <input
+          type="text"
+          placeholder="Title (optional)"
+          value={uploadTitle}
+          onChange={(event) => setUploadTitle(event.target.value)}
+        />
+        <button type="submit" disabled={isBusy || !selectedFile}>
+          {isBusy ? "Dang xu ly..." : "Upload"}
+        </button>
+      </form>
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Tieu de</th>
+              <th>File goc</th>
+              <th>Status</th>
+              <th>Chunks</th>
+              <th>Thao tac</th>
+              <th>Khac</th>
+
+            </tr>
+          </thead>
+          <tbody>
+            {documents.map((doc) => (
+              <tr key={doc.id}>
+                <td>{doc.id}</td>
+                <td>
+                  <input
+                    value={titleDrafts[doc.id] || ""}
+                    onChange={(event) =>
+                      setTitleDrafts((prev) => ({ ...prev, [doc.id]: event.target.value }))
+                    }
+                  />
+                </td>
+                <td>{doc.original_filename}</td>
+                <td>{doc.status}</td>
+                <td>{doc.chunk_count}</td>
+                <td className="row-actions">
+                  <button onClick={() => saveTitle(doc.id)} disabled={isBusy}>
+                    Save
+                  </button>
+                  <button
+                    onClick={() => processDocument(doc.id)}
+                    disabled={isBusy || doc.status === "indexing"}
+                    className={doc.status === "embedded" ? "secondary" : "primary"}
+                  >
+                    {isBusy && activeDocumentAction.documentId === doc.id && activeDocumentAction.action === "process"
+                      ? "Dang xu ly..."
+                      : (doc.status === "embedded" ? "Re-index" : "Start Indexing")}
+                  </button>
+                </td>
+
+                <td className="row-actions">
+                  <button onClick={() => handleChunkToggle(doc)} disabled={isBusy || isChunksBusy}>
+                    {selectedChunkDocumentId === doc.id ? "Hide chunks" : "View chunks"}
+                  </button>
+                  <button className="danger" onClick={() => deleteDocument(doc.id)} disabled={isBusy}>
+                    Delete
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {selectedChunkDocumentId ? (
+        <section className="chunk-inspector">
+          <div className="chunk-inspector-head">
+            <div>
+              <h3>
+                Chunks - Document #{selectedChunkDocumentId}
+                {selectedChunkDocument ? `: ${selectedChunkDocument.title}` : ""}
+              </h3>
+              <p className="muted">
+                Total: {chunkTotal}
+                {chunkTotal > 0 ? ` | Showing ${chunkRangeStart}-${chunkRangeEnd}` : ""}
+              </p>
+            </div>
+            <div className="chunk-inspector-actions">
+              <button
+                onClick={() =>
+                  fetchDocumentChunks(
+                    selectedChunkDocumentId,
+                    Math.max(0, chunkOffset - CHUNK_PAGE_SIZE)
+                  )
+                }
+                disabled={!canGoChunkPrev || isChunksBusy}
+              >
+                Prev
+              </button>
+              <button
+                onClick={() =>
+                  fetchDocumentChunks(selectedChunkDocumentId, chunkOffset + CHUNK_PAGE_SIZE)
+                }
+                disabled={!canGoChunkNext || isChunksBusy}
+              >
+                Next
+              </button>
+              <button className="danger" onClick={closeChunksInspector}>
+                Close
+              </button>
+            </div>
+          </div>
+
+          {isChunksBusy ? <p className="muted">Dang tai chunks...</p> : null}
+          {chunksError ? <p className="error-text">{chunksError}</p> : null}
+          {!isChunksBusy && !chunksError && chunks.length === 0 ? (
+            <p className="muted">Tai lieu nay chua co chunk. Bam Embed de tao chunks.</p>
+          ) : null}
+
+          <div className="chunk-list">
+            {chunks.map((chunk) => {
+              const metadata = chunk.source_metadata || {};
+              const hasMetadata = Object.keys(metadata).length > 0;
+
+              return (
+                <article className="chunk-card" key={chunk.id}>
+                  <div className="chunk-card-head">
+                    <strong>Chunk #{chunk.chunk_index}</strong>
+                    <span className="chunk-pill">id {chunk.id}</span>
+                    {chunk.source_page ? <span className="chunk-pill">page {chunk.source_page}</span> : null}
+                    {chunk.source_kind ? <span className="chunk-pill">{chunk.source_kind}</span> : null}
+                    {chunk.created_at ? (
+                      <span className="chunk-pill">{formatChunkDate(chunk.created_at)}</span>
+                    ) : null}
+                  </div>
+
+                  <details open>
+                    <summary>Content</summary>
+                    <pre className="chunk-pre">{chunk.content}</pre>
+                  </details>
+
+                  <details>
+                    <summary>Metadata</summary>
+                    <pre className="chunk-pre">
+                      {hasMetadata ? JSON.stringify(metadata, null, 2) : "{}"}
+                    </pre>
+                  </details>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+
+      {error ? <p className="error-text">{error}</p> : null}
+      {isBusy && busyMessage ? <p className="muted busy-text">{busyMessage}</p> : null}
+    </div>
   );
 }
 

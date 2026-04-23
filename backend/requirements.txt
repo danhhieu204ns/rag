@@ -1,3 +1,8 @@
+# PyTorch CUDA 12.8 (GPU) — change cu128 to cu124/cpu if needed
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+
 fastapi
 uvicorn[standard]
 sqlalchemy
@@ -15,3 +20,4 @@ python-jose[cryptography]
 bcrypt
 ollama
 marker-pdf
+pillow<11.0.0

@@ -419,16 +419,15 @@ class MetadataBundleGenerator:
         self.summary_words = max(20, settings.hyq_summary_words)
         self.question_count = 3
         self.use_llm = bool(settings.metadata_use_llm or settings.hyq_use_llm)
-        self.model_name = "gemma3:1b"
-        # Keep summary in the same metadata request; do not trigger a second summary-only model call.
-        self.summary_model_name = ""
+        self.model_name = settings.metadata_model
+        self.summary_model_name = settings.metadata_summary_model
         self.base_url = settings.ollama_base_url
         self.num_thread = max(1, settings.metadata_ollama_num_thread)
         self.num_predict = max(128, settings.metadata_ollama_num_predict)
         self.num_ctx = max(512, settings.metadata_num_ctx)
         self.summary_num_ctx = max(512, settings.metadata_summary_num_ctx)
         self.keep_alive = settings.metadata_keep_alive
-        self.batch_size = 2
+        self.batch_size = max(1, settings.metadata_llm_batch_size)
         self.batch_max_chars = max(2000, settings.metadata_llm_batch_max_chars)
         self._thread_local = threading.local()
         self._llm_disabled = not self.use_llm

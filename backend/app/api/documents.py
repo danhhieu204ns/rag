@@ -757,94 +757,124 @@ def _save_index_state(
             time.sleep(0.4 * (attempt + 1))
 
 
-def _run_document_indexing_job(
+def _run_full_indexing_job(
     document_id: int,
-    file_hash: str,
-    parsed_markdown_path_raw: str,
-    source_parser: str,
-    source_type: str,
 ) -> None:
-    with request_logging_context(
-        "embed",
-        doc=document_id,
-    ):
-        _do_document_indexing_job(
-            document_id=document_id,
-            file_hash=file_hash,
-            parsed_markdown_path_raw=parsed_markdown_path_raw,
-            source_parser=source_parser,
-            source_type=source_type,
-        )
+    """Unified background task: Parse (if needed) + Chunking + Metadata + Vectors."""
+    with request_logging_context("index", doc=document_id) as log:
+        _do_full_indexing_job(document_id=document_id, log=log)
 
 
-def _do_document_indexing_job(
+def _do_full_indexing_job(
     document_id: int,
-    file_hash: str,
-    parsed_markdown_path_raw: str,
-    source_parser: str,
-    source_type: str,
+    log: Any,
 ) -> None:
     db = SessionLocal()
     started_at = time.perf_counter()
 
     try:
+        log.step_start("init_indexing", doc_id=document_id)
         document = db.get(Document, document_id)
         if document is None:
-            _emit_progress("[embed_document][bg] Skip missing document_id=%s", document_id)
+            log.step_fail("init_indexing", "Document not found")
             return
+
+        document.status = "indexing"
+        db.add(document)
+        db.commit()
+        log.step_done("init_indexing")
 
         original_filename = document.original_filename
         file_path = settings.uploads_dir / document.stored_filename
         if not file_path.exists():
             raise RuntimeError(f"Stored file does not exist for document_id={document_id}")
 
-        parsed_markdown_path = Path(parsed_markdown_path_raw)
-        if not parsed_markdown_path.exists():
-            raise RuntimeError(f"Parsed markdown not found for document_id={document_id}")
+        file_hash = _compute_file_hash(file_path)
 
-        _emit_progress(
-            "[embed_document][bg] Start indexing document_id=%s file='%s'",
-            document_id,
-            original_filename,
-        )
+        # --- Step 1: Parse (if needed) ---
+        log.step_start("check_parse_cache", file_hash=file_hash)
+        cached_meta = _load_parsed_markdown_meta(document_id)
+        markdown_path = _parsed_markdown_path(document_id)
 
-        with _timed_progress("build_document_chunks_for_indexing", document_id=document_id):
-            new_chunks = _build_document_chunks_for_indexing(
-                db=db,
+        need_parse = True
+        if (
+            cached_meta is not None
+            and markdown_path.exists()
+            and str(cached_meta.get("file_hash") or "") == file_hash
+        ):
+            log.info("Parsed markdown cache hit. Reusing existing markdown.")
+            need_parse = False
+            source_parser = _normalize_source_parser(cached_meta.get("source_parser"))
+            source_type = _normalize_source_type(cached_meta.get("source_type"))
+
+        log.step_done("check_parse_cache", need_parse=need_parse)
+
+        if need_parse:
+            log.step_start("parse_source_to_markdown")
+            try:
+                markdown, source_parser, source_type = parse_source_to_markdown(file_path)
+            except Exception as exc:
+                log.step_fail("parse_source_to_markdown", str(exc))
+                raise
+
+            if not markdown.strip():
+                raise RuntimeError("Parsed markdown is empty.")
+
+            _save_parsed_markdown(
                 document_id=document_id,
-                original_filename=original_filename,
-                file_path=file_path,
+                markdown=markdown,
                 file_hash=file_hash,
-                parsed_markdown_path=parsed_markdown_path,
                 source_parser=source_parser,
                 source_type=source_type,
+                source_file_path=file_path,
             )
-        chunk_rows, metadata_cache_payloads, precomputed_child_rows = new_chunks
+            log.step_done("parse_source_to_markdown", parser=source_parser, type=source_type)
 
-        with _timed_progress("write_document_chunks", document_id=document_id):
-            _write_document_chunks(
-                db=db,
-                document_id=document_id,
-                new_chunks=chunk_rows,
-            )
+        # --- Step 2: Indexing (Embedding + Metadata) ---
+        log.step_start("build_document_chunks")
+        new_chunks_data = _build_document_chunks_for_indexing(
+            db=db,
+            document_id=document_id,
+            original_filename=original_filename,
+            file_path=file_path,
+            file_hash=file_hash,
+            parsed_markdown_path=markdown_path,
+            source_parser=source_parser,
+            source_type=source_type,
+        )
+        chunk_rows, metadata_cache_payloads, precomputed_child_rows = new_chunks_data
+        log.step_done(
+            "build_document_chunks",
+            parent_chunks=len(chunk_rows),
+            child_rows=len(precomputed_child_rows),
+        )
 
-        with _timed_progress("save_metadata_cache", document_id=document_id):
-            _save_metadata_cache(
-                db=db,
-                document_id=document_id,
-                file_hash=file_hash,
-                cached_payloads=metadata_cache_payloads,
-            )
+        log.step_start("write_db_chunks", count=len(chunk_rows))
+        _write_document_chunks(
+            db=db,
+            document_id=document_id,
+            new_chunks=chunk_rows,
+        )
+        log.step_done("write_db_chunks")
 
-        with _timed_progress("reload_document_chunks_after_write", document_id=document_id):
-            document_chunks = (
-                db.query(DocumentChunk)
-                .filter(DocumentChunk.document_id == document_id)
-                .order_by(DocumentChunk.id.asc())
-                .all()
-            )
-            db.expunge_all()
-            db.rollback()
+        log.step_start("save_metadata_cache", count=len(metadata_cache_payloads))
+        _save_metadata_cache(
+            db=db,
+            document_id=document_id,
+            file_hash=file_hash,
+            cached_payloads=metadata_cache_payloads,
+        )
+        log.step_done("save_metadata_cache")
+
+        log.step_start("prepare_qdrant_payload")
+        document_chunks = (
+            db.query(DocumentChunk)
+            .filter(DocumentChunk.document_id == document_id)
+            .order_by(DocumentChunk.id.asc())
+            .all()
+        )
+        db.expunge_all()
+        db.rollback()
 
         if document_chunks:
             chunk_by_index = {int(chunk.chunk_index): chunk for chunk in document_chunks}
@@ -855,7 +885,6 @@ def _do_document_indexing_job(
                 chunk_index = _to_int(row.get("chunk_index"))
                 if chunk_index is None:
                     continue
-
                 parent_chunk = chunk_by_index.get(chunk_index)
                 if parent_chunk is None:
                     continue
@@ -870,64 +899,58 @@ def _do_document_indexing_job(
                             "chunk_index": parent_chunk.chunk_index,
                             "source_page": parent_chunk.source_page,
                             "source_kind": parent_chunk.source_kind,
-                            "source_metadata": row.get("source_metadata") if isinstance(row.get("source_metadata"), dict) else {},
+                            "source_metadata": (
+                                row.get("source_metadata")
+                                if isinstance(row.get("source_metadata"), dict)
+                                else {}
+                            ),
                             "child_type": str(row.get("child_type") or "summary"),
                             "child_index": _to_int(row.get("child_index")) or 0,
                         },
                     }
                 )
-
                 vector = row.get("vector")
                 if isinstance(vector, list):
                     child_vectors.append(vector)
+            log.step_done("prepare_qdrant_payload", count=len(child_documents))
 
-            if len(child_documents) != len(child_vectors):
-                raise RuntimeError("Precomputed child vectors are incomplete for indexing.")
-
+            log.step_start("upsert_to_qdrant", count=len(child_documents))
             from langchain_core.documents import Document as LCDocument
 
-            with _timed_progress("upsert_child_documents", document_id=document_id):
-                indexed_count = upsert_child_documents(
-                    [
-                        LCDocument(
-                            page_content=item["page_content"],
-                            metadata=item["metadata"],
-                        )
-                        for item in child_documents
-                    ],
-                    purge_document_ids=[document_id],
-                    precomputed_vectors=child_vectors,
-                )
-        else:
-            with _timed_progress("delete_vectors_by_document_id", document_id=document_id):
-                delete_vectors_by_document_id(document_id)
-            indexed_count = 0
-
-        with _timed_progress("save_index_state", document_id=document_id):
-            _save_index_state(
-                db=db,
-                document_id=document_id,
-                file_hash=file_hash,
-                indexed_parent_chunks=len(document_chunks),
-                indexed_child_chunks=indexed_count,
+            indexed_count = upsert_child_documents(
+                [
+                    LCDocument(
+                        page_content=item["page_content"],
+                        metadata=item["metadata"],
+                    )
+                    for item in child_documents
+                ],
+                purge_document_ids=[document_id],
+                precomputed_vectors=child_vectors,
             )
+            log.step_done("upsert_to_qdrant", indexed_count=indexed_count)
+        else:
+            log.step_start("delete_vectors")
+            delete_vectors_by_document_id(document_id)
+            indexed_count = 0
+            log.step_done("delete_vectors")
+
+        log.step_start("finalize_state")
+        _save_index_state(
+            db=db,
+            document_id=document_id,
+            file_hash=file_hash,
+            indexed_parent_chunks=len(document_chunks),
+            indexed_child_chunks=indexed_count,
+        )
+        log.step_done("finalize_state")
 
         elapsed = time.perf_counter() - started_at
-        _emit_progress(
-            "[embed_document][bg] Completed document_id=%s chunks_created=%s indexed_children=%s elapsed=%.2fs",
-            document_id,
-            len(chunk_rows),
-            indexed_count,
-            elapsed,
-        )
+        log.info("Full indexing completed successfully in %.2fs", elapsed)
+
     except Exception as exc:
         db.rollback()
-        _emit_progress(
-            "[embed_document][bg] Failed document_id=%s root_cause=%s",
-            document_id,
-            exc,
-        )
-
+        log.error("Indexing failed: %s", exc)
         try:
             failed_document = db.get(Document, document_id)
             if failed_document is not None:
@@ -938,6 +961,47 @@ def _do_document_indexing_job(
             db.rollback()
     finally:
         db.close()
+
+
+
+@router.post("/{document_id}/process", response_model=EmbedDocumentResponse, status_code=status.HTTP_202_ACCEPTED)
+def process_document(
+    document_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
+) -> EmbedDocumentResponse:
+    """Unified endpoint: Start the full indexing process (Parse + Embed)."""
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    if document.status == "indexing":
+        raise HTTPException(status_code=409, detail="Document is already indexing.")
+
+    background_tasks.add_task(_run_full_indexing_job, document_id)
+    _emit_progress("[process_document] Queued background indexing for document_id=%s", document_id)
+
+    return EmbedDocumentResponse(
+        document_id=document_id,
+        chunks_created=0,
+        indexed_chunks=0,
+    )
+
+
+@router.post(
+    "/{document_id}/embed",
+    response_model=EmbedDocumentResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def embed_document(
+    document_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
+) -> EmbedDocumentResponse:
+    """Alias for /process for backward compatibility."""
+    return process_document(document_id, background_tasks, db, _)
 
 
 @router.get("", response_model=list[DocumentRead])
@@ -1340,14 +1404,7 @@ def rebuild_global_index(
 
         target_document.status = "indexing"
         db.add(target_document)
-        background_tasks.add_task(
-            _run_document_indexing_job,
-            document_id,
-            file_hash,
-            str(parsed_markdown_path),
-            _normalize_source_parser(parsed_meta.get("source_parser")),
-            _normalize_source_type(parsed_meta.get("source_type")),
-        )
+        background_tasks.add_task(_run_full_indexing_job, document_id)
         queued_documents += 1
 
     db.commit()
