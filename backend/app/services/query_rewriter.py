@@ -18,6 +18,7 @@ _PROTECTED_PATTERNS: list[str] = [
 ]
 
 _REWRITE_PROMPT = (
+    "Câu hỏi đơn giản thì không cần viết lại"
     "Viết lại câu hỏi sau thành phiên bản đầy đủ hơn để tìm kiếm ngữ nghĩa.\n"
     "Quy tắc bắt buộc:\n"
     "- Giữ NGUYÊN VẸN các định danh sau (không đổi, không dịch): {protected}\n"

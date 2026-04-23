@@ -130,9 +130,17 @@ def _emit_query_progress(
     raw_text = message % args if args else message
     trace_id = _query_trace_id_ctx.get()
 
-    text = raw_text
+    # Tự động nối các trường thời gian vào message nếu có trong details
+    time_fields = []
+    if details:
+        for k in ["elapsed_ms", "predict_elapsed_ms", "duration_ms", "step_time_ms"]:
+            if k in details:
+                time_fields.append(f"{k}={details[k]}")
+    time_info = f" | {'; '.join(time_fields)}" if time_fields else ""
+
+    text = raw_text + time_info
     if trace_id and trace_id != "-":
-        text = f"[trace={trace_id}] {raw_text}"
+        text = f"[trace={trace_id}] {raw_text}{time_info}"
 
     logger.info(text)
     print(text, flush=True)
