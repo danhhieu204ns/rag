@@ -1063,7 +1063,10 @@ def _should_rewrite_query(query: str) -> tuple[bool, int, str]:
 def _rewrite_query(query: str) -> str:
     llm = get_llm()
     prompt = (
-        "Viết lại câu hỏi sau thành phiên bản đầy đủ hơn để tối ưu truy xuất tài liệu nội bộ. "
+        "Bạn đang hỗ trợ hệ thống tìm kiếm tài liệu khoa học tự nhiên. "
+        "Hãy viết lại câu hỏi sau thành phiên bản đầy đủ hơn, bổ sung các thuật ngữ chuyên môn "
+        "(định luật, công thức, khái niệm vật lý/hóa học/sinh học) nếu phù hợp, "
+        "để tối ưu việc truy xuất tài liệu. "
         "Giữ nguyên ý nghĩa gốc. Chỉ trả về đúng một câu đã viết lại, không giải thích.\n\n"
         f"Câu hỏi gốc: {query}\n"
         "Câu hỏi đã viết lại:"
@@ -1205,8 +1208,10 @@ def _extract_json_from_llm_text(raw_text: str) -> str:
 def _generate_query_variants(query: str, variant_count: int) -> list[str]:
     llm = _get_variant_llm()
     prompt = (
-        f"Sinh {variant_count} biến thể câu hỏi có cùng ý nghĩa để tìm tài liệu. "
-        "Mỗi biến thể dùng từ vựng khác nhau nhưng vẫn đúng ý định ban đầu. "
+        f"Bạn đang hỗ trợ hệ thống tìm kiếm tài liệu khoa học tự nhiên (vật lý, hóa học, sinh học, địa lý, ...). "
+        f"Hãy sinh {variant_count} biến thể của câu hỏi dưới đây để tìm kiếm tài liệu hiệu quả hơn. "
+        "Mỗi biến thể dùng từ vựng hoặc thuật ngữ chuyên môn khác nhau nhưng vẫn đúng ý định ban đầu "
+        "(ví dụ: thay tên thông thường bằng thuật ngữ khoa học, hoặc diễn đạt theo hướng định luật/công thức). "
         "Trả về JSON hợp lệ dạng: {\"variants\":[\"...\",\"...\"]}.\n\n"
         f"Câu hỏi gốc: {query}"
     )
@@ -1958,14 +1963,24 @@ def generate_answer(
             context_block = "No retrieved context available."
 
     prompt = (
-        "Bạn là Tử Kỳ, một người bạn đồng hành cùng học hỏi về kiến thức công nghệ.\n"
-        "Sử dụng đại từ 'mình' và 'bạn' khi trả lời để tạo cảm giác thân thiện và gần gũi.\n"
-        "Use the context to answer accurately and avoid hallucination.\n"
-        "Luôn bắt đầu bằng một lời dẫn dắt liên quan đến câu hỏi.\n"
-        "Nếu không có đủ thông tin trong ngữ cảnh, hãy nói rõ điều đó một cách khéo léo.\n\n"
-        f"Lịch sử trò chuyện:\n{history_block or 'No previous messages.'}\n\n"
-        f"Ngữ cảnh:\n{context_block}\n\n"
-        f"Câu hỏi: {question}\n"
+        "Bạn là một chuyên gia khoa học tự nhiên thân thiện. "
+        "Nhiệm vụ của bạn là giải thích khoa học một cách chính xác, dễ hiểu và gần gũi "
+        "bằng phương pháp suy luận từng bước (Chain of Thought).\n"
+        "Sử dụng đại từ 'mình' và 'bạn' để tạo cảm giác thân thiện như người bạn đồng học.\n"
+        "Ưu tiên sử dụng thông tin trong tài liệu được cung cấp. "
+        "Nếu tài liệu không đủ căn cứ, hãy nói rõ 'mình chưa tìm thấy đủ thông tin trong tài liệu về điều này' "
+        "và tuyệt đối không tự ý thêm kiến thức ngoài nếu mâu thuẫn với tài liệu.\n\n"
+        f"--- LỊCH SỬ TRÒ CHUYỆN ---\n{history_block or 'Chưa có tin nhắn trước đó.'}\n\n"
+        f"--- TÀI LIỆU HỖ TRỢ ---\n{context_block}\n\n"
+        f"--- CÂU HỎI ---\n{question}\n\n"
+        "--- YÊU CẦU TRẢ LỜI ---\n"
+        "Hãy suy luận theo đúng 4 bước sau:\n"
+        "Bước 1 – Phân tích câu hỏi: Xác định các từ khóa chuyên môn và dữ liệu đầu vào quan trọng.\n"
+        "Bước 2 – Truy xuất căn cứ: Liệt kê các định luật, khái niệm hoặc sự kiện khoa học "
+        "có trong tài liệu liên quan đến câu hỏi.\n"
+        "Bước 3 – Suy luận logic: Kết nối dữ liệu và định luật theo trình tự nguyên nhân – kết quả. "
+        "Nếu tài liệu không đủ thông tin, ghi rõ 'không đủ căn cứ'.\n"
+        "Bước 4 – Kết luận cuối cùng: Đưa ra câu trả lời ngắn gọn, dễ hiểu và thân thiện.\n\n"
         "Trả lời:"
     )
 
