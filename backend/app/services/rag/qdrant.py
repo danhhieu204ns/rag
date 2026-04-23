@@ -14,7 +14,7 @@ from ...models import DocumentChunk
 from ..chunk_metadata import build_hyq_children
 from .logging import _emit_reindex_progress, _emit_query_progress, _timed_query_step
 from .models import get_embeddings
-from .utils import _to_int, _preview_text, _compact_source_metadata
+from .utils import _to_int, _preview_text, _compact_source_metadata, _build_full_text_search
 
 _qdrant_client: QdrantClient | None = None
 
@@ -176,6 +176,8 @@ def _upsert_qdrant_collection_with_batch_embeddings(
             vector_size,
         )
 
+    ensure_full_text_index()
+
     upsert_batch_size = max(1, settings.vector_batch_size)
     upsert_batch_count = (total + upsert_batch_size - 1) // upsert_batch_size
     for batch_index, start in enumerate(range(0, total, upsert_batch_size), start=1):
@@ -222,6 +224,38 @@ def upsert_child_documents(
     )
 
 
+def ensure_full_text_index() -> None:
+    """Create full_text_search payload index if it doesn't exist yet.
+
+    No-op (with info log) for local Qdrant — payload indexes only apply to
+    server Qdrant. MatchText filtering still works via linear scan in local mode.
+    """
+    import warnings
+
+    client = _get_qdrant_client()
+    if not _qdrant_collection_exists(client):
+        return
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            client.create_payload_index(
+                collection_name=settings.qdrant_collection_name,
+                field_name="full_text_search",
+                field_schema=qdrant_models.TextIndexParams(
+                    type="text",
+                    tokenizer=qdrant_models.TokenizerType.WORD,
+                    min_token_len=2,
+                    lowercase=True,
+                ),
+            )
+        _emit_reindex_progress(
+            "[index] Ensured full_text_search payload index on collection '%s'.",
+            settings.qdrant_collection_name,
+        )
+    except Exception:
+        pass  # Index already exists or unsupported — safe to ignore
+
+
 def load_index_if_available() -> bool:
     """Check whether Qdrant child collection exists."""
 
@@ -257,11 +291,14 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
         if source_metadata:
             metadata["source_metadata"] = source_metadata
 
+        full_text_search = _build_full_text_search(source_metadata, chunk.content)
+
         child_chunks = build_hyq_children(source_metadata, chunk.content)
         for child_index, (child_type, child_text) in enumerate(child_chunks):
             child_metadata = dict(metadata)
             child_metadata["child_type"] = child_type
             child_metadata["child_index"] = child_index
+            child_metadata["full_text_search"] = full_text_search
 
             documents.append(
                 Document(

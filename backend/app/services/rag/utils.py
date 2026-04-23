@@ -87,3 +87,48 @@ def _compact_source_metadata(raw_json: str | None) -> dict[str, object]:
     if compact:
         return compact
     return raw_metadata
+
+
+def _segment_vietnamese(text: str) -> str:
+    """Word-segment Vietnamese text using underthesea if installed, else return as-is."""
+    try:
+        from underthesea import word_tokenize  # type: ignore
+        return word_tokenize(text, format="text")
+    except ImportError:
+        return text
+
+
+def _build_full_text_search(source_metadata: dict[str, object], content: str) -> str:
+    """Build augmented search text: headers + content + HYQ questions/summary + keywords."""
+    parts: list[str] = []
+
+    context = source_metadata.get("context") or {}
+    if isinstance(context, dict):
+        for key in ("h2", "h3"):
+            val = context.get(key)
+            if val and isinstance(val, str):
+                parts.append(val.strip())
+
+    if content:
+        parts.append(content.strip())
+
+    hyq = source_metadata.get("hyq") or {}
+    if isinstance(hyq, dict):
+        summary = hyq.get("summary")
+        if summary and isinstance(summary, str):
+            parts.append(summary.strip())
+        questions = hyq.get("questions") or []
+        if isinstance(questions, list):
+            for q in questions:
+                if q and isinstance(q, str):
+                    parts.append(q.strip())
+
+    search_opt = source_metadata.get("search_optimization") or {}
+    if isinstance(search_opt, dict):
+        for key in ("keywords", "entities", "organizations"):
+            vals = search_opt.get(key) or []
+            if isinstance(vals, list):
+                parts.append(" ".join(str(v) for v in vals if v))
+
+    full_text = " ".join(p for p in parts if p)
+    return _segment_vietnamese(full_text)

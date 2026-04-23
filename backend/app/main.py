@@ -15,6 +15,7 @@ from .core.settings import settings
 from .db import init_db
 from .services.chunk_metadata import warmup_metadata_model
 from .services.rag_runtime import warmup_chat_model, warmup_embedding_model
+from .services.rag.qdrant import ensure_full_text_index
 
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,10 @@ def on_startup() -> None:
     """Initialize database tables and seed default admin at app startup."""
 
     init_db()
+    try:
+        ensure_full_text_index()
+    except Exception as exc:
+        logger.warning("Could not ensure full_text_search index: %s", exc)
     _warmup_orchestrated_models()
 
 

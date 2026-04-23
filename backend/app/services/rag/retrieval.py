@@ -316,6 +316,63 @@ def _keyword_match_score(
     return score
 
 
+def _keyword_parent_candidates_qdrant(
+    query: str,
+    top_k: int,
+    document_ids: list[int] | None,
+) -> list[int] | None:
+    """Keyword candidates via Qdrant full-text index. Returns None if index unavailable."""
+    from qdrant_client.http import models as qdrant_models
+
+    client = _get_qdrant_client()
+    if not _qdrant_collection_exists(client):
+        return None
+
+    probe_k = max(top_k * max(1, settings.hybrid_probe_multiplier), top_k)
+
+    must: list[qdrant_models.Condition] = [
+        qdrant_models.FieldCondition(
+            key="full_text_search",
+            match=qdrant_models.MatchText(text=query),
+        )
+    ]
+    if document_ids:
+        must.append(
+            qdrant_models.FieldCondition(
+                key="document_id",
+                match=qdrant_models.MatchAny(any=[int(d) for d in document_ids]),
+            )
+        )
+
+    try:
+        points, _ = client.scroll(
+            collection_name=settings.qdrant_collection_name,
+            scroll_filter=qdrant_models.Filter(must=must),
+            limit=probe_k * 5,
+            with_payload=["parent_chunk_id"],
+            with_vectors=False,
+        )
+    except Exception as exc:
+        _emit_query_progress("[query][keyword] Qdrant text search failed: %s — fallback to DB scan", exc)
+        return None
+
+    if not points:
+        # field may not be indexed yet (existing collection before migration)
+        return None
+
+    seen: set[int] = set()
+    parent_ids: list[int] = []
+    for point in points:
+        pid = _to_int((point.payload or {}).get("parent_chunk_id"))
+        if pid is not None and pid not in seen:
+            seen.add(pid)
+            parent_ids.append(pid)
+        if len(parent_ids) >= probe_k:
+            break
+
+    return parent_ids
+
+
 def _keyword_parent_candidates(
     query: str,
     top_k: int,
@@ -348,6 +405,30 @@ def _keyword_parent_candidates(
             details={"reason": "no_terms_or_codes"},
         )
         return []
+
+    # --- Phase 3: Qdrant full-text search (fast path via inverted index) ---
+    with _timed_query_step(
+        "keyword_candidates_qdrant",
+        event_prefix="keyword_candidates_qdrant",
+        details={"document_filter": document_ids or []},
+    ):
+        qdrant_results = _keyword_parent_candidates_qdrant(query, top_k, document_ids)
+
+    if qdrant_results is not None:
+        _emit_query_progress(
+            "[query][keyword] Qdrant text search: found=%d parent candidates",
+            len(qdrant_results),
+            event="keyword_candidates_qdrant_done",
+            details={"keyword_selected_count": len(qdrant_results), "keyword_selected_parent_ids": qdrant_results},
+        )
+        return qdrant_results
+
+    # --- Fallback: Python DB scan (for existing collections without full_text_search index) ---
+    _emit_query_progress(
+        "[query][keyword] Falling back to DB scan (full_text_search index not available)",
+        event="keyword_candidates_fallback",
+        details={"reason": "qdrant_text_index_unavailable"},
+    )
 
     with _timed_query_step(
         "load_keyword_candidates_from_db",
