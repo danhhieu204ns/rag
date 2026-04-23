@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ..core.settings import settings
+from ..core.request_logger import request_logging_context, get_request_logger
 from ..db import get_db
 from ..models import ChatMessage, ChatSession
 from ..schemas import (
@@ -32,8 +33,7 @@ logger = logging.getLogger(__name__)
 
 def _emit_query_progress(message: str, *args: object) -> None:
     text = message % args if args else message
-    logger.info(text)
-    print(text, flush=True)
+    get_request_logger().info(text)
 
 
 def _preview_text(value: str, limit: int = 120) -> str:
@@ -126,9 +126,25 @@ def list_messages(session_id: int, db: Session = Depends(get_db)) -> list[ChatMe
 def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> ChatQueryResponse:
     """Run one RAG query, save both user and assistant messages."""
 
-    request_started_at = time.perf_counter()
     user_text = payload.message.strip()
     top_k = payload.top_k or settings.retriever_k
+
+    with request_logging_context(
+        "chat",
+        session=payload.session_id or "new",
+        topk=top_k,
+    ) as req_log:
+        return _run_query_chat(payload, user_text, top_k, db, req_log)
+
+
+def _run_query_chat(
+    payload: ChatQueryRequest,
+    user_text: str,
+    top_k: int,
+    db: Session,
+    req_log: object,
+) -> ChatQueryResponse:
+    request_started_at = time.perf_counter()
 
     _emit_query_progress(
         "[chat.query] Start request: session_id=%s, top_k=%d, document_filter=%s, message='%s'",

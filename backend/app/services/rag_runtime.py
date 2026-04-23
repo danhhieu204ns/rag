@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
 from datetime import UTC, datetime
 import json
@@ -13,6 +14,8 @@ import unicodedata
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from collections import defaultdict
 from typing import Any, Iterator
+
+from ..core.request_logger import get_request_logger
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -206,9 +209,10 @@ def _emit_query_progress(
     if trace_id and trace_id != "-":
         text = f"[trace={trace_id}] {raw_text}{time_info}"
 
-    logger.info(text)
-    print(text, flush=True)
+    # Ghi vào per-request file logger (không ra terminal)
+    get_request_logger().info(text)
 
+    # Vẫn ghi vào file trace JSON để backward compat
     _append_query_log_entry(
         event=event or "progress",
         details={
@@ -341,8 +345,8 @@ def _compact_source_metadata(raw_json: str | None) -> dict[str, object]:
 
 def _emit_reindex_progress(message: str, *args: object) -> None:
     text = message % args if args else message
-    logger.info(text)
-    print(text, flush=True)
+    # Ghi vào per-request file logger (không ra terminal)
+    get_request_logger().info(text)
 
 
 def _get_qdrant_client() -> QdrantClient:
@@ -1893,7 +1897,6 @@ def similarity_search(
                         child_type=parent_child_type.get(chunk.id),
                     )
                 )
-            )
         stage_timings_ms["build_context_documents"] = _elapsed_ms(build_context_docs_started_at)
 
         rerank_stage_started_at = time.perf_counter()

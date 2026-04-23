@@ -5,6 +5,7 @@ import re
 
 from langchain_ollama import ChatOllama
 
+from ..core.request_logger import get_request_logger
 from ..core.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -106,9 +107,10 @@ def rewrite_for_vector(query: str) -> str:
         if not expanded or expanded == query:
             return query
 
-        logger.info("[rewrite] '%s'  →  '%s'", query, expanded)
+        get_request_logger().info("[rewrite] '%s'  →  '%s'", query, expanded)
         return expanded
 
     except Exception as exc:
         logger.warning("[rewrite] LLM call failed, using original query: %s", exc)
         return query
+

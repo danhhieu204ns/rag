@@ -19,6 +19,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..core.settings import settings
+from ..core.request_logger import request_logging_context, get_request_logger
 from ..db import SessionLocal, get_db
 from ..models import AdminUser, ChunkMetadataCache, Document, DocumentChunk, DocumentIndexState
 from ..schemas import (
@@ -44,8 +45,7 @@ logger = logging.getLogger(__name__)
 
 def _emit_progress(message: str, *args: object) -> None:
     text = message % args if args else message
-    logger.info(text)
-    print(text, flush=True)
+    get_request_logger().info(text)
 
 
 @contextmanager
@@ -758,6 +758,26 @@ def _save_index_state(
 
 
 def _run_document_indexing_job(
+    document_id: int,
+    file_hash: str,
+    parsed_markdown_path_raw: str,
+    source_parser: str,
+    source_type: str,
+) -> None:
+    with request_logging_context(
+        "embed",
+        doc=document_id,
+    ):
+        _do_document_indexing_job(
+            document_id=document_id,
+            file_hash=file_hash,
+            parsed_markdown_path_raw=parsed_markdown_path_raw,
+            source_parser=source_parser,
+            source_type=source_type,
+        )
+
+
+def _do_document_indexing_job(
     document_id: int,
     file_hash: str,
     parsed_markdown_path_raw: str,
