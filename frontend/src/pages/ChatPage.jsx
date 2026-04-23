@@ -164,6 +164,36 @@ function ChatPage({ user, onLogout }) {
       let newSessionId = activeSessionId;
       let buffer = "";
 
+      let tokenQueue = [];
+      let isRenderingQueue = false;
+      let isStreamFinished = false;
+      let resolveQueue = null;
+
+      const queuePromise = new Promise(resolve => {
+        resolveQueue = resolve;
+      });
+
+      const processQueue = () => {
+        if (tokenQueue.length === 0) {
+          isRenderingQueue = false;
+          if (isStreamFinished) resolveQueue();
+          return;
+        }
+        
+        isRenderingQueue = true;
+        const chunk = tokenQueue.shift();
+        
+        setMessages(prev => prev.map(msg => 
+          msg.id === assistantMessageId ? { ...msg, content: msg.content + chunk } : msg
+        ));
+
+        let delay = 30;
+        if (tokenQueue.length > 20) delay = 15;
+        if (tokenQueue.length > 50) delay = 5;
+
+        setTimeout(processQueue, delay);
+      };
+
       while (!doneReading) {
         const { value, done } = await reader.read();
         doneReading = done;
@@ -193,9 +223,10 @@ function ChatPage({ user, onLogout }) {
                     msg.id === assistantMessageId ? { ...msg, sources: data.sources } : msg
                   ));
                 } else if (data.type === 'token') {
-                  setMessages(prev => prev.map(msg => 
-                    msg.id === assistantMessageId ? { ...msg, content: msg.content + data.content } : msg
-                  ));
+                  tokenQueue.push(data.content);
+                  if (!isRenderingQueue) {
+                    processQueue();
+                  }
                 } else if (data.type === 'error') {
                    setError(data.detail || "Có lỗi xảy ra trong quá trình tạo câu trả lời.");
                 } else if (data.type === 'done') {
@@ -209,6 +240,13 @@ function ChatPage({ user, onLogout }) {
         }
       }
       
+      isStreamFinished = true;
+      if (!isRenderingQueue && tokenQueue.length === 0) {
+        resolveQueue();
+      }
+      
+      await queuePromise;
+
       await fetchSessions();
       if (newSessionId && newSessionId !== activeSessionId) {
         setActiveSessionId(newSessionId); // This triggers fetchMessages
