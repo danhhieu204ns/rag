@@ -60,6 +60,71 @@ const BotAvatar = () => (
   </div>
 );
 
+function CitationBadge({ chunkNum, source }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handler(e) {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  const sourceInfo = source?.source_metadata?.source_info;
+  const fileName =
+    sourceInfo?.file_name ||
+    (source?.document_id != null ? `Tài liệu #${source.document_id}` : `Chunk ${chunkNum}`);
+  const page = source?.page ?? sourceInfo?.page_number;
+  const excerpt = source?.excerpt;
+
+  return (
+    <span ref={ref} className="cgpt-citation-wrap">
+      <button
+        className="cgpt-citation-badge"
+        onClick={() => setOpen((v) => !v)}
+        title={`Xem nguồn Chunk ${chunkNum}`}
+      >
+        {chunkNum}
+      </button>
+      {open && (
+        <div className="cgpt-citation-tooltip">
+          {source ? (
+            <>
+              <div className="cgpt-citation-title">{fileName}</div>
+              {page != null && <div className="cgpt-citation-meta">Trang&nbsp;{page}</div>}
+              {excerpt && <div className="cgpt-citation-excerpt">{excerpt}</div>}
+            </>
+          ) : (
+            <div className="cgpt-citation-title">Không tìm thấy thông tin nguồn</div>
+          )}
+        </div>
+      )}
+    </span>
+  );
+}
+
+function renderWithCitations(text, sources) {
+  if (!text) return null;
+  // If no sources were retrieved, render plain text without badge wrappers
+  if (!sources?.length) return text;
+  const parts = text.split(/(\[Chunk \d+\])/g);
+  if (parts.length === 1) return text;
+  return parts.map((part, i) => {
+    const match = part.match(/\[Chunk (\d+)\]/);
+    if (match) {
+      const idx = parseInt(match[1], 10) - 1;
+      const source = sources[idx];
+      // Only render badge if the source actually exists in the array
+      if (!source) return part;
+      return <CitationBadge key={i} chunkNum={match[1]} source={source} />;
+    }
+    return part || null;
+  });
+}
+
 function ChatPage({ user, onLogout }) {
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
@@ -431,7 +496,7 @@ function ChatPage({ user, onLogout }) {
                               </div>
                             </details>
                             <div className="cgpt-msg-text">
-                              {msg.content.substring(msg.content.indexOf("</think>") + 8).trim()}
+                              {renderWithCitations(msg.content.substring(msg.content.indexOf("</think>") + 8).trim(), msg.sources)}
                             </div>
                           </>
                         ) : msg.content.includes("<think>") ? (
@@ -446,7 +511,7 @@ function ChatPage({ user, onLogout }) {
                             </details>
                           </>
                         ) : (
-                          <div className="cgpt-msg-text">{msg.content}</div>
+                          <div className="cgpt-msg-text">{renderWithCitations(msg.content, msg.sources)}</div>
                         )}
                         {msg.sources?.length > 0 && (
                           <details className="cgpt-sources">

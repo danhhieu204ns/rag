@@ -112,6 +112,7 @@ def generate_answer(
         "Nhiệm vụ của bạn là giải thích khoa học một cách chính xác, dễ hiểu và gần gũi.\n"
         "Sử dụng đại từ 'mình' và 'bạn' để tạo cảm giác thân thiện như người bạn đồng học.\n"
         "Ưu tiên sử dụng thông tin trong tài liệu được cung cấp. "
+        "Khi sử dụng thông tin từ tài liệu, BẮT BUỘC phải trích dẫn nguồn bằng cách chèn số thẻ (ví dụ: [Chunk 1], [Chunk 2]) ngay sau câu chứa thông tin đó.\n"
         "Nếu tài liệu không đủ căn cứ, hãy nói rõ 'mình chưa tìm thấy đủ thông tin trong tài liệu về điều này' "
         "và tuyệt đối không tự ý thêm kiến thức ngoài nếu mâu thuẫn với tài liệu.\n\n"
         f"--- LỊCH SỬ TRÒ CHUYỆN ---\n{history_block or 'Chưa có tin nhắn trước đó.'}\n\n"
@@ -126,7 +127,7 @@ def generate_answer(
         "  Bước 2 – Truy xuất căn cứ: Liệt kê các định luật, khái niệm hoặc sự kiện khoa học có trong tài liệu liên quan đến câu hỏi.\n"
         "  Bước 3 – Suy luận logic: Kết nối dữ liệu và định luật theo trình tự nguyên nhân – kết quả. Nếu tài liệu không đủ thông tin, ghi rõ 'không đủ căn cứ'.\n"
         "  </think>\n"
-        "  Bước 4 – Kết luận cuối cùng: Đưa ra câu trả lời ngắn gọn, dễ hiểu và thân thiện dựa trên suy luận (không lặp lại chữ 'Bước 4').\n\n"
+        "  Bước 4 – Kết luận cuối cùng: Đưa ra câu trả lời ngắn gọn, dễ hiểu và thân thiện dựa trên suy luận (không lặp lại chữ 'Bước 4'). BẮT BUỘC chèn thêm các đánh dấu trích dẫn (ví dụ: [Chunk 1], [Chunk 2]) vào cuối mỗi câu hoặc đoạn văn để chỉ rõ thông tin được lấy từ đâu.\n\n"
         "Trả lời:"
     )
 
@@ -221,6 +222,7 @@ def generate_answer_stream(
         "Nhiệm vụ của bạn là giải thích khoa học một cách chính xác, dễ hiểu và gần gũi.\n"
         "Sử dụng đại từ 'mình' và 'bạn' để tạo cảm giác thân thiện như người bạn đồng học.\n"
         "Ưu tiên sử dụng thông tin trong tài liệu được cung cấp. "
+        "Khi sử dụng thông tin từ tài liệu, BẮT BUỘC phải trích dẫn nguồn bằng cách chèn số thẻ (ví dụ: [Chunk 1], [Chunk 2]) ngay sau câu chứa thông tin đó.\n"
         "Nếu tài liệu không đủ căn cứ, hãy nói rõ 'mình chưa tìm thấy đủ thông tin trong tài liệu về điều này' "
         "và tuyệt đối không tự ý thêm kiến thức ngoài nếu mâu thuẫn với tài liệu.\n\n"
         f"--- LỊCH SỬ TRÒ CHUYỆN ---\n{history_block or 'Chưa có tin nhắn trước đó.'}\n\n"
@@ -235,7 +237,7 @@ def generate_answer_stream(
         "  Bước 2 – Truy xuất căn cứ: Liệt kê các định luật, khái niệm hoặc sự kiện khoa học có trong tài liệu liên quan đến câu hỏi.\n"
         "  Bước 3 – Suy luận logic: Kết nối dữ liệu và định luật theo trình tự nguyên nhân – kết quả. Nếu tài liệu không đủ thông tin, ghi rõ 'không đủ căn cứ'.\n"
         "  </think>\n"
-        "  Bước 4 – Kết luận cuối cùng: Đưa ra câu trả lời ngắn gọn, dễ hiểu và thân thiện dựa trên suy luận (không lặp lại chữ 'Bước 4').\n\n"
+        "  Bước 4 – Kết luận cuối cùng: Đưa ra câu trả lời ngắn gọn, dễ hiểu và thân thiện dựa trên suy luận (không lặp lại chữ 'Bước 4'). BẮT BUỘC chèn thêm các đánh dấu trích dẫn (ví dụ: [Chunk 1], [Chunk 2]) vào cuối mỗi câu hoặc đoạn văn để chỉ rõ thông tin được lấy từ đâu.\n\n"
         "Trả lời:"
     )
 
