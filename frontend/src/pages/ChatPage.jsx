@@ -93,9 +93,6 @@ function ChatPage({ user, onLogout }) {
   async function fetchSessions() {
     const response = await api.get("/chat/sessions");
     setSessions(response.data);
-    if (!activeSessionId && response.data.length > 0) {
-      setActiveSessionId(response.data[0].id);
-    }
   }
 
   async function fetchMessages(sessionId) {
@@ -107,10 +104,8 @@ function ChatPage({ user, onLogout }) {
     setMessages(response.data);
   }
 
-  async function createSession() {
-    const response = await api.post("/chat/sessions", { title: "New chat" });
-    await fetchSessions();
-    setActiveSessionId(response.data.id);
+  function createSession() {
+    setActiveSessionId(null);
     setMessages([]);
   }
 
