@@ -42,6 +42,12 @@ class HyQResult:
     questions: list[str]
 
 
+@dataclass(slots=True)
+class ChunkEnrichmentResult:
+    hyq: HyQResult | None
+    entities: list[str]
+
+
 _SEARCH_OPT_LIMITS: dict[str, int] = {
     "keywords": 20,
     "entities": 15,
@@ -386,12 +392,14 @@ def _fallback_search_optimization(chunk_text: str) -> dict[str, list[str]]:
 class HyQResultModel(BaseModel):
     summary: str = Field(description="Tóm tắt nội dung chính ngắn gọn")
     questions: list[str] = Field(description="Danh sách câu hỏi tiếng Việt có dấu")
+    entities: list[str] = Field(default_factory=list, description="Danh sách thực thể quan trọng trong đoạn")
 
 
 class HyQBatchItemModel(BaseModel):
     index: int = Field(description="Index của đoạn trong batch")
     summary: str = Field(description="Tóm tắt nội dung chính ngắn gọn")
     questions: list[str] = Field(description="Danh sách câu hỏi tiếng Việt có dấu")
+    entities: list[str] = Field(default_factory=list, description="Danh sách thực thể quan trọng trong đoạn")
 
 
 class HyQBatchResultModel(BaseModel):
@@ -409,21 +417,18 @@ class SummaryBatchResultModel(BaseModel):
 class MetadataBundleGenerator:
     def __init__(self) -> None:
         self.summary_words = max(20, settings.hyq_summary_words)
-        self.question_count = max(1, settings.hyq_questions_per_chunk)
+        self.question_count = 3
         self.use_llm = bool(settings.metadata_use_llm or settings.hyq_use_llm)
-        self.model_name = settings.metadata_model or settings.hyq_model or settings.llm_model
-        self.summary_model_name = (
-            settings.metadata_summary_model.strip()
-            if settings.metadata_summary_use_high_accuracy
-            else ""
-        )
+        self.model_name = "gemma3:1b"
+        # Keep summary in the same metadata request; do not trigger a second summary-only model call.
+        self.summary_model_name = ""
         self.base_url = settings.ollama_base_url
         self.num_thread = max(1, settings.metadata_ollama_num_thread)
         self.num_predict = max(128, settings.metadata_ollama_num_predict)
         self.num_ctx = max(512, settings.metadata_num_ctx)
         self.summary_num_ctx = max(512, settings.metadata_summary_num_ctx)
         self.keep_alive = settings.metadata_keep_alive
-        self.batch_size = max(1, settings.metadata_llm_batch_size)
+        self.batch_size = 2
         self.batch_max_chars = max(2000, settings.metadata_llm_batch_max_chars)
         self._thread_local = threading.local()
         self._llm_disabled = not self.use_llm
@@ -492,11 +497,17 @@ class MetadataBundleGenerator:
             )
 
         return (
-            "Bạn là hệ thống tạo metadata cho RAG. "
-            f"Với mỗi ITEM, hãy sinh tóm tắt dưới {self.summary_words} từ và đúng {self.question_count} câu hỏi tiếng Việt. "
-            "Trả về DUY NHẤT JSON theo schema: "
-            '{"items":[{"index":<int>,"summary":"...","questions":["...?"]}]}. '
-            "Không thêm text ngoài JSON.\n\n"
+            "You are building a RAG index. "
+            "For each ITEM, generate from the given content only: "
+            f"(1) summary in Vietnamese within {self.summary_words} words, "
+            f"(2) exactly {self.question_count} distinct hypothetical search questions in Vietnamese, "
+            "(3) 5 to 8 important entities/keyphrases. "
+            "Requirements: output must be factual, concise, and based only on provided content; "
+            "questions must reflect realistic search intents and be different from each other; "
+            "entities must be specific and informative, avoid generic words and duplicates. "
+            "Return ONLY valid JSON with this schema: "
+            '{"items":[{"index":<int>,"summary":"...","questions":["...","...","..."],"entities":["...","..."]}]}. '
+            "Do not include any text outside JSON.\n\n"
             + "\n".join(sections)
         )
 
@@ -557,12 +568,12 @@ class MetadataBundleGenerator:
         *,
         chunk_texts: list[str],
         contexts: list[dict[str, str | None]],
-    ) -> list[HyQResult | None]:
+    ) -> list[ChunkEnrichmentResult | None]:
         llm = self._get_batch_llm()
         if llm is None:
             return [None] * len(chunk_texts)
 
-        results: list[HyQResult | None] = [None] * len(chunk_texts)
+        results: list[ChunkEnrichmentResult | None] = [None] * len(chunk_texts)
         batches = self._iter_batch_indexes(chunk_texts)
 
         for batch_indexes in batches:
@@ -582,6 +593,11 @@ class MetadataBundleGenerator:
                 if item.index not in wanted_indexes:
                     continue
 
+                entities = _dedupe_keep_order(
+                    [str(entity) for entity in item.entities if str(entity).strip()],
+                    limit=8,
+                )
+
                 parsed = _parse_hyq_payload(
                     {
                         "summary": item.summary,
@@ -590,9 +606,9 @@ class MetadataBundleGenerator:
                     summary_words=self.summary_words,
                     question_count=self.question_count,
                 )
-                if parsed is None:
+                if parsed is None and not entities:
                     continue
-                results[item.index] = parsed
+                results[item.index] = ChunkEnrichmentResult(hyq=parsed, entities=entities)
 
         return results
 
@@ -655,10 +671,39 @@ class MetadataBundleGenerator:
         if not self.use_llm or not chunk_texts:
             return fallback_searches, [None] * len(chunk_texts)
 
-        hyq_results = self._generate_many_with_llm(
+        llm_enrichments = self._generate_many_with_llm(
             chunk_texts=chunk_texts,
             contexts=contexts,
         )
+
+        search_optimizations: list[dict[str, list[str]]] = []
+        hyq_results: list[HyQResult | None] = [None] * len(chunk_texts)
+
+        for idx, fallback in enumerate(fallback_searches):
+            enrichment = llm_enrichments[idx]
+            entities = enrichment.entities if enrichment is not None else []
+
+            merged_entities = _dedupe_keep_order(
+                [*entities, *fallback.get("entities", [])],
+                limit=_SEARCH_OPT_LIMITS["entities"],
+            )
+
+            merged_keywords = _dedupe_keep_order(
+                [*fallback.get("keywords", []), *entities],
+                limit=_SEARCH_OPT_LIMITS["keywords"],
+            )
+
+            search_optimizations.append(
+                {
+                    "keywords": merged_keywords,
+                    "entities": merged_entities,
+                    "organizations": fallback.get("organizations", []),
+                    "dates": fallback.get("dates", []),
+                    "document_codes": fallback.get("document_codes", []),
+                }
+            )
+
+            hyq_results[idx] = enrichment.hyq if enrichment is not None else None
 
         if self.summary_model_name and self.summary_model_name != self.model_name:
             refined_summaries = self._generate_summaries_with_summary_model(
@@ -673,7 +718,7 @@ class MetadataBundleGenerator:
                     continue
                 hyq_results[idx] = HyQResult(summary=summary, questions=existing.questions)
 
-        return fallback_searches, hyq_results
+        return search_optimizations, hyq_results
 
 
 _metadata_bundle_generator: MetadataBundleGenerator | None = None

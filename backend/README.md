@@ -45,12 +45,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 Optional tuning:
 
 - `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
-- `EMBEDDING_BACKEND` (default: `ollama`, supports: `ollama`, `sentence-transformers`)
 - `EMBEDDING_MODEL_NAME` (default: `BAAI/bge-m3`)
-- `EMBEDDING_MAX_LENGTH` (default: `512`, only for `sentence-transformers` backend)
-- `EMBEDDING_USE_FP16` (default: `true`, only for `sentence-transformers` backend)
-- `EMBEDDING_BATCH_SIZE` (default: `64`, only for `sentence-transformers` backend)
+- `EMBEDDING_MAX_LENGTH` (default: `512`)
+- `EMBEDDING_USE_FP16` (default: `true`)
+- `EMBEDDING_BATCH_SIZE` (default: `64`)
 - `EMBEDDING_DEVICE` (default: `auto`, values: `auto`, `cuda`, `cpu`)
+- `EMBEDDING_LOCAL_FILES_ONLY` (default: `false`, set `true` after first successful download to skip network fetch)
 - `QDRANT_URL` (default: empty -> local embedded Qdrant)
 - `QDRANT_API_KEY` (default: empty)
 - `QDRANT_COLLECTION_NAME` (default: `global_child_chunks`)
@@ -75,7 +75,6 @@ Optional tuning:
 - `METADATA_OLLAMA_NUM_PREDICT` (default: `256`)
 - `METADATA_NUM_CTX` (default: `1536`, giảm KV cache cho metadata/HyQ)
 - `METADATA_KEEP_ALIVE` (default: `-1`, giữ model metadata resident)
-- `EMBEDDING_KEEP_ALIVE` (default: `-1`, giữ model embedding resident)
 - `METADATA_LLM_BATCH_SIZE` (default: `8`, số chunk gọi LLM mỗi lượt)
 - `METADATA_LLM_BATCH_MAX_CHARS` (default: `12000`, ngưỡng ký tự prompt cho mỗi batch)
 - `VECTOR_BATCH_SIZE` (default: `64`, can increase to `128` if RAM allows)
@@ -112,7 +111,6 @@ Before running queries, ensure Ollama is available for chat generation:
 
 ```bash
 ollama pull llama3.1:8b
-ollama pull bge-m3
 ```
 
 Optional if HyQ LLM generation is enabled:
@@ -150,7 +148,7 @@ ollama serve
 Recommended tiered pipeline to reduce model-switch overhead:
 
 - `llama3.2:3b` as persistent model for metadata + HyQ.
-- `bge-m3` as persistent embedding model.
+- `BAAI/bge-m3` as local Python embedding model.
 - `llama3.1:8b` only for high-accuracy summary when needed.
 
 Profile A (default, fastest switching / lowest VRAM pressure):
@@ -160,7 +158,6 @@ HYQ_MODEL=llama3.2:3b
 METADATA_MODEL=llama3.2:3b
 METADATA_SUMMARY_USE_HIGH_ACCURACY=false
 METADATA_KEEP_ALIVE=-1
-EMBEDDING_KEEP_ALIVE=-1
 LLM_KEEP_ALIVE=10m
 ```
 
@@ -191,23 +188,29 @@ OLLAMA_KV_CACHE_TYPE=q8_0
 OLLAMA_FLASH_ATTENTION=1
 ```
 
-Embedding model is served via Ollama using `langchain-ollama`.
+Embedding model runs locally in Python via `sentence-transformers`.
 
 For BGE-M3 speed optimization with fixed length + fp16, use:
 
 ```env
-EMBEDDING_BACKEND=sentence-transformers
 EMBEDDING_MODEL_NAME=BAAI/bge-m3
 EMBEDDING_MAX_LENGTH=512
 EMBEDDING_USE_FP16=true
 EMBEDDING_BATCH_SIZE=64
 EMBEDDING_DEVICE=auto
+EMBEDDING_LOCAL_FILES_ONLY=false
 ```
 
 Notes:
 
 - `EMBEDDING_MAX_LENGTH` should align with chunk size to avoid extra padding compute.
 - `EMBEDDING_USE_FP16=true` gives best speed on modern RTX GPUs and is ignored on CPU.
+
+To reduce model load time in practice:
+
+- First run (download once): keep `EMBEDDING_LOCAL_FILES_ONLY=false`.
+- Next runs: switch `EMBEDDING_LOCAL_FILES_ONLY=true` to avoid network checks/download.
+- For large indexing jobs, prefer running backend without `--reload` to avoid extra process restart overhead.
 
 ## Async Indexing Behavior
 

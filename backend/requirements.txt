@@ -15,4 +15,3 @@ python-jose[cryptography]
 bcrypt
 ollama
 marker-pdf
-sentence-transformers>=3.0.0
