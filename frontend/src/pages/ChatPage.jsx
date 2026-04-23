@@ -420,7 +420,34 @@ function ChatPage({ user, onLogout }) {
                       <BotAvatar />
                       <div className="cgpt-assistant-content">
                         <div className="cgpt-assistant-name">ViettelRAG</div>
-                        <div className="cgpt-msg-text">{msg.content}</div>
+                        {msg.content.includes("<think>") && msg.content.includes("</think>") ? (
+                          <>
+                            <details className="cgpt-think-block" style={{ marginBottom: '8px', fontSize: '13px', color: '#555' }}>
+                              <summary style={{ cursor: 'pointer', fontWeight: '500', color: '#666', userSelect: 'none' }}>
+                                Xem chi tiết suy luận
+                              </summary>
+                              <div style={{ marginTop: '6px', padding: '10px', background: '#f9f9f9', borderRadius: '6px', whiteSpace: 'pre-wrap' }}>
+                                {msg.content.substring(msg.content.indexOf("<think>") + 7, msg.content.indexOf("</think>")).trim()}
+                              </div>
+                            </details>
+                            <div className="cgpt-msg-text">
+                              {msg.content.substring(msg.content.indexOf("</think>") + 8).trim()}
+                            </div>
+                          </>
+                        ) : msg.content.includes("<think>") ? (
+                          <>
+                            <details className="cgpt-think-block" open style={{ marginBottom: '8px', fontSize: '13px', color: '#555' }}>
+                              <summary style={{ cursor: 'pointer', fontWeight: '500', color: '#666', userSelect: 'none' }}>
+                                Đang suy nghĩ...
+                              </summary>
+                              <div style={{ marginTop: '6px', padding: '10px', background: '#f9f9f9', borderRadius: '6px', whiteSpace: 'pre-wrap' }}>
+                                {msg.content.substring(msg.content.indexOf("<think>") + 7).trim()}
+                              </div>
+                            </details>
+                          </>
+                        ) : (
+                          <div className="cgpt-msg-text">{msg.content}</div>
+                        )}
                         {msg.sources?.length > 0 && (
                           <details className="cgpt-sources">
                             <summary>
