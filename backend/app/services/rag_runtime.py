@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from ..core.settings import settings
 from ..models import ChatMessage, DocumentChunk
 from .chunk_metadata import build_hyq_children, build_keyword_blob, extract_document_codes
+from .query_rewriter import rewrite_for_vector
 
 logger = logging.getLogger(__name__)
 _QUERY_LOG_FILE_NAME = "query_trace.json"
@@ -193,9 +194,17 @@ def _emit_query_progress(
     raw_text = message % args if args else message
     trace_id = _query_trace_id_ctx.get()
 
-    text = raw_text
+    # Tự động nối các trường thời gian vào message nếu có trong details
+    time_fields = []
+    if details:
+        for k in ["elapsed_ms", "predict_elapsed_ms", "duration_ms", "step_time_ms"]:
+            if k in details:
+                time_fields.append(f"{k}={details[k]}")
+    time_info = f" | {'; '.join(time_fields)}" if time_fields else ""
+
+    text = raw_text + time_info
     if trace_id and trace_id != "-":
-        text = f"[trace={trace_id}] {raw_text}"
+        text = f"[trace={trace_id}] {raw_text}{time_info}"
 
     logger.info(text)
     print(text, flush=True)
@@ -259,6 +268,10 @@ def _preview_ids(values: list[int], limit: int = 8) -> list[int | str]:
     if len(values) <= limit:
         return values
     return [*values[:limit], f"+{len(values) - limit} more"]
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 2)
 
 
 def _to_int(value: object) -> int | None:
@@ -1516,8 +1529,21 @@ def rerank_documents(
     Input:  query string + list Document (đã qua RRF)
     Output: top_k Document được sắp xếp lại theo relevance score
     """
+    rerank_started_at = time.perf_counter()
     reranker = get_reranker()
     if reranker is None or not documents:
+        _emit_query_progress(
+            "[reranker] Skip reranking: reranker=%s, docs=%d (%.2fms)",
+            "ready" if reranker is not None else "missing",
+            len(documents),
+            _elapsed_ms(rerank_started_at),
+            event="rerank_documents_skip",
+            details={
+                "reranker_ready": reranker is not None,
+                "document_count": len(documents),
+                "elapsed_ms": _elapsed_ms(rerank_started_at),
+            },
+        )
         return documents[:top_k]
 
     _emit_query_progress(
@@ -1532,17 +1558,24 @@ def rerank_documents(
     )
 
     pairs = [(query, doc.page_content) for doc in documents]
+    predict_started_at = time.perf_counter()
     try:
         scores: list[float] = reranker.predict(pairs).tolist()
     except Exception as e:
         logger.error("[reranker] Prediction failed: %s", str(e))
         _emit_query_progress(
-            "[reranker] Reranking failed: %s",
+            "[reranker] Reranking failed after %.2fms: %s",
+            _elapsed_ms(rerank_started_at),
             str(e),
             event="rerank_documents_error",
-            details={"error": str(e)},
+            details={
+                "error": str(e),
+                "elapsed_ms": _elapsed_ms(rerank_started_at),
+            },
         )
         return documents[:top_k]
+
+    predict_elapsed_ms = _elapsed_ms(predict_started_at)
 
     # Gắn reranker score vào metadata để debug/tracing
     for doc, score in zip(documents, scores):
@@ -1553,10 +1586,12 @@ def rerank_documents(
     reranked_docs = [doc for doc, _ in ranked[:top_k]]
     
     _emit_query_progress(
-        "[reranker] Reranked %d documents to top %d. "
+        "[reranker] Reranked %d documents to top %d in %.2fms (predict=%.2fms). "
         "Original top score: %.4f, Reranked top score: %.4f",
         len(documents),
         top_k,
+        _elapsed_ms(rerank_started_at),
+        predict_elapsed_ms,
         scores[0] if scores else 0.0,
         ranked[0][1] if ranked else 0.0,
         event="rerank_documents",
@@ -1565,6 +1600,8 @@ def rerank_documents(
             "output_count": len(reranked_docs),
             "query": _preview_text(query),
             "top_k": top_k,
+            "elapsed_ms": _elapsed_ms(rerank_started_at),
+            "predict_elapsed_ms": predict_elapsed_ms,
             "original_top_score": float(scores[0]) if scores else 0.0,
             "reranked_top_score": float(ranked[0][1]) if ranked else 0.0,
         },
@@ -1583,6 +1620,8 @@ def similarity_search(
 
     trace_id = f"q-{int(time.time() * 1000)}-{uuid4().hex[:8]}"
     token = _query_trace_id_ctx.set(trace_id)
+    query_started_at = time.perf_counter()
+    stage_timings_ms: dict[str, float] = {}
     started_at = time.perf_counter()
     try:
         with _timed_query_step(
@@ -1631,6 +1670,9 @@ def similarity_search(
             },
         )
 
+        index_check_started_at = time.perf_counter()
+        index_available = load_index_if_available()
+        stage_timings_ms["index_check"] = _elapsed_ms(index_check_started_at)
         with _timed_query_step(
             "check_index_available",
             event_prefix="similarity_check_index",
@@ -1641,11 +1683,18 @@ def similarity_search(
             _emit_query_progress(
                 "[query] similarity_search stop: index not available",
                 event="similarity_search_stop",
-                details={"reason": "index_unavailable"},
+                details={
+                    "reason": "index_unavailable",
+                    "stage_timings_ms": stage_timings_ms,
+                    "total_elapsed_ms": _elapsed_ms(query_started_at),
+                },
             )
             return []
 
         if db is None:
+            vector_only_started_at = time.perf_counter()
+            vector_only_results = _search_qdrant_children(query, limit=top_k)
+            stage_timings_ms["vector_only_search"] = _elapsed_ms(vector_only_started_at)
             with _timed_query_step(
                 "vector_only_search",
                 event_prefix="similarity_vector_only",
@@ -1653,11 +1702,14 @@ def similarity_search(
             ):
                 vector_only_results = _search_qdrant_children(effective_query, limit=top_k)
             _emit_query_progress(
-                "[query] similarity_search done (vector_only): result_count=%d",
+                "[query] similarity_search done (vector_only): result_count=%d, elapsed=%.2fms",
                 len(vector_only_results),
+                stage_timings_ms["vector_only_search"],
                 event="similarity_search_done_vector_only",
                 details={
                     "result_count": len(vector_only_results),
+                    "stage_timings_ms": stage_timings_ms,
+                    "total_elapsed_ms": _elapsed_ms(query_started_at),
                     "effective_query_preview": _preview_text(effective_query),
                     "result_preview": [
                         {
@@ -1670,6 +1722,44 @@ def similarity_search(
                 },
             )
             return vector_only_results
+
+        # Keyword branch always uses the original query to preserve exact identifiers
+        # (document codes, dates, org names).  Vector branch uses an expanded query
+        # when QUERY_REWRITE_ENABLED=true and the query is short/vague.
+        vector_query = rewrite_for_vector(query)
+        if vector_query != query:
+            _emit_query_progress(
+                "[query][rewrite] Vector query expanded: '%s' → '%s'",
+                _preview_text(query),
+                _preview_text(vector_query),
+                event="query_rewrite",
+                details={"original_query": query, "vector_query": vector_query},
+            )
+
+        semantic_started_at = time.perf_counter()
+        vector_parent_ids, parent_child_type = _vector_parent_candidates(
+            vector_query,
+            top_k,
+            document_ids,
+        )
+        stage_timings_ms["semantic_candidates"] = _elapsed_ms(semantic_started_at)
+
+        keyword_started_at = time.perf_counter()
+        keyword_parent_ids = _keyword_parent_candidates(
+            query,
+            top_k,
+            db,
+            document_ids,
+        )
+        stage_timings_ms["keyword_candidates"] = _elapsed_ms(keyword_started_at)
+
+        load_semantic_chunks_started_at = time.perf_counter()
+        semantic_chunk_rows = _load_chunks_by_ids(db, vector_parent_ids)
+        stage_timings_ms["load_semantic_chunks"] = _elapsed_ms(load_semantic_chunks_started_at)
+
+        load_keyword_chunks_started_at = time.perf_counter()
+        keyword_chunk_rows = _load_chunks_by_ids(db, keyword_parent_ids)
+        stage_timings_ms["load_keyword_chunks"] = _elapsed_ms(load_keyword_chunks_started_at)
 
         with _timed_query_step(
             "vector_parent_candidates_multi_query",
@@ -1707,6 +1797,7 @@ def similarity_search(
         semantic_chunk_by_id = {item.id: item for item in semantic_chunk_rows}
         keyword_chunk_by_id = {item.id: item for item in keyword_chunk_rows}
 
+        candidate_payload_started_at = time.perf_counter()
         semantic_chunk_details: list[dict[str, Any]] = []
         for rank, chunk_id in enumerate(vector_parent_ids, start=1):
             chunk = semantic_chunk_by_id.get(chunk_id)
@@ -1732,6 +1823,7 @@ def similarity_search(
                     retrieval_mode="keyword",
                 )
             )
+        stage_timings_ms["build_candidate_debug_payloads"] = _elapsed_ms(candidate_payload_started_at)
 
         _emit_query_progress(
             "[query] Candidate chunk details: semantic=%d, keyword=%d",
@@ -1745,6 +1837,9 @@ def similarity_search(
         )
 
         merge_k = settings.reranker_candidate_pool if settings.reranker_enabled else top_k
+        rrf_started_at = time.perf_counter()
+        merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, merge_k)
+        stage_timings_ms["rrf_merge"] = _elapsed_ms(rrf_started_at)
         with _timed_query_step(
             "rrf_merge_candidates",
             event_prefix="similarity_rrf_merge",
@@ -1755,10 +1850,17 @@ def similarity_search(
             _emit_query_progress(
                 "[query] similarity_search stop: no merged parent ids",
                 event="similarity_search_stop",
-                details={"reason": "no_merged_parent_ids"},
+                details={
+                    "reason": "no_merged_parent_ids",
+                    "stage_timings_ms": stage_timings_ms,
+                    "total_elapsed_ms": _elapsed_ms(query_started_at),
+                },
             )
             return []
 
+        load_merged_chunks_started_at = time.perf_counter()
+        chunks = _load_chunks_by_ids(db, merged_parent_ids)
+        stage_timings_ms["load_merged_chunks"] = _elapsed_ms(load_merged_chunks_started_at)
         with _timed_query_step(
             "load_merged_chunks",
             event_prefix="similarity_load_merged_chunks",
@@ -1768,6 +1870,7 @@ def similarity_search(
         vector_set = set(vector_parent_ids)
         keyword_set = set(keyword_parent_ids)
 
+        build_context_docs_started_at = time.perf_counter()
         results: list[Document] = []
         with _timed_query_step(
             "build_context_documents",
@@ -1790,8 +1893,13 @@ def similarity_search(
                         child_type=parent_child_type.get(chunk.id),
                     )
                 )
+            )
+        stage_timings_ms["build_context_documents"] = _elapsed_ms(build_context_docs_started_at)
 
+        rerank_stage_started_at = time.perf_counter()
         if settings.reranker_enabled and len(results) > top_k:
+            final_results = rerank_documents(query, results, top_k)
+            stage_timings_ms["reranker"] = _elapsed_ms(rerank_stage_started_at)
             with _timed_query_step(
                 "rerank_documents",
                 event_prefix="similarity_rerank",
@@ -1800,6 +1908,11 @@ def similarity_search(
                 final_results = rerank_documents(query, results, top_k)
         else:
             final_results = results[:top_k]
+            stage_timings_ms["reranker"] = _elapsed_ms(rerank_stage_started_at)
+            if not settings.reranker_enabled:
+                stage_timings_ms["reranker_skipped"] = 1.0
+            elif len(results) <= top_k:
+                stage_timings_ms["reranker_skipped"] = 1.0
         
         mode_counts: dict[str, int] = defaultdict(int)
         for item in final_results:
@@ -1810,6 +1923,7 @@ def similarity_search(
             _to_int(item.metadata.get("chunk_id")) or -1
             for item in final_results
         ]
+        final_payload_started_at = time.perf_counter()
         final_chunk_details: list[dict[str, Any]] = []
         for rank, item in enumerate(final_results, start=1):
             final_chunk_details.append(
@@ -1828,6 +1942,26 @@ def similarity_search(
                     "content": item.page_content,
                 }
             )
+        stage_timings_ms["build_final_payload"] = _elapsed_ms(final_payload_started_at)
+        stage_timings_ms["total"] = _elapsed_ms(query_started_at)
+
+        _emit_query_progress(
+            "[query][timing] semantic=%.2fms keyword=%.2fms rrf=%.2fms reranker=%.2fms total=%.2fms",
+            stage_timings_ms.get("semantic_candidates", 0.0),
+            stage_timings_ms.get("keyword_candidates", 0.0),
+            stage_timings_ms.get("rrf_merge", 0.0),
+            stage_timings_ms.get("reranker", 0.0),
+            stage_timings_ms.get("total", 0.0),
+            event="similarity_search_timing",
+            details={
+                "stage_timings_ms": stage_timings_ms,
+                "top_k": top_k,
+                "semantic_candidate_count": len(vector_parent_ids),
+                "keyword_candidate_count": len(keyword_parent_ids),
+                "merged_candidate_count": len(merged_parent_ids),
+                "final_result_count": len(final_results),
+            },
+        )
 
         _emit_query_progress(
             "[query] similarity_search done: parent_chunks=%d, final_results=%d, modes=%s, chunk_ids=%s",
@@ -1844,6 +1978,8 @@ def similarity_search(
                 "final_modes": dict(mode_counts),
                 "final_chunk_ids": final_chunk_ids,
                 "final_chunks": final_chunk_details,
+                "stage_timings_ms": stage_timings_ms,
+                "total_elapsed_ms": stage_timings_ms.get("total", 0.0),
             },
         )
 
