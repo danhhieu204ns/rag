@@ -227,39 +227,32 @@ VITE_API_BASE_URL=http://localhost:8000/api
 
 ## 9) Biến môi trường backend
 
-### Tùy chọn
+### Required
+- `OLLAMA_BASE_URL`: URL to the remote Ollama Shield API.
+- `OLLAMA_API_KEY`: API key for X-API-KEY authentication.
 
-- `APP_NAME` (default: `RAG App Backend`)
-- `APP_ENV` (default: `development`)
-- `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
-- `EMBEDDING_MODEL_NAME` (default: `BAAI/bge-m3`)
-- `QDRANT_URL` (default: rỗng, dùng local embedded Qdrant)
-- `QDRANT_API_KEY` (default: rỗng)
-- `QDRANT_COLLECTION_NAME` (default: `global_child_chunks`)
-- `PDF_PARSER_MODE` (default: `legacy`, hỗ trợ `legacy` hoặc `marker`)
-- `CHUNK_SIZE` (default: `500`)
-- `CHUNK_OVERLAP` (default: `50`)
-- `RETRIEVER_K` (default: `4`)
-- `LLM_MODEL` (default: `llama3.1:8b`)
-- `LLM_TEMPERATURE` (default: `0.0`)
-- `LLM_NUM_CTX` (default: `2048`)
-- `HYQ_ENABLED` (default: `true`)
-- `HYQ_USE_LLM` (default: `false`)
-- `HYQ_MODEL` (default: dùng lại `LLM_MODEL` nếu để trống)
-- `METADATA_USE_LLM` (default: kế thừa từ `HYQ_USE_LLM`)
-- `METADATA_MODEL` (default: kế thừa từ `HYQ_MODEL`, sau đó `LLM_MODEL`)
-- `METADATA_OLLAMA_NUM_THREAD` (default: kế thừa `OLLAMA_NUM_THREAD`)
-- `METADATA_OLLAMA_NUM_PREDICT` (default: `256`)
-- `METADATA_NUM_CTX` (default: `1536`)
-- `METADATA_LLM_BATCH_SIZE` (default: `8`)
-- `METADATA_LLM_BATCH_MAX_CHARS` (default: `12000`)
-- `VECTOR_BATCH_SIZE` (default: `64`)
-- `HYQ_SUMMARY_WORDS` (default: `50`)
-- `HYQ_QUESTIONS_PER_CHUNK` (default: `3`)
-- `HYBRID_VECTOR_RRF_WEIGHT` (default: `1.0`)
-- `HYBRID_KEYWORD_RRF_WEIGHT` (default: `1.2`)
-- `HYBRID_RRF_K` (default: `60`)
-- `HYBRID_PROBE_MULTIPLIER` (default: `4`)
+### Core Settings
+- `APP_NAME`: Backend application name.
+- `SECRET_KEY`: JWT signing key.
+- `ADMIN_DEFAULT_USERNAME` / `ADMIN_DEFAULT_PASSWORD`: Initial admin credentials.
+
+### Vector Storage (Qdrant)
+- `QDRANT_URL`: Empty for local embedded mode, or remote Qdrant URL.
+- `QDRANT_API_KEY`: Required for remote Qdrant.
+- `QDRANT_COLLECTION_NAME`: Default collection name.
+
+### Ingestion & Retrieval
+- `PDF_PARSER_MODE`: `legacy` (PyMuPDF) or `marker`.
+- `CHUNK_SIZE`: Target chunk length (default: 1000).
+- `CHUNK_OVERLAP`: Overlap between chunks (default: 150).
+- `RERANKER_ENABLED`: Enable BGE Reranker (default: true).
+- `QUERY_REWRITE_ENABLED`: Enable HyDE-like query rewriting.
+
+If `QDRANT_URL` is empty, backend uses local embedded Qdrant persisted at:
+
+- `backend/storage/indexes/global_qdrant/`
+
+If `PDF_PARSER_MODE=marker`, install Marker in backend venv:
 
 ## 10) Dữ liệu runtime được sinh tự động
 

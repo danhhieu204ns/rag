@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import json
+import logging
 import re
-import threading
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from pydantic import BaseModel, Field
-from langchain_ollama import ChatOllama
 
 from ..core.settings import settings
 
+logger = logging.getLogger(__name__)
 
 _CAPITALIZED_PHRASE_PATTERN = re.compile(
     r"\b[A-ZÀ-Ỵ][A-Za-zÀ-ỹĐđ'\-]*(?:\s+[A-ZÀ-Ỵ][A-Za-zÀ-ỹĐđ'\-]*){1,4}\b"
@@ -92,23 +92,6 @@ def _dedupe_keep_order(items: list[str], limit: int) -> list[str]:
     return output
 
 
-def _extract_json_payload(raw_output: str) -> dict[str, Any] | None:
-    start = raw_output.find("{")
-    end = raw_output.rfind("}")
-    if start < 0 or end <= start:
-        return None
-
-    try:
-        payload = json.loads(raw_output[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-
-    if not isinstance(payload, dict):
-        return None
-
-    return payload
-
-
 def _payload_list(payload: dict[str, Any], key: str, limit: int) -> list[str]:
     value = payload.get(key)
     if not isinstance(value, list):
@@ -131,49 +114,6 @@ def _build_fallback_keywords(
     ]
     return _dedupe_keep_order(combined, limit=_SEARCH_OPT_LIMITS["keywords"])
 
-
-def _merge_search_optimization(
-    primary: dict[str, list[str]],
-    fallback: dict[str, list[str]],
-) -> dict[str, list[str]]:
-    merged: dict[str, list[str]] = {}
-
-    for key, limit in _SEARCH_OPT_LIMITS.items():
-        merged[key] = _dedupe_keep_order(
-            [*primary.get(key, []), *fallback.get(key, [])],
-            limit=limit,
-        )
-
-    return merged
-
-
-def _parse_search_optimization_payload(payload: dict[str, Any]) -> dict[str, list[str]]:
-    entities = _payload_list(payload, "entities", limit=_SEARCH_OPT_LIMITS["entities"])
-    organizations = _payload_list(payload, "organizations", limit=_SEARCH_OPT_LIMITS["organizations"])
-    dates = _payload_list(payload, "dates", limit=_SEARCH_OPT_LIMITS["dates"])
-
-    raw_codes = _payload_list(payload, "document_codes", limit=30)
-    parsed_codes: list[str] = []
-    for item in raw_codes:
-        parsed_codes.extend(extract_document_codes(item, limit=5))
-    document_codes = _dedupe_keep_order(parsed_codes, limit=_SEARCH_OPT_LIMITS["document_codes"])
-
-    keywords = _payload_list(payload, "keywords", limit=_SEARCH_OPT_LIMITS["keywords"])
-    if not keywords:
-        keywords = _build_fallback_keywords(
-            entities=entities,
-            organizations=organizations,
-            dates=dates,
-            document_codes=document_codes,
-        )
-
-    return {
-        "keywords": keywords,
-        "entities": entities,
-        "organizations": organizations,
-        "dates": dates,
-        "document_codes": document_codes,
-    }
 
 
 def _parse_hyq_payload(
@@ -416,151 +356,11 @@ class SummaryBatchResultModel(BaseModel):
 
 class MetadataBundleGenerator:
     def __init__(self) -> None:
-        self.summary_words = max(20, settings.hyq_summary_words)
+        self.summary_words = 50
         self.question_count = 3
-        self.use_llm = bool(settings.metadata_use_llm or settings.hyq_use_llm)
-        self.model_name = settings.metadata_model
-        self.summary_model_name = settings.metadata_summary_model
         self.base_url = settings.ollama_base_url
-        self.num_thread = max(1, settings.metadata_ollama_num_thread)
-        self.num_predict = max(128, settings.metadata_ollama_num_predict)
-        self.num_ctx = max(512, settings.metadata_num_ctx)
-        self.summary_num_ctx = max(512, settings.metadata_summary_num_ctx)
-        self.keep_alive = settings.metadata_keep_alive
-        self.batch_size = max(1, settings.metadata_llm_batch_size)
-        self.batch_max_chars = max(2000, settings.metadata_llm_batch_max_chars)
-        self._thread_local = threading.local()
-        self._llm_disabled = not self.use_llm
-
-    def _get_batch_llm(self) -> ChatOllama | None:
-        if self._llm_disabled:
-            return None
-
-        llm = getattr(self._thread_local, "llm_batch", None)
-        if llm is None:
-            if not self.model_name:
-                self._llm_disabled = True
-                return None
-
-            base_llm = ChatOllama(
-                model=self.model_name,
-                base_url=self.base_url,
-                temperature=0.0,
-                num_thread=self.num_thread,
-                num_predict=self.num_predict,
-                num_ctx=self.num_ctx,
-                keep_alive=self.keep_alive,
-                format="json",
-            )
-            llm = base_llm.with_structured_output(HyQBatchResultModel)
-            self._thread_local.llm_batch = llm
-
-        return llm
-
-    def _get_summary_llm(self) -> ChatOllama | None:
-        if not self.summary_model_name:
-            return None
-
-        llm = getattr(self._thread_local, "llm_summary", None)
-        if llm is None:
-            base_llm = ChatOllama(
-                model=self.summary_model_name,
-                base_url=self.base_url,
-                temperature=0.0,
-                num_thread=self.num_thread,
-                num_predict=self.num_predict,
-                num_ctx=self.summary_num_ctx,
-                keep_alive=self.keep_alive,
-                format="json",
-            )
-            llm = base_llm.with_structured_output(SummaryBatchResultModel)
-            self._thread_local.llm_summary = llm
-
-        return llm
-
-    def _build_batch_prompt(
-        self,
-        batch_items: list[tuple[int, str, dict[str, str | None]]],
-    ) -> str:
-        sections: list[str] = []
-        for index, chunk_text, context in batch_items:
-            sections.extend(
-                [
-                    f"### ITEM {index}",
-                    f"H2: {context.get('h2') or ''}",
-                    f"H3: {context.get('h3') or ''}",
-                    "CONTENT:",
-                    chunk_text,
-                    "",
-                ]
-            )
-
-        return (
-            "You are building a RAG index. "
-            "For each ITEM, generate from the given content only: "
-            f"(1) summary in Vietnamese within {self.summary_words} words, "
-            f"(2) exactly {self.question_count} distinct hypothetical search questions in Vietnamese, "
-            "(3) 5 to 8 important entities/keyphrases. "
-            "Requirements: output must be factual, concise, and based only on provided content; "
-            "questions must reflect realistic search intents and be different from each other; "
-            "entities must be specific and informative, avoid generic words and duplicates. "
-            "Return ONLY valid JSON with this schema: "
-            '{"items":[{"index":<int>,"summary":"...","questions":["...","...","..."],"entities":["...","..."]}]}. '
-            "Do not include any text outside JSON.\n\n"
-            + "\n".join(sections)
-        )
-
-    def _iter_batch_indexes(
-        self,
-        chunk_texts: list[str],
-    ) -> list[list[int]]:
-        batches: list[list[int]] = []
-        current: list[int] = []
-        current_chars = 0
-
-        for idx, text in enumerate(chunk_texts):
-            estimated = len(text) + 400
-            if current and (
-                len(current) >= self.batch_size
-                or current_chars + estimated > self.batch_max_chars
-            ):
-                batches.append(current)
-                current = []
-                current_chars = 0
-
-            current.append(idx)
-            current_chars += estimated
-
-        if current:
-            batches.append(current)
-
-        return batches
-
-    def _build_summary_batch_prompt(
-        self,
-        batch_items: list[tuple[int, str, dict[str, str | None]]],
-    ) -> str:
-        sections: list[str] = []
-        for index, chunk_text, context in batch_items:
-            sections.extend(
-                [
-                    f"### ITEM {index}",
-                    f"H2: {context.get('h2') or ''}",
-                    f"H3: {context.get('h3') or ''}",
-                    "CONTENT:",
-                    chunk_text,
-                    "",
-                ]
-            )
-
-        return (
-            "Bạn là hệ thống tạo tóm tắt cho RAG. "
-            f"Với mỗi ITEM, hãy tóm tắt dưới {self.summary_words} từ bằng tiếng Việt. "
-            "Trả về DUY NHẤT JSON theo schema: "
-            '{"items":[{"index":<int>,"summary":"..."}]}. '
-            "Không thêm text ngoài JSON.\n\n"
-            + "\n".join(sections)
-        )
+        self.api_key = settings.ollama_api_key
+        self._llm_disabled = False
 
     def _generate_many_with_llm(
         self,
@@ -568,83 +368,59 @@ class MetadataBundleGenerator:
         chunk_texts: list[str],
         contexts: list[dict[str, str | None]],
     ) -> list[ChunkEnrichmentResult | None]:
-        llm = self._get_batch_llm()
-        if llm is None:
+        if self._llm_disabled:
             return [None] * len(chunk_texts)
 
         results: list[ChunkEnrichmentResult | None] = [None] * len(chunk_texts)
-        batches = self._iter_batch_indexes(chunk_texts)
 
-        for batch_indexes in batches:
-            batch_items = [
-                (index, chunk_texts[index], contexts[index])
-                for index in batch_indexes
-            ]
-            prompt = self._build_batch_prompt(batch_items)
-
+        for i, text in enumerate(chunk_texts):
             try:
-                response: HyQBatchResultModel = llm.invoke(prompt)
-            except Exception:
-                continue
+                # Call the new Shield /v1/indexing endpoint
+                payload = {"text": text}
+                headers = {}
+                if self.api_key:
+                    headers["x-api-key"] = self.api_key
 
-            wanted_indexes = set(batch_indexes)
-            for item in response.items:
-                if item.index not in wanted_indexes:
-                    continue
+                with httpx.Client(timeout=180.0) as client:
+                    r = client.post(
+                        f"{self.base_url}/v1/indexing",
+                        json=payload,
+                        headers=headers,
+                    )
+                    r.raise_for_status()
+                    data = r.json()
 
-                entities = _dedupe_keep_order(
-                    [str(entity) for entity in item.entities if str(entity).strip()],
-                    limit=8,
-                )
+                # Extract data from specialized indexing response
+                summary = data.get("summary") or ""
+                hyq = data.get("hyq") or []
+                metadata = data.get("metadata") or {}
+                entities = metadata.get("keywords") or []
 
-                parsed = _parse_hyq_payload(
+                parsed_hyq = _parse_hyq_payload(
                     {
-                        "summary": item.summary,
-                        "questions": item.questions,
+                        "summary": summary,
+                        "questions": hyq,
                     },
                     summary_words=self.summary_words,
                     question_count=self.question_count,
                 )
-                if parsed is None and not entities:
-                    continue
-                results[item.index] = ChunkEnrichmentResult(hyq=parsed, entities=entities)
 
-        return results
+                cleaned_entities = _dedupe_keep_order(
+                    [str(e) for e in entities if str(e).strip()],
+                    limit=8,
+                )
 
-    def _generate_summaries_with_summary_model(
-        self,
-        *,
-        chunk_texts: list[str],
-        contexts: list[dict[str, str | None]],
-    ) -> list[str | None]:
-        llm = self._get_summary_llm()
-        if llm is None:
-            return [None] * len(chunk_texts)
+                if parsed_hyq or cleaned_entities:
+                    results[i] = ChunkEnrichmentResult(
+                        hyq=parsed_hyq,
+                        entities=cleaned_entities,
+                    )
 
-        outputs: list[str | None] = [None] * len(chunk_texts)
-        batches = self._iter_batch_indexes(chunk_texts)
-
-        for batch_indexes in batches:
-            batch_items = [
-                (index, chunk_texts[index], contexts[index])
-                for index in batch_indexes
-            ]
-            prompt = self._build_summary_batch_prompt(batch_items)
-
-            try:
-                response: SummaryBatchResultModel = llm.invoke(prompt)
-            except Exception:
+            except Exception as e:
+                logger.error("[metadata] Error calling /v1/indexing for chunk %d: %s", i, e)
                 continue
 
-            wanted_indexes = set(batch_indexes)
-            for item in response.items:
-                if item.index not in wanted_indexes:
-                    continue
-                summary = _word_limited_text(str(item.summary or ""), self.summary_words)
-                if summary:
-                    outputs[item.index] = summary
-
-        return outputs
+        return results
 
     def generate(
         self,
@@ -658,7 +434,7 @@ class MetadataBundleGenerator:
             contexts=[context],
             fallback_searches=[fallback_search],
         )
-        return fallback_search, hyq_results[0]
+        return fallback_search, hyq_results[0] if hyq_results else None
 
     def generate_many(
         self,
@@ -667,7 +443,7 @@ class MetadataBundleGenerator:
         contexts: list[dict[str, str | None]],
         fallback_searches: list[dict[str, list[str]]],
     ) -> tuple[list[dict[str, list[str]]], list[HyQResult | None]]:
-        if not self.use_llm or not chunk_texts:
+        if not chunk_texts:
             return fallback_searches, [None] * len(chunk_texts)
 
         llm_enrichments = self._generate_many_with_llm(
@@ -704,19 +480,7 @@ class MetadataBundleGenerator:
 
             hyq_results[idx] = enrichment.hyq if enrichment is not None else None
 
-        if self.summary_model_name and self.summary_model_name != self.model_name:
-            refined_summaries = self._generate_summaries_with_summary_model(
-                chunk_texts=chunk_texts,
-                contexts=contexts,
-            )
-            for idx, summary in enumerate(refined_summaries):
-                if summary is None:
-                    continue
-                existing = hyq_results[idx]
-                if existing is None:
-                    continue
-                hyq_results[idx] = HyQResult(summary=summary, questions=existing.questions)
-
+        # Redundant summaries are handled by the same default model now
         return search_optimizations, hyq_results
 
 
@@ -817,18 +581,17 @@ def build_structured_chunk_metadata_batch(
         search_optimization = search_optimizations[idx]
 
         hyq_result = HyQResult(summary="", questions=[])
-        if settings.hyq_enabled:
-            # Use LLM result if available, otherwise fallback to Regex-based questions
-            if llm_hyqs[idx] is not None:
-                hyq_result = llm_hyqs[idx] or hyq_result
-            else:
-                hyq_result = _fallback_hyq(
-                    chunk_text=chunk_text,
-                    context=context,
-                    search_optimization=search_optimization,
-                    summary_words=settings.hyq_summary_words,
-                    question_count=settings.hyq_questions_per_chunk,
-                )
+        # Use LLM result if available, otherwise fallback to Regex-based questions
+        if llm_hyqs[idx] is not None:
+            hyq_result = llm_hyqs[idx] or hyq_result
+        else:
+            hyq_result = _fallback_hyq(
+                chunk_text=chunk_text,
+                context=context,
+                search_optimization=search_optimization,
+                summary_words=50,
+                question_count=3,
+            )
 
         structured_metadata: dict[str, Any] = {
             "chunk_id": f"doc_{document_id:02d}_chunk_{chunk_index:04d}",

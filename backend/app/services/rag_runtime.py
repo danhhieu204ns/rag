@@ -5,8 +5,6 @@ from .rag.models import (
     get_embeddings,
     get_llm,
     get_reranker,
-    warmup_embedding_model,
-    warmup_chat_model,
 )
 from .rag.qdrant import (
     delete_vectors_by_document_id,
@@ -29,8 +27,6 @@ __all__ = [
     "get_embeddings",
     "get_llm",
     "get_reranker",
-    "warmup_embedding_model",
-    "warmup_chat_model",
     "delete_vectors_by_document_id",
     "upsert_child_documents",
     "rebuild_index_from_chunks",

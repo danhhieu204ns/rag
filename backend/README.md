@@ -18,6 +18,7 @@
 - Hybrid retrieval (vector + keyword) with reciprocal-rank-fusion
 - Qdrant as vector store backend (local mode by default, remote mode optional)
 - Chat query endpoint with persistent chat memory
+- Remote Indexing: Offloads metadata, summary, and HyQ generation to a remote Shield API.
 
 ## Auth Model
 
@@ -42,54 +43,26 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## Environment
 
-Optional tuning:
+### Required
+- `OLLAMA_BASE_URL`: URL to the remote Ollama Shield API.
+- `OLLAMA_API_KEY`: API key for X-API-KEY authentication.
 
-- `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
-- `EMBEDDING_MODEL_NAME` (default: `BAAI/bge-m3`)
-- `EMBEDDING_MAX_LENGTH` (default: `512`)
-- `EMBEDDING_USE_FP16` (default: `true`)
-- `EMBEDDING_BATCH_SIZE` (default: `64`)
-- `EMBEDDING_DEVICE` (default: `auto`, values: `auto`, `cuda`, `cpu`)
-- `EMBEDDING_LOCAL_FILES_ONLY` (default: `false`, set `true` after first successful download to skip network fetch)
-- `QDRANT_URL` (default: empty -> local embedded Qdrant)
-- `QDRANT_API_KEY` (default: empty)
-- `QDRANT_COLLECTION_NAME` (default: `global_child_chunks`)
-- `PDF_PARSER_MODE` (default: `legacy`, supports: `legacy`, `marker`)
-- `CHUNK_SIZE`
-- `CHUNK_OVERLAP`
-- `RETRIEVER_K`
-- `LLM_MODEL` (default: `llama3.1:8b`)
-- `LLM_TEMPERATURE`
-- `LLM_NUM_CTX` (default: `2048`, giảm KV cache cho LLM chính)
-- `LLM_KEEP_ALIVE` (default: `10m`, thời gian giữ model chat trên VRAM)
-- `OLLAMA_NUM_THREAD` (default: `8`)
-- `HYQ_ENABLED` (default: `true`)
-- `HYQ_USE_LLM` (default: `false`)
-- `HYQ_MODEL` (default: fallback to `METADATA_MODEL`, then `LLM_MODEL`)
-- `METADATA_USE_LLM` (default: fallback to `HYQ_USE_LLM`)
-- `METADATA_MODEL` (default: fallback to `HYQ_MODEL`, then `LLM_MODEL`)
-- `METADATA_SUMMARY_USE_HIGH_ACCURACY` (default: `false`, bật thì dùng model riêng cho phần summary)
-- `METADATA_SUMMARY_MODEL` (default: empty, ví dụ `llama3.1:8b` nếu cần summary chất lượng cao)
-- `METADATA_SUMMARY_NUM_CTX` (default: `2048`)
-- `METADATA_OLLAMA_NUM_THREAD` (default: fallback to `OLLAMA_NUM_THREAD`)
-- `METADATA_OLLAMA_NUM_PREDICT` (default: `256`)
-- `METADATA_NUM_CTX` (default: `1536`, giảm KV cache cho metadata/HyQ)
-- `METADATA_KEEP_ALIVE` (default: `-1`, giữ model metadata resident)
-- `METADATA_LLM_BATCH_SIZE` (default: `8`, số chunk gọi LLM mỗi lượt)
-- `METADATA_LLM_BATCH_MAX_CHARS` (default: `12000`, ngưỡng ký tự prompt cho mỗi batch)
-- `VECTOR_BATCH_SIZE` (default: `64`, can increase to `128` if RAM allows)
-- `HYQ_SUMMARY_WORDS` (default: `50`)
-- `HYQ_QUESTIONS_PER_CHUNK` (default: `3`)
-- `HYBRID_VECTOR_RRF_WEIGHT` (default: `1.0`)
-- `HYBRID_KEYWORD_RRF_WEIGHT` (default: `1.2`)
-- `HYBRID_RRF_K` (default: `60`)
-- `HYBRID_PROBE_MULTIPLIER` (default: `4`)
-- `MODEL_WARMUP_ON_STARTUP` (default: `false`, warmup model sau khi backend khởi động)
-- `MODEL_WARMUP_METADATA` (default: `true`)
-- `MODEL_WARMUP_EMBEDDING` (default: `true`)
-- `MODEL_WARMUP_CHAT` (default: `false`)
+### Core Settings
+- `APP_NAME`: Backend application name.
+- `SECRET_KEY`: JWT signing key.
+- `ADMIN_DEFAULT_USERNAME` / `ADMIN_DEFAULT_PASSWORD`: Initial admin credentials.
 
-If `HYQ_USE_LLM=true` or `METADATA_USE_LLM=true`, ensure the selected model is available in Ollama.
+### Vector Storage (Qdrant)
+- `QDRANT_URL`: Empty for local embedded mode, or remote Qdrant URL.
+- `QDRANT_API_KEY`: Required for remote Qdrant.
+- `QDRANT_COLLECTION_NAME`: Default collection name.
+
+### Ingestion & Retrieval
+- `PDF_PARSER_MODE`: `legacy` (PyMuPDF) or `marker`.
+- `CHUNK_SIZE`: Target chunk length (default: 1000).
+- `CHUNK_OVERLAP`: Overlap between chunks (default: 150).
+- `RERANKER_ENABLED`: Enable BGE Reranker (default: true).
+- `QUERY_REWRITE_ENABLED`: Enable HyDE-like query rewriting.
 
 If `QDRANT_URL` is empty, backend uses local embedded Qdrant persisted at:
 
@@ -158,7 +131,6 @@ HYQ_MODEL=llama3.2:3b
 METADATA_MODEL=llama3.2:3b
 METADATA_SUMMARY_USE_HIGH_ACCURACY=false
 METADATA_KEEP_ALIVE=-1
-LLM_KEEP_ALIVE=10m
 ```
 
 Profile B (precision summary, accepts extra model switch):
@@ -179,10 +151,7 @@ HYQ_USE_LLM=true
 HYQ_MODEL=llama3.2:3b
 METADATA_USE_LLM=true
 METADATA_MODEL=llama3.2:3b
-OLLAMA_NUM_THREAD=8
-METADATA_OLLAMA_NUM_THREAD=8
 METADATA_OLLAMA_NUM_PREDICT=192
-LLM_NUM_CTX=2048
 METADATA_NUM_CTX=1536
 OLLAMA_KV_CACHE_TYPE=q8_0
 OLLAMA_FLASH_ATTENTION=1

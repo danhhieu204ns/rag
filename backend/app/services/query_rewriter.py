@@ -36,12 +36,15 @@ _rewrite_llm: ChatOllama | None = None
 def _get_rewrite_llm() -> ChatOllama:
     global _rewrite_llm
     if _rewrite_llm is None:
-        model = settings.query_rewrite_model or settings.llm_model
+        headers = {}
+        if settings.ollama_api_key:
+            headers["x-api-key"] = settings.ollama_api_key
+
         _rewrite_llm = ChatOllama(
-            model=model,
+            model="default",
             base_url=settings.ollama_base_url,
+            headers=headers,
             temperature=0.0,
-            num_thread=settings.ollama_num_thread,
         )
     return _rewrite_llm
 

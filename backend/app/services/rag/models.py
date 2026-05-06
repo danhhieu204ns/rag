@@ -27,13 +27,17 @@ def get_embeddings() -> Embeddings:
     if _embeddings is None:
         with _embeddings_lock:
             if _embeddings is None:
+                headers = {}
+                if settings.ollama_api_key:
+                    headers["x-api-key"] = settings.ollama_api_key
+
                 _embeddings = OllamaEmbeddings(
-                    model=settings.embedding_model_name,
+                    model="default",
                     base_url=settings.ollama_base_url,
+                    headers=headers,
                 )
                 logger.info(
-                    "[embedding] Using Ollama embedding model '%s' at %s",
-                    settings.embedding_model_name,
+                    "[embedding] Using Ollama embedding model at %s",
                     settings.ollama_base_url,
                 )
 
@@ -47,25 +51,17 @@ def get_llm() -> ChatOllama:
     if _llm is None:
         with _llm_lock:
             if _llm is None:
+                headers = {}
+                if settings.ollama_api_key:
+                    headers["x-api-key"] = settings.ollama_api_key
+
                 _llm = ChatOllama(
-                    model=settings.llm_model,
+                    model="default",
                     base_url=settings.ollama_base_url,
-                    temperature=settings.llm_temperature,
-                    num_thread=settings.ollama_num_thread,
-                    num_ctx=settings.llm_num_ctx,
-                    keep_alive=settings.llm_keep_alive,
+                    headers=headers,
+                    temperature=0.0,
                 )
     return _llm
-
-
-def warmup_embedding_model() -> None:
-    """Warm embedding model once to reduce first-request cold start."""
-    get_embeddings().embed_documents(["warmup embedding model"])
-
-
-def warmup_chat_model() -> None:
-    """Warm chat model with minimal output to reduce first-request cold start."""
-    get_llm().invoke("Trả về đúng 1 từ: OK")
 
 
 def _get_variant_llm() -> ChatOllama:
@@ -73,16 +69,18 @@ def _get_variant_llm() -> ChatOllama:
     global _variant_llm
 
     if _variant_llm is None:
-        model = settings.multi_query_model or settings.llm_model
+        headers = {}
+        if settings.ollama_api_key:
+            headers["x-api-key"] = settings.ollama_api_key
+
         _variant_llm = ChatOllama(
-            model=model,
+            model="default",
             base_url=settings.ollama_base_url,
+            headers=headers,
             temperature=0.0,
-            num_thread=settings.ollama_num_thread,
             format="json",
         )
     return _variant_llm
-
 
 def get_reranker() -> Any:
     """Lazy-load CrossEncoder reranker."""
