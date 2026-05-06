@@ -37,6 +37,7 @@ from ..services.document_processing import (
     split_source_documents,
 )
 from .auth import require_admin
+from ..models import User as AdminUser
 from ..services.rag_runtime import delete_vectors_by_document_id, get_embeddings, upsert_child_documents
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -508,6 +509,12 @@ def _build_document_chunks_for_indexing(
         prepare_started_at = time.perf_counter()
 
         llm_batch_size = max(1, settings.metadata_llm_batch_size)
+        # Use embedding_batch_size from settings for chunks processing
+        embedding_batch_size = max(1, settings.embedding_batch_size)
+        
+        # We group candidates into batches for processing. 
+        # Metadata calls (structured /v1/indexing) are slow and call LLM.
+        # Embedding calls (/api/embed) are faster and process text in batches.
         batches: list[list[dict[str, Any]]] = [
             candidates[start : start + llm_batch_size]
             for start in range(0, len(candidates), llm_batch_size)
@@ -515,6 +522,11 @@ def _build_document_chunks_for_indexing(
 
         loop = asyncio.get_running_loop()
         embeddings_client = get_embeddings()
+
+        # Simple thread pool shared for metadata and embeddings to leverage OLLAMA_NUM_PARALLEL
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = settings.indexing_concurrency
+        indexing_executor = ThreadPoolExecutor(max_workers=max_workers)
 
         def _prepare_batch_metadata(batch: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
             uncached_batch = [item for item in batch if prepared_metadata[int(item["chunk_index"])] is None]
@@ -579,11 +591,17 @@ def _build_document_chunks_for_indexing(
             if not texts:
                 return []
 
-            vectors = embeddings_client.embed_documents(texts)
-            if len(vectors) != len(payload_rows):
+            # Process in batches of embedding_batch_size to optimize /api/embed calls
+            all_vectors: list[list[float]] = []
+            for i in range(0, len(texts), embedding_batch_size):
+                batch_texts = texts[i : i + embedding_batch_size]
+                batch_vectors = embeddings_client.embed_documents(batch_texts)
+                all_vectors.extend(batch_vectors)
+
+            if len(all_vectors) != len(payload_rows):
                 raise RuntimeError("Child embedding count mismatch while building index payload.")
 
-            for idx, vector in enumerate(vectors):
+            for idx, vector in enumerate(all_vectors):
                 payload_rows[idx]["vector"] = vector
 
             return payload_rows
@@ -591,11 +609,15 @@ def _build_document_chunks_for_indexing(
         if not batches:
             return
 
-        metadata_future = loop.run_in_executor(None, _prepare_batch_metadata, batches[0])
+        # Parallelized execution using the executor
+        metadata_futures = [
+            loop.run_in_executor(indexing_executor, _prepare_batch_metadata, batch)
+            for batch in batches
+        ]
 
-        for batch_index in range(len(batches)):
+        for batch_index, future in enumerate(metadata_futures):
             metadata_batch_started_at = time.perf_counter()
-            prepared_batch = await metadata_future
+            prepared_batch = await future
             metadata_batch_elapsed_ms = (time.perf_counter() - metadata_batch_started_at) * 1000
             _emit_progress(
                 "[timing][embed_document] DONE step=prepare_batch_metadata batch=%d/%d document_id=%s elapsed_ms=%.2f",
@@ -606,20 +628,14 @@ def _build_document_chunks_for_indexing(
             )
 
             child_embedding_started_at = time.perf_counter()
-            child_embedding_future = loop.run_in_executor(
-                None,
+            # We can also parallelize child embedding if needed, but since we are already
+            # parallelizing the batches for metadata (which is the slow part), 
+            # and each embed call handles a batch of texts, this is already efficient.
+            embedded_rows = await loop.run_in_executor(
+                indexing_executor,
                 _embed_children_from_batch,
                 prepared_batch,
             )
-
-            if batch_index + 1 < len(batches):
-                metadata_future = loop.run_in_executor(
-                    None,
-                    _prepare_batch_metadata,
-                    batches[batch_index + 1],
-                )
-
-            embedded_rows = await child_embedding_future
             child_embedding_elapsed_ms = (time.perf_counter() - child_embedding_started_at) * 1000
             _emit_progress(
                 "[timing][embed_document] DONE step=embed_children_from_batch batch=%d/%d document_id=%s rows=%d elapsed_ms=%.2f",
@@ -631,6 +647,8 @@ def _build_document_chunks_for_indexing(
             )
 
             precomputed_child_rows.extend(embedded_rows)
+
+        indexing_executor.shutdown(wait=False)
 
         prepare_elapsed_ms = (time.perf_counter() - prepare_started_at) * 1000
         _emit_progress(
@@ -1326,12 +1344,8 @@ def embed_document(
     db.commit()
 
     background_tasks.add_task(
-        _run_document_indexing_job,
+        _run_full_indexing_job,
         document_id,
-        file_hash,
-        str(parsed_markdown_path),
-        source_parser,
-        source_type,
     )
     _emit_progress(
         "[embed_document] Queued background indexing for document_id=%s",

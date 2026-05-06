@@ -373,52 +373,60 @@ class MetadataBundleGenerator:
 
         results: list[ChunkEnrichmentResult | None] = [None] * len(chunk_texts)
 
-        for i, text in enumerate(chunk_texts):
-            try:
-                # Call the new Shield /v1/indexing endpoint
-                payload = {"text": text}
-                headers = {}
-                if self.api_key:
-                    headers["x-api-key"] = self.api_key
+        headers = {}
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
 
-                with httpx.Client(timeout=180.0) as client:
-                    r = client.post(
-                        f"{self.base_url}/v1/indexing",
-                        json=payload,
-                        headers=headers,
-                    )
-                    r.raise_for_status()
-                    data = r.json()
-
-                # Extract data from specialized indexing response
-                summary = data.get("summary") or ""
-                hyq = data.get("hyq") or []
-                metadata = data.get("metadata") or {}
-                entities = metadata.get("keywords") or []
-
-                parsed_hyq = _parse_hyq_payload(
-                    {
-                        "summary": summary,
-                        "questions": hyq,
-                    },
-                    summary_words=self.summary_words,
-                    question_count=self.question_count,
+        payload = {"texts": chunk_texts}
+        try:
+            with httpx.Client(timeout=180.0) as client:
+                r = client.post(
+                    f"{self.base_url}/v1/indexing/batch",
+                    json=payload,
+                    headers=headers,
                 )
+                r.raise_for_status()
+                data = r.json()
+        except Exception as exc:
+            logger.error("[metadata] Error calling /v1/indexing/batch: %s", exc)
+            return results
 
-                cleaned_entities = _dedupe_keep_order(
-                    [str(e) for e in entities if str(e).strip()],
-                    limit=8,
-                )
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            logger.error("[metadata] Invalid response from /v1/indexing/batch")
+            return results
 
-                if parsed_hyq or cleaned_entities:
-                    results[i] = ChunkEnrichmentResult(
-                        hyq=parsed_hyq,
-                        entities=cleaned_entities,
-                    )
-
-            except Exception as e:
-                logger.error("[metadata] Error calling /v1/indexing for chunk %d: %s", i, e)
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
                 continue
+            if item.get("error"):
+                logger.error("[metadata] Indexing error for chunk %d: %s", index, item.get("error"))
+                continue
+
+            summary = item.get("summary") or ""
+            hyq = item.get("hyq") or []
+            metadata = item.get("metadata") or {}
+            entities = metadata.get("keywords") or []
+
+            parsed_hyq = _parse_hyq_payload(
+                {
+                    "summary": summary,
+                    "questions": hyq,
+                },
+                summary_words=self.summary_words,
+                question_count=self.question_count,
+            )
+
+            cleaned_entities = _dedupe_keep_order(
+                [str(e) for e in entities if str(e).strip()],
+                limit=8,
+            )
+
+            if parsed_hyq or cleaned_entities:
+                results[index] = ChunkEnrichmentResult(
+                    hyq=parsed_hyq,
+                    entities=cleaned_entities,
+                )
 
         return results
 

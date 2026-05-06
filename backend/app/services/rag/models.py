@@ -27,18 +27,23 @@ def get_embeddings() -> Embeddings:
     if _embeddings is None:
         with _embeddings_lock:
             if _embeddings is None:
+                # Nếu dùng Ollama qua proxy/service khác yêu cầu xác thực API key
                 headers = {}
                 if settings.ollama_api_key:
                     headers["x-api-key"] = settings.ollama_api_key
 
+                # LangChain Ollama yêu cầu truyền headers qua client_kwargs
+                # Note: OllamaEmbeddings uses /api/embeddings by default.
+                # If using a proxy that maps /v1/chat but not /api/embeddings, this may fail with 404.
                 _embeddings = OllamaEmbeddings(
-                    model="default",
+                    model=settings.ollama_embedding_model,
                     base_url=settings.ollama_base_url,
-                    headers=headers,
+                    client_kwargs={"headers": headers} if headers else None,
                 )
                 logger.info(
-                    "[embedding] Using Ollama embedding model at %s",
+                    "[embedding] Using remote Ollama embedding model (with auth) at %s, model=%s",
                     settings.ollama_base_url,
+                    settings.ollama_embedding_model,
                 )
 
     return _embeddings
@@ -56,9 +61,9 @@ def get_llm() -> ChatOllama:
                     headers["x-api-key"] = settings.ollama_api_key
 
                 _llm = ChatOllama(
-                    model="default",
+                    model=settings.ollama_chat_model,
                     base_url=settings.ollama_base_url,
-                    headers=headers,
+                    client_kwargs={"headers": headers} if headers else None,
                     temperature=0.0,
                 )
     return _llm
@@ -74,9 +79,9 @@ def _get_variant_llm() -> ChatOllama:
             headers["x-api-key"] = settings.ollama_api_key
 
         _variant_llm = ChatOllama(
-            model="default",
+            model=settings.ollama_chat_model,
             base_url=settings.ollama_base_url,
-            headers=headers,
+            client_kwargs={"headers": headers} if headers else None,
             temperature=0.0,
             format="json",
         )

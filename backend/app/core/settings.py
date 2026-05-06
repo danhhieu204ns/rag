@@ -19,6 +19,8 @@ class Settings:
     database_path: Path
     ollama_base_url: str
     ollama_api_key: str
+    ollama_chat_model: str
+    ollama_embedding_model: str
     pdf_parser_mode: str
     chunk_size: int
     chunk_overlap: int
@@ -28,8 +30,12 @@ class Settings:
     reranker_enabled: bool
     reranker_model: str
     reranker_candidate_pool: int
+    metadata_llm_batch_size: int
+    indexing_concurrency: int
+    embedding_batch_size: int
     # Query Rewriting
     query_rewrite_min_words: int
+    vector_batch_size: int
     # Auth
     secret_key: str
     access_token_expire_minutes: int
@@ -107,6 +113,8 @@ def get_settings() -> Settings:
         qdrant_url=_string_env("QDRANT_URL", ""),
         qdrant_api_key=_string_env("QDRANT_API_KEY", ""),
         database_path=storage_dir / "app.db",
+        ollama_chat_model=_string_env("OLLAMA_CHAT_MODEL", "default"),
+        ollama_embedding_model=_string_env("OLLAMA_EMBEDDING_MODEL", "default"),
         ollama_base_url=ollama_base_url,
         ollama_api_key=ollama_api_key,
         pdf_parser_mode=_pdf_parser_mode_env(),
@@ -117,7 +125,11 @@ def get_settings() -> Settings:
         reranker_enabled=_bool_env("RERANKER_ENABLED", True),
         reranker_model=_string_env("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
         reranker_candidate_pool=_int_env("RERANKER_CANDIDATE_POOL", 20),
+        metadata_llm_batch_size=_int_env("METADATA_LLM_BATCH_SIZE", 10),
+        indexing_concurrency=_int_env("INDEXING_CONCURRENCY", 8),
+        embedding_batch_size=_int_env("EMBEDDING_BATCH_SIZE", 128),
         query_rewrite_min_words=max(1, _int_env("QUERY_REWRITE_MIN_WORDS", 5)),
+        vector_batch_size=_int_env("VECTOR_BATCH_SIZE", 32),
         secret_key=os.getenv("SECRET_KEY", "change-this-secret-key-in-production"),
         access_token_expire_minutes=_int_env("ACCESS_TOKEN_EXPIRE_MINUTES", 1440),
         admin_default_username=os.getenv("ADMIN_DEFAULT_USERNAME", "admin"),
