@@ -9,6 +9,7 @@ from pathlib import Path
 import time
 from typing import Any, Iterator
 
+from ...core.query_logger import get_query_log
 from ...core.request_logger import get_request_logger
 from ...core.settings import settings
 from .utils import _json_safe_value
@@ -46,7 +47,7 @@ def _load_query_log_entries(log_file: Path) -> list[dict[str, Any]]:
                 entries = payload.get("entries")
                 if isinstance(entries, list):
                     return [item for item in entries if isinstance(item, dict)]
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return []
 
     legacy_log_file = _legacy_query_log_file_path()
@@ -117,6 +118,12 @@ def _emit_query_progress(
 
     # Ghi vào per-request file logger (không ra terminal)
     get_request_logger().info(text)
+
+    # Hook vào QueryLog nếu đang trong context chat query
+    if event is not None:
+        qlog = get_query_log()
+        if qlog is not None:
+            qlog.record(event, details, trace_id=trace_id)
 
     # Vẫn ghi vào file trace JSON để backward compat
     _append_query_log_entry(

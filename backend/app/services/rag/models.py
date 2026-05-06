@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 _embeddings: Embeddings | None = None
 _qdrant_client = None  # defined here so it won't conflict if moved
 _llm: ChatOllama | None = None
-_variant_llm: ChatOllama | None = None
 _reranker: Any = None
 _embeddings_lock = threading.Lock()
 _llm_lock = threading.Lock()
@@ -66,22 +65,6 @@ def warmup_embedding_model() -> None:
 def warmup_chat_model() -> None:
     """Warm chat model with minimal output to reduce first-request cold start."""
     get_llm().invoke("Trả về đúng 1 từ: OK")
-
-
-def _get_variant_llm() -> ChatOllama:
-    """Return cached LLM instance for multi-query variant generation."""
-    global _variant_llm
-
-    if _variant_llm is None:
-        model = settings.multi_query_model or settings.llm_model
-        _variant_llm = ChatOllama(
-            model=model,
-            base_url=settings.ollama_base_url,
-            temperature=0.0,
-            num_thread=settings.ollama_num_thread,
-            format="json",
-        )
-    return _variant_llm
 
 
 def get_reranker() -> Any:

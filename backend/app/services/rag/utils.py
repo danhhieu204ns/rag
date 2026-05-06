@@ -50,10 +50,21 @@ def _normalize_lookup_text(text: str) -> str:
     without_marks = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
     return " ".join(without_marks.lower().split())
 
+# Vietnamese function words that carry no retrieval signal
+_VI_STOP_WORDS: frozenset[str] = frozenset({
+    "la", "gi", "cua", "va", "co", "do", "de", "ra", "da", "an",
+    "hay", "se", "bi", "duoc", "voi", "thi", "ma", "khi", "neu",
+    "tu", "sau", "trong", "ngoai", "tren", "duoi", "nhu", "the",
+    "nay", "kia", "ay", "ho", "ta", "ban", "minh", "no", "chung",
+    "cac", "nhung", "mot", "hai", "ba", "bon", "nam", "sau",
+    "nhieu", "moi", "tat", "ca", "vi", "den", "len", "xuong",
+})
+
+
 def _lookup_terms(query: str) -> list[str]:
     normalized = _normalize_lookup_text(query)
     terms = re.findall(r"[a-z0-9/-]+", normalized)
-    return [term for term in terms if len(term) >= 2]
+    return [term for term in terms if len(term) >= 2 and term not in _VI_STOP_WORDS]
 
 def _parse_chunk_source_metadata(raw_json: str | None) -> dict[str, object]:
     if not raw_json:

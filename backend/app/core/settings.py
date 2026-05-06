@@ -59,10 +59,6 @@ class Settings:
     query_rewrite_enabled: bool
     query_rewrite_min_terms: int
     query_rewrite_max_terms: int
-    multi_query_enabled: bool
-    multi_query_variants: int
-    multi_query_max_workers: int
-    multi_query_model: str
     # Reranking
     reranker_enabled: bool
     reranker_model: str
@@ -196,10 +192,6 @@ def get_settings() -> Settings:
         query_rewrite_enabled=_bool_env("QUERY_REWRITE_ENABLED", False),
         query_rewrite_min_terms=max(1, _int_env("QUERY_REWRITE_MIN_TERMS", 4)),
         query_rewrite_max_terms=max(1, _int_env("QUERY_REWRITE_MAX_TERMS", 8)),
-        multi_query_enabled=_bool_env("MULTI_QUERY_ENABLED", False),
-        multi_query_variants=max(1, _int_env("MULTI_QUERY_VARIANTS", 3)),
-        multi_query_max_workers=max(1, _int_env("MULTI_QUERY_MAX_WORKERS", 3)),
-        multi_query_model=_string_env("MULTI_QUERY_MODEL", ""),
         reranker_enabled=_bool_env("RERANKER_ENABLED", False),
         reranker_model=_string_env("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
         reranker_top_k=_int_env("RERANKER_TOP_K", 4),
