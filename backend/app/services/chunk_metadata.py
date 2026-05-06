@@ -790,9 +790,11 @@ def build_structured_chunk_metadata_batch(
 
         chunk_text = str(item.get("chunk_text") or "")
         contexts.append(_extract_context(raw_metadata))
+        # Regex extraction as primary fallback
         fallback_searches.append(_fallback_search_optimization(chunk_text))
         chunk_texts.append(chunk_text)
 
+    # LLM extraction for Summary, Questions, and Entities
     search_optimizations, llm_hyqs = _get_metadata_bundle_generator().generate_many(
         chunk_texts=chunk_texts,
         contexts=contexts,
@@ -810,10 +812,13 @@ def build_structured_chunk_metadata_batch(
         source_page = item.get("source_page")
         chunk_text = chunk_texts[idx]
         context = contexts[idx]
+        
+        # search_optimization is already combined (LLM entities + Regex fallback)
         search_optimization = search_optimizations[idx]
 
         hyq_result = HyQResult(summary="", questions=[])
         if settings.hyq_enabled:
+            # Use LLM result if available, otherwise fallback to Regex-based questions
             if llm_hyqs[idx] is not None:
                 hyq_result = llm_hyqs[idx] or hyq_result
             else:
