@@ -21,3 +21,4 @@ bcrypt
 ollama
 marker
 pillow<11.0.0
+httpx

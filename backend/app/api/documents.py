@@ -31,7 +31,7 @@ from ..schemas import (
     ParseDocumentResponse,
 )
 from ..services.chunk_metadata import build_hyq_children, build_structured_chunk_metadata_batch
-from ..services.document_processing import (
+from ..services.ingestion_client import (
     load_documents_from_parsed_markdown,
     parse_source_to_markdown,
     split_source_documents,

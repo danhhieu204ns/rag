@@ -41,6 +41,14 @@ cd backend
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+Run ingestion service (separate process):
+
+```bash
+cd ingestion_service
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8100
+```
+
 ## Environment
 
 ### Required
@@ -59,6 +67,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ### Ingestion & Retrieval
 - `PDF_PARSER_MODE`: `legacy` (PyMuPDF) or `marker`.
+- `INGESTION_SERVICE_URL`: Optional URL for external parse/split service (example: `http://localhost:8100`).
+- `INGESTION_TIMEOUT_SECONDS`: HTTP timeout when backend calls ingestion service.
 - `CHUNK_SIZE`: Target chunk length (default: 1000).
 - `CHUNK_OVERLAP`: Overlap between chunks (default: 150).
 - `RERANKER_ENABLED`: Enable BGE Reranker (default: true).

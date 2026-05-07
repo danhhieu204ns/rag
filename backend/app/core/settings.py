@@ -33,6 +33,8 @@ class Settings:
     metadata_llm_batch_size: int
     indexing_concurrency: int
     embedding_batch_size: int
+    ingestion_service_url: str
+    ingestion_timeout_seconds: float
     # Query Rewriting
     query_rewrite_min_words: int
     vector_batch_size: int
@@ -128,6 +130,8 @@ def get_settings() -> Settings:
         metadata_llm_batch_size=_int_env("METADATA_LLM_BATCH_SIZE", 12),
         indexing_concurrency=_int_env("INDEXING_CONCURRENCY", 12),
         embedding_batch_size=_int_env("EMBEDDING_BATCH_SIZE", 128),
+        ingestion_service_url=_string_env("INGESTION_SERVICE_URL", "").rstrip("/"),
+        ingestion_timeout_seconds=_float_env("INGESTION_TIMEOUT_SECONDS", 180.0),
         query_rewrite_min_words=max(1, _int_env("QUERY_REWRITE_MIN_WORDS", 5)),
         vector_batch_size=_int_env("VECTOR_BATCH_SIZE", 64),
         secret_key=os.getenv("SECRET_KEY", "change-this-secret-key-in-production"),
