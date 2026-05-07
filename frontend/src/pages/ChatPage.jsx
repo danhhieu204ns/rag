@@ -72,6 +72,21 @@ const IconThink = () => (
   </svg>
 );
 
+const IconCopy = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="9" y="9" width="13" height="13" rx="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  </svg>
+);
+
+const IconDownload = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <polyline points="7 10 12 15 17 10" />
+    <line x1="12" y1="15" x2="12" y2="3" />
+  </svg>
+);
+
 const BotAvatar = () => (
   <div className="cgpt-avatar">
     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
@@ -256,6 +271,66 @@ function SourcesPanel({ sources }) {
   );
 }
 
+// ── Output mode config ─────────────────────────────────────────────────────
+
+const OUTPUT_MODES = [
+  { mode: "outline",     icon: "📋", label: "Đề cương",  prefix: "Tạo đề cương chi tiết về: " },
+  { mode: "script",      icon: "📝", label: "Script",     prefix: "Tạo script giảng dạy về: " },
+  { mode: "quiz",        icon: "❓", label: "Câu hỏi",    prefix: "Tạo bộ câu hỏi ôn tập về: " },
+  { mode: "summary_doc", icon: "📄", label: "Tóm tắt",    prefix: "Tóm tắt toàn bộ nội dung về: " },
+];
+
+const MODE_META = {
+  outline:     { icon: "📋", label: "Đề cương",   color: "#3b82f6" },
+  script:      { icon: "📝", label: "Script",      color: "#8b5cf6" },
+  quiz:        { icon: "❓", label: "Câu hỏi",     color: "#f59e0b" },
+  summary_doc: { icon: "📄", label: "Tóm tắt",     color: "#10b981" },
+};
+
+// ── ActionBar: copy + download for structured outputs ─────────────────────
+
+function ActionBar({ content, outputMode }) {
+  const [copied, setCopied] = useState(false);
+
+  function handleCopy() {
+    const plain = content
+      .replace(/<think>[\s\S]*?<\/think>/g, "")
+      .replace(/<\/?think>/g, "")
+      .trim();
+    navigator.clipboard.writeText(plain).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }
+
+  function handleDownload() {
+    const plain = content
+      .replace(/<think>[\s\S]*?<\/think>/g, "")
+      .replace(/<\/?think>/g, "")
+      .trim();
+    const blob = new Blob([plain], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `viettelrag_${outputMode}_${Date.now()}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div className="cgpt-action-bar">
+      <button className="cgpt-action-btn" onClick={handleCopy} title="Sao chép nội dung">
+        <IconCopy />
+        <span>{copied ? "Đã sao chép!" : "Sao chép"}</span>
+      </button>
+      <button className="cgpt-action-btn" onClick={handleDownload} title="Tải về dạng Markdown">
+        <IconDownload />
+        <span>Tải về .md</span>
+      </button>
+    </div>
+  );
+}
+
 // ── Parse think block from message content ─────────────────────────────────
 
 function parseContent(content) {
@@ -281,12 +356,25 @@ function AssistantMessage({ msg }) {
   const { thinking, answer, isThinking } = parseContent(msg.content);
   const sources = msg.sources ?? [];
   const answerText = thinking !== null ? answer : msg.content;
+  const modeMeta = msg.outputMode ? MODE_META[msg.outputMode] : null;
+  const isStructured = !!modeMeta;
 
   return (
     <div className="cgpt-assistant-row">
       <BotAvatar />
       <div className="cgpt-assistant-content">
-        <div className="cgpt-assistant-name">ViettelRAG</div>
+        <div className="cgpt-assistant-name">
+          ViettelRAG
+          {modeMeta && (
+            <span
+              className="cgpt-mode-badge"
+              style={{ background: modeMeta.color }}
+              title={`Chế độ: ${modeMeta.label}`}
+            >
+              {modeMeta.icon} {modeMeta.label}
+            </span>
+          )}
+        </div>
 
         {thinking !== null && (
           <ThinkBlock content={thinking} isStreaming={isThinking} />
@@ -294,6 +382,10 @@ function AssistantMessage({ msg }) {
 
         {answerText && (
           <MarkdownWithCitations content={answerText} sources={sources} />
+        )}
+
+        {isStructured && answerText && !isThinking && (
+          <ActionBar content={msg.content} outputMode={msg.outputMode} />
         )}
       </div>
     </div>
@@ -312,6 +404,7 @@ function ChatPage({ user, onLogout }) {
   const [error, setError] = useState("");
   const [isSidebarOpen, setIsSidebarOpen] = useState(() => window.innerWidth >= 769);
   const [searchQuery, setSearchQuery] = useState("");
+  const [activeOutputMode, setActiveOutputMode] = useState(null);
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
 
@@ -368,6 +461,8 @@ function ChatPage({ user, onLogout }) {
     setIsSending(true);
     setIsReceiving(false);
     const userText = input.trim();
+    const pendingMode = activeOutputMode;
+    setActiveOutputMode(null);
     setInput("");
     setMessages((prev) => [
       ...prev,
@@ -382,10 +477,13 @@ function ChatPage({ user, onLogout }) {
       const token = localStorage.getItem("rag_admin_token");
       if (token) headers["Authorization"] = `Bearer ${token}`;
 
+      const body = { session_id: activeSessionId, message: userText };
+      if (pendingMode) body.output_mode = pendingMode;
+
       const response = await fetch(`${api.defaults.baseURL}/chat/query`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ session_id: activeSessionId, message: userText }),
+        body: JSON.stringify(body),
       });
 
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -443,6 +541,15 @@ function ChatPage({ user, onLogout }) {
               }
               if (data.type === "session") {
                 newSessionId = data.session_id;
+              } else if (data.type === "output_mode") {
+                const detectedMode = data.mode && data.mode !== "qa" ? data.mode : null;
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === assistantMessageId
+                      ? { ...msg, outputMode: detectedMode }
+                      : msg
+                  )
+                );
               } else if (data.type === "sources") {
                 setMessages((prev) =>
                   prev.map((msg) =>
@@ -629,6 +736,31 @@ function ChatPage({ user, onLogout }) {
 
         {/* Composer */}
         <div className="cgpt-composer-wrap">
+          {/* Quick-action toolbar */}
+          <div className="cgpt-mode-toolbar">
+            {OUTPUT_MODES.map(({ mode, icon, label, prefix }) => (
+              <button
+                key={mode}
+                type="button"
+                className={`cgpt-mode-btn${activeOutputMode === mode ? " cgpt-mode-btn-active" : ""}`}
+                onClick={() => {
+                  if (activeOutputMode === mode) {
+                    setActiveOutputMode(null);
+                    setInput((v) => v.startsWith(prefix) ? v.slice(prefix.length) : v);
+                  } else {
+                    setActiveOutputMode(mode);
+                    setInput((v) => v.startsWith(prefix) ? v : prefix + v.replace(/^(Tạo đề cương chi tiết về: |Tạo script giảng dạy về: |Tạo bộ câu hỏi ôn tập về: |Tóm tắt toàn bộ nội dung về: )/, ""));
+                  }
+                  textareaRef.current?.focus();
+                }}
+                title={`Chế độ: ${label}`}
+                disabled={isSending}
+              >
+                {icon} {label}
+              </button>
+            ))}
+          </div>
+
           <form className="cgpt-composer" onSubmit={sendMessage}>
             <div className="cgpt-composer-inner">
               <button type="button" className="cgpt-attach-btn" aria-label="Thêm nội dung">
@@ -640,7 +772,11 @@ function ChatPage({ user, onLogout }) {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Hỏi bất kỳ điều gì"
+                placeholder={
+                  activeOutputMode
+                    ? `${MODE_META[activeOutputMode]?.icon} Nhập chủ đề cần ${MODE_META[activeOutputMode]?.label.toLowerCase()}...`
+                    : "Hỏi bất kỳ điều gì"
+                }
                 rows={1}
               />
               <button

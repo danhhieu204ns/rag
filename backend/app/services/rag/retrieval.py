@@ -914,16 +914,15 @@ def similarity_search(
     top_k: int,
     db: Session | None = None,
     document_ids: list[int] | None = None,
+    plan: OrchestrationPlan | None = None,
 ) -> list[Document]:
     """
     Search relevant parent chunks using orchestrated hybrid retrieval.
 
-    When ORCHESTRATOR_ENABLED=true the function:
-      1. Classifies the query (zero-latency, rule-based).
-      2. Builds an OrchestrationPlan with adaptive weights / reranker flag.
-      3. Runs _run_hybrid_once() with those parameters.
-      4. If results are thin and the plan allows a retry, widens the search
-         and runs a second pass (max 2 iterations total).
+    plan — when provided by the caller (e.g. chat.py that already ran
+           classify_query()), it is used as-is; internal classification is
+           skipped.  When omitted, classification runs here if
+           ORCHESTRATOR_ENABLED=true.
     """
     trace_id = f"q-{int(time.time() * 1000)}-{uuid4().hex[:8]}"
     token = _query_trace_id_ctx.set(trace_id)
@@ -954,8 +953,8 @@ def similarity_search(
         )
 
         # ── Orchestration (hybrid path only) ──────────────────────────────────
-        plan: OrchestrationPlan | None = None
-        if settings.orchestrator_enabled and db is not None:
+        # Use the caller-supplied plan when available; classify only when not.
+        if plan is None and settings.orchestrator_enabled and db is not None:
             with _timed_query_step(
                 "orchestrate_query",
                 event_prefix="similarity_orchestrate",

@@ -22,6 +22,7 @@ from ..schemas import (
     ChatSessionRead,
     SourceItem,
 )
+from ..services.rag.orchestrator import classify_query
 from ..services.rag_runtime import (
     build_sources,
     generate_answer,
@@ -231,19 +232,31 @@ def _run_query_chat_stream_inner(
     )
     _emit_query_progress("[chat.query] Loaded history messages: count=%d", len(history))
 
+    # ── Orchestrate: classify query + resolve output mode ─────────────────────
+    plan = None
+    if settings.orchestrator_enabled:
+        explicit_mode = payload.output_mode or None
+        plan = classify_query(
+            user_text,
+            top_k,
+            output_mode_override=explicit_mode,  # type: ignore[arg-type]
+        )
+    output_mode: str = plan.output_mode if plan else (payload.output_mode or "qa")
+
     retrieval_started_at = time.perf_counter()
     retrieved_docs = similarity_search(
         user_text,
         top_k=top_k,
         db=db,
         document_ids=payload.document_ids,
+        plan=plan,
     )
     _emit_query_progress("[chat.query] Retrieved context docs: count=%d", len(retrieved_docs))
 
     sources = build_sources(retrieved_docs)
-    
-    # Send session info and sources as the first chunks
+
     yield f"data: {json.dumps({'type': 'session', 'session_id': session.id})}\n\n"
+    yield f"data: {json.dumps({'type': 'output_mode', 'mode': output_mode})}\n\n"
     yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
 
     answer_parts = []
@@ -256,6 +269,7 @@ def _run_query_chat_stream_inner(
             question=user_text,
             context_docs=retrieved_docs,
             history_messages=history,
+            output_mode=output_mode,
         ):
             answer_parts.append(chunk)
             yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"

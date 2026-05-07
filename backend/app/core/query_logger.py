@@ -123,7 +123,6 @@ class QueryLog:
                 return
 
             if event == "orchestrator_plan":
-                # Ghi lần đầu (initial plan). Lần retry thì _orchestrator_retries xử lý.
                 if not self._orchestrator:
                     self._orchestrator = details
                     self._orchestrator_ms = float(details.get("elapsed_ms", 0.0))
@@ -265,6 +264,7 @@ class QueryLog:
         if od:
             from .settings import settings as _s
             kv("  Query type", od.get("query_type", "?"))
+            kv("  Output mode", od.get("output_mode", "qa"))
             kv("  Strategy", od.get("strategy", "?"))
             kv("  Top-K (plan)", od.get("top_k", "?"))
             v_w = od.get("vector_rrf_weight", "?")
