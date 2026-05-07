@@ -97,6 +97,7 @@ def init_db() -> None:
 
     _migrate_users_table()
     Base.metadata.create_all(bind=engine)
+    _ensure_document_chunk_columns()
     _seed_admin()
 
 

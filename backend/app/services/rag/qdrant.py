@@ -307,8 +307,8 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
         return 0
 
     _emit_reindex_progress(
-        "[reindex] Generated %d child documents. Creating embeddings with model '%s'.",
-        len(documents)
+        "[reindex] Generated %d child documents. Creating embeddings.",
+        len(documents),
     )
 
     indexed_count = _upsert_qdrant_collection_with_batch_embeddings(

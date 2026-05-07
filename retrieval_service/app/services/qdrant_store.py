@@ -50,8 +50,18 @@ def ensure_collection(name: str, vector_size: int) -> None:
     )
 
 
-def _point_id(name: str, document_id: int | str, chunk_id: int | str) -> str:
-    return str(uuid5(NAMESPACE_URL, f"{name}|document:{document_id}|chunk:{chunk_id}"))
+def _point_id(
+    name: str,
+    document_id: int | str,
+    chunk_id: int | str,
+    child_type: int | str,
+    child_index: int | str,
+) -> str:
+    raw = (
+        f"{name}|document:{document_id}|chunk:{chunk_id}|"
+        f"type:{child_type}|index:{child_index}"
+    )
+    return str(uuid5(NAMESPACE_URL, raw))
 
 
 def _json_safe(payload: dict[str, Any]) -> dict[str, Any]:
@@ -168,9 +178,11 @@ def upsert_chunks(chunks: list[ChunkIndexItem], vectors: list[list[float]], name
                 "source_page": chunk.page,
                 "source_metadata": source_metadata,
             }
+            child_type = payload.get("child_type") or "summary"
+            child_index = _to_int(payload.get("child_index")) or 0
             points.append(
                 PointStruct(
-                    id=_point_id(name, chunk.document_id, chunk.chunk_id),
+                    id=_point_id(name, chunk.document_id, chunk.chunk_id, child_type, child_index),
                     vector=vector,
                     payload=_json_safe(payload),
                 )

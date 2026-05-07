@@ -17,12 +17,6 @@ cp .env.example .env
 uvicorn app.main:app --host 0.0.0.0 --port 8200
 ```
 
-Hoặc dùng entrypoint cũ ở repo root:
-
-```bash
-uvicorn shield_api:app --host 0.0.0.0 --port 8200
-```
-
 URL mặc định: `http://localhost:8200`
 
 - Health: `GET /health`

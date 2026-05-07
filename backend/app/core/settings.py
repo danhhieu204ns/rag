@@ -26,6 +26,13 @@ class Settings:
     chunk_overlap: int
     retriever_k: int
     query_rewrite_enabled: bool
+    query_rewrite_min_terms: int
+    query_rewrite_max_terms: int
+    # Hybrid retrieval
+    hybrid_probe_multiplier: int
+    hybrid_rrf_k: int
+    hybrid_vector_rrf_weight: float
+    hybrid_keyword_rrf_weight: float
     # Reranking
     reranker_enabled: bool
     reranker_model: str
@@ -37,8 +44,6 @@ class Settings:
     ingestion_timeout_seconds: float
     retrieval_service_url: str
     retrieval_timeout_seconds: float
-    # Query Rewriting
-    query_rewrite_min_words: int
     vector_batch_size: int
     # Auth
     secret_key: str
@@ -53,6 +58,15 @@ def _int_env(name: str, default: int) -> int:
     if raw_value is None:
         return default
     return int(raw_value)
+
+
+def _int_env_any(names: tuple[str, ...], default: int) -> int:
+    for name in names:
+        raw_value = os.getenv(name)
+        if raw_value is None:
+            continue
+        return int(raw_value)
+    return default
 
 
 
@@ -126,6 +140,15 @@ def get_settings() -> Settings:
         chunk_overlap=_int_env("CHUNK_OVERLAP", 50),
         retriever_k=4,
         query_rewrite_enabled=_bool_env("QUERY_REWRITE_ENABLED", False),
+        query_rewrite_min_terms=max(
+            1,
+            _int_env_any(("QUERY_REWRITE_MIN_TERMS", "QUERY_REWRITE_MIN_WORDS"), 5),
+        ),
+        query_rewrite_max_terms=max(1, _int_env("QUERY_REWRITE_MAX_TERMS", 12)),
+        hybrid_probe_multiplier=max(1, _int_env("HYBRID_PROBE_MULTIPLIER", 4)),
+        hybrid_rrf_k=max(1, _int_env("HYBRID_RRF_K", 60)),
+        hybrid_vector_rrf_weight=_float_env("HYBRID_VECTOR_RRF_WEIGHT", 1.0),
+        hybrid_keyword_rrf_weight=_float_env("HYBRID_KEYWORD_RRF_WEIGHT", 1.0),
         reranker_enabled=_bool_env("RERANKER_ENABLED", True),
         reranker_model=_string_env("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
         reranker_candidate_pool=_int_env("RERANKER_CANDIDATE_POOL", 20),
@@ -136,7 +159,6 @@ def get_settings() -> Settings:
         ingestion_timeout_seconds=_float_env("INGESTION_TIMEOUT_SECONDS", 180.0),
         retrieval_service_url=_string_env("RETRIEVAL_SERVICE_URL", "").rstrip("/"),
         retrieval_timeout_seconds=_float_env("RETRIEVAL_TIMEOUT_SECONDS", 180.0),
-        query_rewrite_min_words=max(1, _int_env("QUERY_REWRITE_MIN_WORDS", 5)),
         vector_batch_size=_int_env("VECTOR_BATCH_SIZE", 64),
         secret_key=os.getenv("SECRET_KEY", "change-this-secret-key-in-production"),
         access_token_expire_minutes=_int_env("ACCESS_TOKEN_EXPIRE_MINUTES", 1440),

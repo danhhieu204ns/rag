@@ -388,7 +388,7 @@ class QueryLog:
 
         # ── PHASE 2 — GENERATION ─────────────────────────────────────────
         section("PHASE 2 — GENERATION")
-        lines.append(f"\n▶ LLM STREAM ({settings.llm_model})  [{self._gen_elapsed_ms:.1f}ms]")
+        lines.append(f"\n▶ LLM STREAM ({settings.ollama_chat_model})  [{self._gen_elapsed_ms:.1f}ms]")
         kv("  Context docs", len(self._final_chunks))
         kv("  Answer length", f"{self._gen_answer_len} chars")
 
