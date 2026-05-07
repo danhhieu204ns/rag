@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import atexit
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -361,6 +363,23 @@ class MetadataBundleGenerator:
         self.base_url = settings.ollama_base_url
         self.api_key = settings.ollama_api_key
         self._llm_disabled = False
+        self._http_client: httpx.Client | None = None
+        self._client_lock = threading.Lock()
+        atexit.register(self.close)
+
+    def _get_http_client(self) -> httpx.Client:
+        if self._http_client is None:
+            with self._client_lock:
+                if self._http_client is None:
+                    self._http_client = httpx.Client(timeout=180.0)
+        return self._http_client
+
+    def close(self) -> None:
+        with self._client_lock:
+            if self._http_client is None:
+                return
+            self._http_client.close()
+            self._http_client = None
 
     def _generate_many_with_llm(
         self,
@@ -379,14 +398,14 @@ class MetadataBundleGenerator:
 
         payload = {"texts": chunk_texts}
         try:
-            with httpx.Client(timeout=180.0) as client:
-                r = client.post(
-                    f"{self.base_url}/v1/indexing/batch",
-                    json=payload,
-                    headers=headers,
-                )
-                r.raise_for_status()
-                data = r.json()
+            client = self._get_http_client()
+            r = client.post(
+                f"{self.base_url}/v1/indexing/batch",
+                json=payload,
+                headers=headers,
+            )
+            r.raise_for_status()
+            data = r.json()
         except Exception as exc:
             logger.error("[metadata] Error calling /v1/indexing/batch: %s", exc)
             return results
@@ -502,20 +521,6 @@ def _get_metadata_bundle_generator() -> MetadataBundleGenerator:
         _metadata_bundle_generator = MetadataBundleGenerator()
 
     return _metadata_bundle_generator
-
-
-def warmup_metadata_model() -> None:
-    """Issue a tiny structured call so metadata model stays warm in Ollama."""
-
-    generator = _get_metadata_bundle_generator()
-    if not generator.use_llm:
-        return
-
-    generator.generate_many(
-        chunk_texts=["Warmup metadata model for resident VRAM."],
-        contexts=[{"h2": "Warmup", "h3": "Metadata"}],
-        fallback_searches=[_fallback_search_optimization("Warmup metadata model")],
-    )
 
 
 def build_structured_chunk_metadata(

@@ -609,46 +609,80 @@ def _build_document_chunks_for_indexing(
         if not batches:
             return
 
-        # Parallelized execution using the executor
-        metadata_futures = [
-            loop.run_in_executor(indexing_executor, _prepare_batch_metadata, batch)
-            for batch in batches
-        ]
+        try:
+            metadata_jobs = [
+                (
+                    batch_index,
+                    time.perf_counter(),
+                    loop.run_in_executor(indexing_executor, _prepare_batch_metadata, batch),
+                )
+                for batch_index, batch in enumerate(batches, start=1)
+            ]
 
-        for batch_index, future in enumerate(metadata_futures):
-            metadata_batch_started_at = time.perf_counter()
-            prepared_batch = await future
-            metadata_batch_elapsed_ms = (time.perf_counter() - metadata_batch_started_at) * 1000
-            _emit_progress(
-                "[timing][embed_document] DONE step=prepare_batch_metadata batch=%d/%d document_id=%s elapsed_ms=%.2f",
-                batch_index + 1,
-                len(batches),
-                document_id,
-                metadata_batch_elapsed_ms,
-            )
+            async def _await_metadata_job(
+                batch_index: int,
+                started_at: float,
+                future: asyncio.Future[list[tuple[dict[str, Any], dict[str, Any]]]],
+            ) -> tuple[int, list[tuple[dict[str, Any], dict[str, Any]]], float]:
+                prepared_batch = await future
+                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                return batch_index, prepared_batch, elapsed_ms
 
-            child_embedding_started_at = time.perf_counter()
-            # We can also parallelize child embedding if needed, but since we are already
-            # parallelizing the batches for metadata (which is the slow part), 
-            # and each embed call handles a batch of texts, this is already efficient.
-            embedded_rows = await loop.run_in_executor(
-                indexing_executor,
-                _embed_children_from_batch,
-                prepared_batch,
-            )
-            child_embedding_elapsed_ms = (time.perf_counter() - child_embedding_started_at) * 1000
-            _emit_progress(
-                "[timing][embed_document] DONE step=embed_children_from_batch batch=%d/%d document_id=%s rows=%d elapsed_ms=%.2f",
-                batch_index + 1,
-                len(batches),
-                document_id,
-                len(embedded_rows),
-                child_embedding_elapsed_ms,
-            )
+            metadata_tasks = [
+                asyncio.create_task(_await_metadata_job(batch_index, started_at, future))
+                for batch_index, started_at, future in metadata_jobs
+            ]
 
-            precomputed_child_rows.extend(embedded_rows)
+            embed_jobs: list[tuple[int, float, asyncio.Future[list[dict[str, Any]]]]] = []
+            for metadata_task in asyncio.as_completed(metadata_tasks):
+                batch_index, prepared_batch, metadata_batch_elapsed_ms = await metadata_task
+                _emit_progress(
+                    "[timing][embed_document] DONE step=prepare_batch_metadata batch=%d/%d document_id=%s elapsed_ms=%.2f",
+                    batch_index,
+                    len(batches),
+                    document_id,
+                    metadata_batch_elapsed_ms,
+                )
 
-        indexing_executor.shutdown(wait=False)
+                embed_jobs.append(
+                    (
+                        batch_index,
+                        time.perf_counter(),
+                        loop.run_in_executor(
+                            indexing_executor,
+                            _embed_children_from_batch,
+                            prepared_batch,
+                        ),
+                    )
+                )
+
+            async def _await_embed_job(
+                batch_index: int,
+                started_at: float,
+                future: asyncio.Future[list[dict[str, Any]]],
+            ) -> tuple[int, list[dict[str, Any]], float]:
+                embedded_rows = await future
+                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                return batch_index, embedded_rows, elapsed_ms
+
+            embed_tasks = [
+                asyncio.create_task(_await_embed_job(batch_index, started_at, future))
+                for batch_index, started_at, future in embed_jobs
+            ]
+
+            for embed_task in asyncio.as_completed(embed_tasks):
+                batch_index, embedded_rows, child_embedding_elapsed_ms = await embed_task
+                _emit_progress(
+                    "[timing][embed_document] DONE step=embed_children_from_batch batch=%d/%d document_id=%s rows=%d elapsed_ms=%.2f",
+                    batch_index,
+                    len(batches),
+                    document_id,
+                    len(embedded_rows),
+                    child_embedding_elapsed_ms,
+                )
+                precomputed_child_rows.extend(embedded_rows)
+        finally:
+            indexing_executor.shutdown(wait=False)
 
         prepare_elapsed_ms = (time.perf_counter() - prepare_started_at) * 1000
         _emit_progress(

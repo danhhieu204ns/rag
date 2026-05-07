@@ -19,5 +19,5 @@ pypdf
 python-jose[cryptography]
 bcrypt
 ollama
-marker-pdf
+marker
 pillow<11.0.0

@@ -12,9 +12,9 @@ from qdrant_client.http.models import Distance, PointStruct, VectorParams
 from ...core.settings import settings
 from ...models import DocumentChunk
 from ..chunk_metadata import build_hyq_children
-from .logging import _emit_reindex_progress, _emit_query_progress, _timed_query_step
+from .logging import _emit_reindex_progress
 from .models import get_embeddings
-from .utils import _to_int, _preview_text, _compact_source_metadata
+from .utils import _to_int, _compact_source_metadata
 
 _qdrant_client: QdrantClient | None = None
 
@@ -40,11 +40,6 @@ def _get_qdrant_client() -> QdrantClient:
 def _qdrant_collection_exists(client: QdrantClient) -> bool:
     collections = client.get_collections().collections
     return any(item.name == settings.qdrant_collection_name for item in collections)
-
-
-def _clear_qdrant_collection(client: QdrantClient) -> None:
-    if _qdrant_collection_exists(client):
-        client.delete_collection(collection_name=settings.qdrant_collection_name)
 
 
 def delete_vectors_by_document_id(document_id: int) -> None:
@@ -276,8 +271,7 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
 
     _emit_reindex_progress(
         "[reindex] Generated %d child documents. Creating embeddings with model '%s'.",
-        len(documents),
-        settings.embedding_model_name,
+        len(documents)
     )
 
     indexed_count = _upsert_qdrant_collection_with_batch_embeddings(

@@ -95,24 +95,9 @@ Mở `.env` và thêm tối thiểu:
 
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
-EMBEDDING_MODEL_NAME=bge-m3:latest
 QDRANT_COLLECTION_NAME=global_child_chunks
 PDF_PARSER_MODE=legacy
-LLM_MODEL=llama3.1:8b
 ```
-
-Khuyến nghị cho máy 12GB VRAM:
-
-```env
-HYQ_MODEL=llama3.2:3b
-METADATA_MODEL=llama3.2:3b
-LLM_NUM_CTX=2048
-METADATA_NUM_CTX=1536
-OLLAMA_KV_CACHE_TYPE=q8_0
-OLLAMA_FLASH_ATTENTION=1
-```
-
-Với `OLLAMA_KV_CACHE_TYPE` và `OLLAMA_FLASH_ATTENTION`, cần set trước khi khởi động `ollama serve`.
 
 `PDF_PARSER_MODE`:
 
