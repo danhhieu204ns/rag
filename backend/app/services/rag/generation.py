@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from typing import Iterator
 
 from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from ...models import ChatMessage
 from .logging import _timed_query_step, _emit_query_progress
@@ -79,52 +81,60 @@ def _build_context_block(context_docs: list[Document]) -> str:
     return "\n\n".join(context_lines) or "Không có tài liệu hỗ trợ."
 
 
-def _build_generation_prompt(
+def _build_messages(
     question: str,
     context_docs: list[Document],
     history_messages: list[ChatMessage],
-) -> str:
+) -> list:
+    """Build chat messages for RAG generation."""
+
     history_block = "\n".join(
         f"{message.role.upper()}: {message.content}" for message in history_messages[-8:]
     )
     context_block = _build_context_block(context_docs)
 
-    return (
-        "Bạn là \"Chuyên gia Phân tích Tài liệu Hệ thống RAG\". Nhiệm vụ của bạn là cung cấp "
-        "câu trả lời chuyên sâu, chi tiết và có căn cứ xác thực TUYỆT ĐỐI từ tài liệu được cung cấp.\n\n"
-        
-        "--- NGUYÊN TẮC HÀNH VI ---\n"
-        "1. TÍNH CHÍNH XÁC: Chỉ trả lời dựa trên dữ liệu có trong tài liệu. Nếu tài liệu không nói, "
-        "hãy khẳng định là không có thông tin. Tuyệt đối không suy diễn ngoài văn bản.\n"
-        "2. ĐỘ CHI TIẾT: Khi giải thích một khái niệm hoặc trả lời câu hỏi, hãy trình bày đầy đủ "
-        "các khía cạnh liên quan có trong tài liệu (nguyên nhân, diễn biến, kết quả, các con số thống kê...).\n"
-        "3. XỬ LÝ DANH SÁCH: Hiểu các ký hiệu đánh số (1, 2, 3...) hoặc ký tự (a, b, c...) là thứ tự "
-        "ưu tiên hoặc thứ tự xuất hiện (ví dụ: \"1.\" tương ứng với \"Thứ nhất\").\n"
-        "4. TRÍCH DẪN: BẮT BUỘC chèn thẻ [Chunk ID] ngay sau mỗi thông tin cụ thể được trích lục.\n\n"
-        
-        "--- CẤU TRÚC PHẢN HỒI ---\n"
-        "Mọi phản hồi phải tuân thủ cấu trúc sau:\n\n"
-        "<think>\n"
-        "- Bước 1: Xác định các thực thể chính và mục tiêu tìm kiếm trong câu hỏi.\n"
-        "- Bước 2: Lọc ra các Chunk chứa thông tin trực tiếp. Loại bỏ các Chunk nhiễu (chỉ chứa từ khóa nhưng không chứa nội dung trả lời).\n"
-        "- Bước 3: Nếu câu hỏi yêu cầu giải thích chi tiết, hãy liên kết dữ liệu từ nhiều Chunk để xây dựng một bức tranh toàn cảnh.\n"
-        "- Bước 4: Kiểm chứng lại: \"Thông tin này có thực sự nằm trong văn bản không?\"\n"
-        "</think>\n\n"
-        
-        "--- CÂU TRẢ LỜI (Trình bày chuyên nghiệp) ---\n"
-        "Sử dụng đại từ \"mình\" và \"bạn\". Trình bày theo phong cách phân tích chuyên sâu:\n"
-        "- Nếu là câu hỏi tra cứu: Đi thẳng vào nội dung chính, sau đó mở rộng bằng các chi tiết bổ trợ "
-        "có trong tài liệu để làm rõ vấn đề.\n"
-        "- Nếu có danh sách: Hãy liệt kê đầy đủ và giải thích từng mục dựa trên nội dung tài liệu.\n"
-        "- Định dạng: Sử dụng các thẻ tiêu đề (###), in đậm (**) các từ khóa quan trọng để dễ theo dõi.\n\n"
-        
-        "--- DỮ LIỆU ĐẦU VÀO ---\n"
-        f"LỊCH SỬ TRÒ CHUYỆN:\n{history_block or 'Trống.'}\n\n"
-        f"TÀI LIỆU HỖ TRỢ:\n{context_block}\n\n"
-        f"CÂU HỎI CỦA NGƯỜI DÙNG: {question}\n\n"
-        
-        "Trả lời:"
+    system_content = (
+        "Bạn là ViettelRAG - trợ lý tra cứu tài liệu chuyên nghiệp của Viettel.\n\n"
+
+        "QUY TẮC TRẢ LỜI:\n\n"
+
+        "1. TRÍCH DẪN NGUỒN (BẮT BUỘC):\n"
+        "   Sau mỗi câu có thông tin từ tài liệu, chèn [Chunk N] ngay sau câu đó.\n"
+        "   Ví dụ đúng: Viettel thành lập năm 1989 [Chunk 3]. Doanh thu đạt 50 tỷ USD [Chunk 7].\n"
+        "   Nếu không có thông tin cụ thể từ tài liệu cho một ý, bỏ qua trích dẫn — KHÔNG viết bất kỳ nội dung ngoặc vuông nào.\n\n"
+
+        "2. ĐÚNG TRỌNG TÂM:\n"
+        "   Chỉ trả lời về đúng điều được hỏi.\n"
+        "   - Hỏi về mục cụ thể (thứ nhất, loại X...) → chỉ nói về mục đó.\n"
+        "   - Hỏi liệt kê/tổng hợp → mới liệt kê đầy đủ.\n\n"
+
+        "3. CHI TIẾT: Khai thác đầy đủ thông tin (định nghĩa, giải thích, ví dụ, số liệu).\n\n"
+
+        "4. ĐỊNH DẠNG: Dùng ### tiêu đề, **in đậm** từ khóa, danh sách -.\n"
+        "   Đi thẳng vào nội dung, không thêm tiêu đề dẫn nhập thừa.\n"
+        "   Dùng 'mình' và 'bạn'."
     )
+
+    user_content = (
+        "=== TÀI LIỆU THAM KHẢO ===\n"
+        f"{context_block}\n\n"
+        "=== LỊCH SỬ TRÒ CHUYỆN ===\n"
+        f"{history_block or 'Chưa có.'}\n\n"
+        "=== CÂU HỎI ===\n"
+        f"{question}\n\n"
+        "Phân tích và trả lời theo định dạng sau:\n"
+        "<think>\n"
+        "Câu hỏi hỏi về: [xác định đúng đối tượng]\n"
+        "Chunks liên quan nhất: [liệt kê số chunk có thông tin trực tiếp]\n"
+        "Kế hoạch: [nêu ngắn gọn sẽ trình bày gì]\n"
+        "</think>\n\n"
+        "[Câu trả lời đầy đủ với [Chunk N] sau mỗi thông tin]"
+    )
+
+    return [
+        SystemMessage(content=system_content),
+        HumanMessage(content=user_content),
+    ]
 
 
 def generate_answer(
@@ -142,7 +152,7 @@ def generate_answer(
         event_prefix="generate_answer_build_prompt",
         details={"history_count": len(history_messages), "context_doc_count": len(context_docs)},
     ):
-        prompt = _build_generation_prompt(question, context_docs, history_messages)
+        messages = _build_messages(question, context_docs, history_messages)
 
     with _timed_query_step(
         "invoke_chat_llm",
@@ -152,20 +162,17 @@ def generate_answer(
             "context_doc_count": len(context_docs),
         },
     ):
-        response = llm.invoke(prompt)
-    if hasattr(response, "content"):
-        return str(response.content)
-    return str(response)
+        response = llm.invoke(messages)
 
+    return str(response.content) if hasattr(response, "content") else str(response)
 
-from typing import Iterator
 
 def generate_answer_stream(
     question: str,
     context_docs: list[Document],
     history_messages: list[ChatMessage],
 ) -> Iterator[str]:
-    """Generate answer from question, retrieval context, and chat history as a stream."""
+    """Generate answer as a stream."""
 
     with _timed_query_step("load_chat_llm", event_prefix="generate_answer_load_llm"):
         llm = get_llm()
@@ -175,17 +182,16 @@ def generate_answer_stream(
         event_prefix="generate_answer_build_prompt",
         details={"history_count": len(history_messages), "context_doc_count": len(context_docs)},
     ):
-        prompt = _build_generation_prompt(question, context_docs, history_messages)
+        messages = _build_messages(question, context_docs, history_messages)
 
     _emit_query_progress(
         "[chat.query] Start stream response: context_doc_count=%d", len(context_docs)
     )
-    for chunk in llm.stream(prompt):
-        if hasattr(chunk, "content"):
-            yield str(chunk.content)
-        else:
-            yield str(chunk)
 
+    for chunk in llm.stream(messages):
+        content = str(chunk.content) if hasattr(chunk, "content") else str(chunk)
+        if content:
+            yield content
 
 
 def parse_sources(raw_json: str | None) -> list[dict[str, int | str | float | dict[str, object] | None]]:
