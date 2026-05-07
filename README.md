@@ -60,12 +60,6 @@ ADMIN_DEFAULT_PASSWORD=Admin@123
 Khởi động toàn bộ hệ thống:
 
 ```powershell
-make up
-```
-
-Nếu không dùng `make`:
-
-```powershell
 docker compose -f infra/docker-compose.yml up -d --build
 ```
 
@@ -78,14 +72,14 @@ docker compose -f infra/docker-compose.yml up -d --build
 Kiểm tra trạng thái:
 
 ```powershell
-make status
-make logs service=api-gateway
+docker compose -f infra/docker-compose.yml ps
+docker compose -f infra/docker-compose.yml logs api-gateway
 ```
 
 Tắt hệ thống:
 
 ```powershell
-make down
+docker compose -f infra/docker-compose.yml down
 ```
 
 ## Cài đặt thủ công cho development

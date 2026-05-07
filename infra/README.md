@@ -8,19 +8,13 @@ RAG platform as a managed set of services.
 From the repository root:
 
 ```bash
-make up
-make down
-make logs
-make logs service=api-gateway
-make restart service=ollama-service
-make status
-make build
-```
-
-Equivalent direct command:
-
-```bash
-docker compose -f infra/docker-compose.yml up -d
+docker compose -f infra/docker-compose.yml up -d --build
+docker compose -f infra/docker-compose.yml down
+docker compose -f infra/docker-compose.yml logs
+docker compose -f infra/docker-compose.yml logs api-gateway
+docker compose -f infra/docker-compose.yml restart ollama-service
+docker compose -f infra/docker-compose.yml ps
+docker compose -f infra/docker-compose.yml build
 ```
 
 ## Public Ports
@@ -56,5 +50,5 @@ code still uses SQLite and FastAPI background tasks.
 Start them only when the application code is wired to use them:
 
 ```bash
-make up-future
+docker compose -f infra/docker-compose.yml --profile future up -d --build
 ```
