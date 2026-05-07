@@ -82,6 +82,30 @@ Tắt hệ thống:
 docker compose -f infra/docker-compose.yml down
 ```
 
+## Chạy local compose (không cần Docker)
+
+Script local-compose cung cấp các lệnh tương đương `up`, `down`, `logs` cho từng service.
+
+Chạy toàn bộ:
+
+```powershell
+./scripts/local-compose.sh up
+```
+
+Dừng toàn bộ:
+
+```powershell
+./scripts/local-compose.sh down
+```
+
+Xem log từng service:
+
+```powershell
+./scripts/local-compose.sh logs api-gateway
+./scripts/local-compose.sh logs retrieval-service
+./scripts/local-compose.sh logs ollama-service
+```
+
 ## Cài đặt thủ công cho development
 
 Tạo env cho từng service:
