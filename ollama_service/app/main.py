@@ -4,8 +4,9 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Response
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[1]
 _REPO_ROOT = _SERVICE_ROOT.parent
@@ -56,6 +57,29 @@ async def health() -> dict[str, Any]:
             "embedding": settings.embedding_model,
         },
     }
+
+
+@app.get("/ready")
+async def ready(response: Response) -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=settings.ollama_connect_timeout_seconds) as client:
+            upstream_response = await client.get(f"{settings.ollama_base_url}/api/tags")
+        if upstream_response.status_code >= 500:
+            response.status_code = 503
+        return {
+            "status": "ok" if upstream_response.status_code < 500 else "degraded",
+            "service": "ollama-service",
+            "upstream": settings.ollama_base_url,
+            "upstream_status_code": upstream_response.status_code,
+        }
+    except Exception as exc:
+        response.status_code = 503
+        return {
+            "status": "degraded",
+            "service": "ollama-service",
+            "upstream": settings.ollama_base_url,
+            "error": str(exc),
+        }
 
 
 @app.get("/v1/models")

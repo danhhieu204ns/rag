@@ -50,7 +50,20 @@ app = FastAPI(title=settings.app_name)
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "service": "ingestion-service",
+        "version": "1.0.0",
+    }
+
+
+@app.get("/ready")
+def ready() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "service": "ingestion-service",
+        "parser_mode": settings.pdf_parser_mode,
+    }
 
 
 @app.post("/v1/parse", response_model=ParseResponse)

@@ -1,0 +1,200 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-python-health-defaults: &python-health-defaults
+  interval: 20s
+  timeout: 10s
+  retries: 5
+  start_period: 30s
+
+services:
+  api-gateway:
+    build:
+      context: ../backend
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      APP_NAME: RAG API Gateway
+      OLLAMA_BASE_URL: http://ollama-service:8020
+      OLLAMA_API_KEY: ${SHIELD_API_KEY:-change-this-key}
+      INGESTION_SERVICE_URL: http://ingestion-service:8100
+      RETRIEVAL_SERVICE_URL: http://retrieval-service:8030
+      QDRANT_URL: http://qdrant:6333
+    ports:
+      - "${API_GATEWAY_PORT:-8000}:8000"
+    volumes:
+      - backend-storage:/app/storage
+    depends_on:
+      ollama-service:
+        condition: service_healthy
+      ingestion-service:
+        condition: service_healthy
+      retrieval-service:
+        condition: service_healthy
+    healthcheck:
+      <<: *python-health-defaults
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5)"
+    logging: *default-logging
+
+  frontend:
+    build:
+      context: ../frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE_URL: http://localhost:${API_GATEWAY_PORT:-8000}/api
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    healthcheck:
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+    logging: *default-logging
+
+  ollama-service:
+    build:
+      context: ../ollama_service
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      UPSTREAM_OLLAMA_BASE_URL: http://ollama:11434
+      SHIELD_API_KEY: ${SHIELD_API_KEY:-change-this-key}
+    expose:
+      - "8020"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      <<: *python-health-defaults
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/ready', timeout=5)"
+    logging: *default-logging
+
+  retrieval-service:
+    build:
+      context: ../retrieval_service
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      OLLAMA_SERVICE_URL: http://ollama-service:8020
+      OLLAMA_API_KEY: ${SHIELD_API_KEY:-change-this-key}
+      QDRANT_URL: http://qdrant:6333
+      RETRIEVAL_DATABASE_PATH: /backend-storage/app.db
+    expose:
+      - "8030"
+    volumes:
+      - backend-storage:/backend-storage
+    depends_on:
+      ollama-service:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      <<: *python-health-defaults
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8030/ready', timeout=5)"
+    logging: *default-logging
+
+  ingestion-service:
+    build:
+      context: ../ingestion_service
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    expose:
+      - "8100"
+    volumes:
+      - ingestion-storage:/app/storage
+    healthcheck:
+      <<: *python-health-defaults
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/ready', timeout=5)"
+    logging: *default-logging
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.0
+    restart: unless-stopped
+    expose:
+      - "6333"
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    logging: *default-logging
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    expose:
+      - "11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+      test:
+        - CMD
+        - ollama
+        - list
+    logging: *default-logging
+
+  postgres:
+    image: postgres:16
+    profiles:
+      - future
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-password}
+    expose:
+      - "5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    logging: *default-logging
+
+  redis:
+    image: redis:7
+    profiles:
+      - future
+    restart: unless-stopped
+    expose:
+      - "6379"
+    volumes:
+      - redis-data:/data
+    logging: *default-logging
+
+volumes:
+  backend-storage:
+  ingestion-storage:
+  qdrant-storage:
+  ollama-data:
+  postgres-data:
+  redis-data:

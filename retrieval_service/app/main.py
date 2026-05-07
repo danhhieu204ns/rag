@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[1]
 _REPO_ROOT = _SERVICE_ROOT.parent
@@ -57,6 +58,60 @@ def health() -> dict[str, Any]:
         "qdrant_error": qdrant_error,
         "ollama_service_url": settings.ollama_service_url,
     }
+
+
+@app.get("/ready")
+def ready(response: Response) -> dict[str, Any]:
+    qdrant = _qdrant_ready()
+    ollama = _ollama_ready()
+    status = "ok" if qdrant["ready"] and ollama["ready"] else "degraded"
+    if status != "ok":
+        response.status_code = 503
+    return {
+        "status": status,
+        "service": "retrieval-service",
+        "checks": {
+            "qdrant": qdrant,
+            "ollama_service": ollama,
+        },
+    }
+
+
+def _qdrant_ready() -> dict[str, Any]:
+    try:
+        active_collection = collection_name()
+        return {
+            "ready": True,
+            "collection": active_collection,
+            "collection_exists": collection_exists(active_collection),
+            "url": settings.qdrant_url or str(settings.qdrant_path),
+        }
+    except Exception as exc:
+        return {
+            "ready": False,
+            "url": settings.qdrant_url or str(settings.qdrant_path),
+            "error": str(exc),
+        }
+
+
+def _ollama_ready() -> dict[str, Any]:
+    headers = {"x-api-key": settings.ollama_api_key} if settings.ollama_api_key else {}
+    try:
+        with httpx.Client(timeout=10.0, headers=headers) as client:
+            response = client.get(f"{settings.ollama_service_url}/ready")
+            if response.status_code == 404:
+                response = client.get(f"{settings.ollama_service_url}/health")
+        return {
+            "ready": response.status_code < 500,
+            "status_code": response.status_code,
+            "url": settings.ollama_service_url,
+        }
+    except Exception as exc:
+        return {
+            "ready": False,
+            "url": settings.ollama_service_url,
+            "error": str(exc),
+        }
 
 
 @app.post("/v1/retrieve", response_model=RetrieveResponse)
