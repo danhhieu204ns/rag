@@ -1041,21 +1041,6 @@ def process_document(
     )
 
 
-@router.post(
-    "/{document_id}/embed",
-    response_model=EmbedDocumentResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-def embed_document(
-    document_id: int,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    _: AdminUser = Depends(require_admin),
-) -> EmbedDocumentResponse:
-    """Alias for /process for backward compatibility."""
-    return process_document(document_id, background_tasks, db, _)
-
-
 @router.get("", response_model=list[DocumentRead])
 def list_documents(
     db: Session = Depends(get_db),
@@ -1275,6 +1260,8 @@ def parse_document(
         markdown, source_parser, source_type = parse_source_to_markdown(file_path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     if not markdown.strip():
         raise HTTPException(status_code=422, detail="Parsed markdown is empty.")

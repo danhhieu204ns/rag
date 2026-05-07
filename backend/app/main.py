@@ -1,8 +1,12 @@
 from __future__ import annotations
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+_BACKEND_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = _BACKEND_ROOT.parent
+load_dotenv(_REPO_ROOT / ".env", override=False)
+load_dotenv(_BACKEND_ROOT / ".env", override=True)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

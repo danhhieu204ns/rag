@@ -19,6 +19,8 @@
 - Qdrant as vector store backend (local mode by default, remote mode optional)
 - Chat query endpoint with persistent chat memory
 - Remote Indexing: Offloads metadata, summary, and HyQ generation to a remote Shield API.
+- Remote Ingestion: Offloads document parse/split to `ingestion_service` when `INGESTION_SERVICE_URL` is configured.
+- Ollama Shield: Backend calls `ollama_service` instead of exposing raw Ollama directly.
 
 ## Auth Model
 
@@ -32,6 +34,7 @@ Install dependencies:
 ```bash
 cd backend
 pip install -r requirements.txt
+cp .env.example .env
 ```
 
 Run server:
@@ -39,6 +42,14 @@ Run server:
 ```bash
 cd backend
 uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Run Ollama shield service:
+
+```bash
+cd ollama_service
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8200
 ```
 
 Run ingestion service (separate process):
@@ -49,11 +60,31 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8100
 ```
 
+Set backend client config in `backend/.env` before starting backend:
+
+```env
+OLLAMA_BASE_URL=http://localhost:8200
+OLLAMA_API_KEY=change-this-key
+OLLAMA_CHAT_MODEL=default
+OLLAMA_EMBEDDING_MODEL=default
+INGESTION_SERVICE_URL=http://localhost:8100
+```
+
 ## Environment
 
 ### Required
-- `OLLAMA_BASE_URL`: URL to the remote Ollama Shield API.
+- `OLLAMA_BASE_URL`: URL to the remote Ollama Shield API, example `http://localhost:8200`.
 - `OLLAMA_API_KEY`: API key for X-API-KEY authentication.
+- `OLLAMA_CHAT_MODEL`: Can be `default` when using `ollama_service`; service overrides the real model via `CHAT_MODEL`.
+- `OLLAMA_EMBEDDING_MODEL`: Can be `default` when using `ollama_service`; service overrides the real model via `EMBEDDING_MODEL`.
+
+### Ollama Shield Service (`ollama_service/.env`)
+- `SHIELD_API_KEY`: Must match backend `OLLAMA_API_KEY`.
+- `UPSTREAM_OLLAMA_BASE_URL`: Real Ollama server behind the shield, example `http://127.0.0.1:11434`.
+- `CHAT_MODEL`: Real chat model served by Ollama.
+- `INDEXING_MODEL`: Real model for metadata/HyQ indexing endpoints.
+- `EMBEDDING_MODEL`: Real embedding model served by Ollama.
+- `RATE_LIMIT_PER_MINUTE`: Per-key, per-route rate limit.
 
 ### Core Settings
 - `APP_NAME`: Backend application name.
@@ -78,13 +109,24 @@ If `QDRANT_URL` is empty, backend uses local embedded Qdrant persisted at:
 
 - `backend/storage/indexes/global_qdrant/`
 
-If `PDF_PARSER_MODE=marker`, install Marker in backend venv:
+If `PDF_PARSER_MODE=marker` and `INGESTION_SERVICE_URL` is set, install Marker in the ingestion service venv:
 
 ```bash
+cd ingestion_service
 pip install marker-pdf
 ```
 
-When using `PDF_PARSER_MODE=marker`, parsed markdown is also logged to:
+If `INGESTION_SERVICE_URL` is empty, backend falls back to local parsing and parser dependencies must be available in the backend venv.
+
+When using remote ingestion, parsed markdown is cached by backend at:
+
+- `backend/storage/parsed_markdown/<document_id>.md`
+
+Marker/debug markdown logs are written by the process that performs parsing. With remote ingestion this is usually:
+
+- `ingestion_service/storage/markdown_logs/marker/<uploaded_file_stem>.md`
+
+With backend local parsing this is:
 
 - `backend/storage/markdown_logs/marker/<uploaded_file_stem>.md`
 
@@ -93,6 +135,7 @@ This file is regenerated on each embed so you can quickly inspect parsing output
 ## Async Indexing Behavior
 
 - `POST /api/documents/{document_id}/embed` now queues background indexing and returns `202 Accepted` immediately.
+- `POST /api/documents/{document_id}/process` runs parse-if-needed + indexing in one background job and is the preferred UI path.
 - `POST /api/documents/reindex` now queues pending documents in background instead of blocking request time.
 - Document `status` transitions: `uploaded` -> `indexing` -> `embedded` (or `index_failed` when background task fails).
 - Qdrant upsert is executed with async write mode (`wait=false`) for faster ingestion throughput.

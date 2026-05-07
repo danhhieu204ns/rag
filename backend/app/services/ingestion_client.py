@@ -7,11 +7,6 @@ import httpx
 from langchain_core.documents import Document
 
 from ..core.settings import settings
-from .document_processing import (
-    load_documents_from_parsed_markdown as _local_load_documents_from_parsed_markdown,
-)
-from .document_processing import parse_source_to_markdown as _local_parse_source_to_markdown
-from .document_processing import split_source_documents as _local_split_source_documents
 
 
 def _service_enabled() -> bool:
@@ -22,16 +17,37 @@ def _service_url(path: str) -> str:
     return f"{settings.ingestion_service_url}{path}"
 
 
+def _raise_service_error(response: httpx.Response) -> None:
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    message = str(detail or response.text or response.reason_phrase).strip()
+    raise RuntimeError(
+        f"Ingestion service returned HTTP {response.status_code}: {message}"
+    )
+
+
 def parse_source_to_markdown(file_path: Path) -> tuple[str, str, str]:
     if not _service_enabled():
+        from .document_processing import parse_source_to_markdown as _local_parse_source_to_markdown
+
         return _local_parse_source_to_markdown(file_path)
 
-    with file_path.open("rb") as source:
-        files = {"file": (file_path.name, source, "application/octet-stream")}
-        with httpx.Client(timeout=settings.ingestion_timeout_seconds) as client:
-            response = client.post(_service_url("/v1/parse"), files=files)
+    try:
+        with file_path.open("rb") as source:
+            files = {"file": (file_path.name, source, "application/octet-stream")}
+            with httpx.Client(timeout=settings.ingestion_timeout_seconds) as client:
+                response = client.post(_service_url("/v1/parse"), files=files)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError("Ingestion service request timed out while parsing document.") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"Failed to connect to ingestion service: {exc}") from exc
 
-    response.raise_for_status()
+    if response.status_code >= 400:
+        _raise_service_error(response)
     payload = response.json()
     return (
         str(payload.get("markdown") or "").strip(),
@@ -48,6 +64,10 @@ def load_documents_from_parsed_markdown(
     source_type: str,
 ) -> list[Document]:
     if not _service_enabled():
+        from .document_processing import (
+            load_documents_from_parsed_markdown as _local_load_documents_from_parsed_markdown,
+        )
+
         return _local_load_documents_from_parsed_markdown(
             markdown_path,
             source_file_path=source_file_path,
@@ -66,6 +86,7 @@ def load_documents_from_parsed_markdown(
                 "source": str(source_file_path),
                 "source_parser": source_parser.strip().lower() or "legacy",
                 "source_type": source_type.strip().lower() or "text",
+                "source_page": 1,
             },
         )
     ]
@@ -77,6 +98,8 @@ def split_source_documents(
     chunk_overlap: int,
 ) -> list[Document]:
     if not _service_enabled():
+        from .document_processing import split_source_documents as _local_split_source_documents
+
         return _local_split_source_documents(
             documents,
             chunk_size,
@@ -100,9 +123,16 @@ def split_source_documents(
         "chunk_overlap": int(chunk_overlap),
     }
 
-    with httpx.Client(timeout=settings.ingestion_timeout_seconds) as client:
-        response = client.post(_service_url("/v1/split"), json=payload)
-    response.raise_for_status()
+    try:
+        with httpx.Client(timeout=settings.ingestion_timeout_seconds) as client:
+            response = client.post(_service_url("/v1/split"), json=payload)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError("Ingestion service request timed out while splitting markdown.") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"Failed to connect to ingestion service: {exc}") from exc
+
+    if response.status_code >= 400:
+        _raise_service_error(response)
 
     result = response.json()
     chunks = result.get("chunks") or []

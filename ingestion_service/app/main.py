@@ -4,8 +4,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+
+_SERVICE_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = _SERVICE_ROOT.parent
+load_dotenv(_REPO_ROOT / ".env", override=False)
+load_dotenv(_SERVICE_ROOT / ".env", override=True)
 
 from .core.settings import settings
 from .services.document_processing import (
@@ -56,6 +62,8 @@ async def parse(file: UploadFile = File(...)) -> ParseResponse:
     with TemporaryDirectory(prefix="ingestion_upload_") as tmp_dir:
         temp_path = Path(tmp_dir) / (file.filename or "uploaded.bin")
         payload = await file.read()
+        if not payload:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
         temp_path.write_bytes(payload)
 
         try:
@@ -76,17 +84,20 @@ def split(request: SplitRequest) -> SplitResponse:
         markdown_path = Path(tmp_dir) / "parsed.md"
         markdown_path.write_text(request.markdown.strip(), encoding="utf-8")
 
-        loaded = load_documents_from_parsed_markdown(
-            markdown_path,
-            source_file_path=Path(request.source_file_path),
-            source_parser=request.source_parser,
-            source_type=request.source_type,
-        )
-        chunks = split_source_documents(
-            loaded,
-            chunk_size=request.chunk_size,
-            chunk_overlap=request.chunk_overlap,
-        )
+        try:
+            loaded = load_documents_from_parsed_markdown(
+                markdown_path,
+                source_file_path=Path(request.source_file_path),
+                source_parser=request.source_parser,
+                source_type=request.source_type,
+            )
+            chunks = split_source_documents(
+                loaded,
+                chunk_size=request.chunk_size,
+                chunk_overlap=request.chunk_overlap,
+            )
+        except Exception as exc:  # pragma: no cover
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return SplitResponse(
         chunks=[
