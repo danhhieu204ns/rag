@@ -112,7 +112,8 @@ def _build_messages(
 
         "4. ĐỊNH DẠNG: Dùng ### tiêu đề, **in đậm** từ khóa, danh sách -.\n"
         "   Đi thẳng vào nội dung, không thêm tiêu đề dẫn nhập thừa.\n"
-        "   Dùng 'mình' và 'bạn'."
+        "   Dùng 'mình' và 'bạn'.\n"
+        "   Nếu toàn bộ nội dung có thể kết luận thành ý chính, hãy tóm tắt ý chính đó ở cuối phần trả lời (sau khi đã trình bày chi tiết), chỉ cần có nhiều nhất 1 kết luận ngắn gọn, rõ ràng, và chính xác về nội dung đã trình bày, KHÔNG thêm bất kỳ lời dẫn nhập nào cho phần kết luận này.\n\n"
     )
 
     user_content = (

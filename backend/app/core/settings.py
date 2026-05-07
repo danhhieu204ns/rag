@@ -67,6 +67,8 @@ class Settings:
     # Query Rewriting
     query_rewrite_model: str
     query_rewrite_min_words: int
+    # Orchestrator
+    orchestrator_enabled: bool
     # Auth
     secret_key: str
     access_token_expire_minutes: int
@@ -198,6 +200,7 @@ def get_settings() -> Settings:
         reranker_candidate_pool=_int_env("RERANKER_CANDIDATE_POOL", 20),
         query_rewrite_model=_string_env("QUERY_REWRITE_MODEL", ""),
         query_rewrite_min_words=max(1, _int_env("QUERY_REWRITE_MIN_WORDS", 5)),
+        orchestrator_enabled=_bool_env("ORCHESTRATOR_ENABLED", True),
         secret_key=os.getenv("SECRET_KEY", "change-this-secret-key-in-production"),
         access_token_expire_minutes=_int_env("ACCESS_TOKEN_EXPIRE_MINUTES", 1440),
         admin_default_username=os.getenv("ADMIN_DEFAULT_USERNAME", "admin"),

@@ -82,6 +82,11 @@ class QueryLog:
         self._lock = threading.Lock()
         self._trace_id = ""
 
+        # --- Orchestrator phase ---
+        self._orchestrator: dict[str, Any] = {}           # orchestrator_plan (initial)
+        self._orchestrator_ms: float = 0.0                # elapsed_ms từ classify_query
+        self._orchestrator_retries: list[dict[str, Any]] = []  # orchestrator_retry events
+
         # --- Retrieval phase ---
         self._rewrite: dict[str, Any] = {}
         self._rewrite_ms: float = 0.0             # từ query_rewrite_success.elapsed_ms
@@ -117,7 +122,16 @@ class QueryLog:
             if not details:
                 return
 
-            if event in ("query_rewrite_success", "query_rewrite_skip", "query_rewrite_done"):
+            if event == "orchestrator_plan":
+                # Ghi lần đầu (initial plan). Lần retry thì _orchestrator_retries xử lý.
+                if not self._orchestrator:
+                    self._orchestrator = details
+                    self._orchestrator_ms = float(details.get("elapsed_ms", 0.0))
+
+            elif event == "orchestrator_retry":
+                self._orchestrator_retries.append(details)
+
+            elif event in ("query_rewrite_success", "query_rewrite_skip", "query_rewrite_done"):
                 # Merge mọi rewrite event để giữ fields từ cả 3 event
                 # (success có original_query_preview + elapsed_ms, done có rewritten + effective_query_preview)
                 self._rewrite = {**self._rewrite, **details}
@@ -243,7 +257,41 @@ class QueryLog:
         else:
             kv("  Trạng thái", "no data")
 
-        # 1b. Semantic Search
+        # 1b. Orchestrator
+        orch_ms = self._orchestrator_ms
+        orch_ms_str = f"  [{orch_ms:.2f}ms]" if orch_ms > 0 else ""
+        lines.append(f"\n▶ ORCHESTRATOR{orch_ms_str}")
+        od = self._orchestrator
+        if od:
+            from .settings import settings as _s
+            kv("  Query type", od.get("query_type", "?"))
+            kv("  Strategy", od.get("strategy", "?"))
+            kv("  Top-K (plan)", od.get("top_k", "?"))
+            v_w = od.get("vector_rrf_weight", "?")
+            k_w = od.get("keyword_rrf_weight", "?")
+            v_def = _s.hybrid_vector_rrf_weight
+            k_def = _s.hybrid_keyword_rrf_weight
+            v_mark = "  ← tuned" if isinstance(v_w, float) and abs(v_w - v_def) > 0.05 else ""
+            k_mark = "  ← tuned" if isinstance(k_w, float) and abs(k_w - k_def) > 0.05 else ""
+            kv("  Vector RRF weight", f"{v_w}{v_mark}")
+            kv("  Keyword RRF weight", f"{k_w}{k_mark}")
+            kv("  Reranker", "on" if od.get("use_reranker") else "off")
+            kv("  Candidate pool", od.get("candidate_pool", "?"))
+            kv("  Max iterations", od.get("max_iterations", 1))
+            kv("  Signals", ", ".join(od.get("signals", [])) or "-")
+            if self._orchestrator_retries:
+                for i, retry in enumerate(self._orchestrator_retries, start=2):
+                    prev_n = retry.get("prev_result_count", "?")
+                    new_plan = retry.get("new_plan") or {}
+                    lines.append(f"  ⚑ Retry #{i}: results thin "
+                                 f"({prev_n} chunks) → broader search")
+                    kv("    Strategy", new_plan.get("strategy", "?"))
+                    kv("    Vector weight", new_plan.get("vector_rrf_weight", "?"))
+                    kv("    Keyword weight", new_plan.get("keyword_rrf_weight", "?"))
+        else:
+            kv("  Trạng thái", "disabled (ORCHESTRATOR_ENABLED=false)")
+
+        # 1c. Semantic Search
         sem_ms = self._timing.get("semantic_candidates", 0.0)
         lines.append(f"\n▶ SEMANTIC SEARCH (vector)  [{sem_ms:.1f}ms]")
 
@@ -395,6 +443,10 @@ class QueryLog:
         # ── TIMING SUMMARY ───────────────────────────────────────────────
         section("TIMING SUMMARY")
         lines.append("")
+        if self._orchestrator_ms > 0:
+            retry_count = len(self._orchestrator_retries)
+            retry_note = f"  (+{retry_count} retry)" if retry_count else ""
+            kv("Orchestrator classify", f"{self._orchestrator_ms:.2f}ms{retry_note}", indent=2)
         if rewrite_ms > 0:
             kv("Query rewrite", f"{rewrite_ms:.1f}ms", indent=2)
         kv("Semantic search", f"{sem_ms_v:.1f}ms", indent=2)
@@ -403,7 +455,8 @@ class QueryLog:
         kv("RRF merge", f"{rrf_ms:.2f}ms", indent=2)
         kv("Reranking", f"{rerank_ms:.1f}ms", indent=2)
         lines.append("  " + "-" * 44)
-        kv("Retrieval tổng", f"{retrieval_total:.1f}ms", indent=2)
+        retrieval_total_with_orch = retrieval_total + self._orchestrator_ms
+        kv("Retrieval tổng", f"{retrieval_total_with_orch:.1f}ms", indent=2)
         kv("Generation", f"{self._gen_elapsed_ms:.1f}ms", indent=2)
         lines.append("  " + "=" * 44)
         kv("TỔNG (end-to-end)", f"{total_ms:.1f}ms", indent=2)
