@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 def _emit_progress(message: str, *args: object) -> None:
     text = message % args if args else message
+    logger.info(text)
     get_request_logger().info(text)
 
 
@@ -813,8 +814,12 @@ def _run_full_indexing_job(
     document_id: int,
 ) -> None:
     """Unified background task: Parse (if needed) + Chunking + Metadata + Vectors."""
+    logger.info("[process_document] Background indexing job started for document_id=%s", document_id)
     with request_logging_context("index", doc=document_id) as log:
-        _do_full_indexing_job(document_id=document_id, log=log)
+        try:
+            _do_full_indexing_job(document_id=document_id, log=log)
+        finally:
+            logger.info("[process_document] Background indexing job finished for document_id=%s", document_id)
 
 
 def _do_full_indexing_job(
@@ -1031,6 +1036,7 @@ def process_document(
     if document.status == "indexing":
         raise HTTPException(status_code=409, detail="Document is already indexing.")
 
+    logger.info("[process_document] Queueing background indexing for document_id=%s status=%s", document_id, document.status)
     background_tasks.add_task(_run_full_indexing_job, document_id)
     _emit_progress("[process_document] Queued background indexing for document_id=%s", document_id)
 

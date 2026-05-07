@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,9 @@ from .schemas import (
     OllamaNativeEmbeddingsRequest,
     OllamaNativeGenerateRequest,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 app = FastAPI(
@@ -147,11 +151,19 @@ async def indexing(req: IndexingRequest, api_key: str = Depends(verify_api_key))
     enforce_rate_limit(api_key, "indexing")
     validate_text_length(req.text, settings.max_indexing_chars, "text")
 
+    logger.info(
+        "[ollama-service] /v1/indexing text_chars=%d instruction_chars=%d model=%s",
+        len(req.text),
+        len(req.instruction or INDEXING_INSTRUCTION),
+        settings.indexing_model,
+    )
+
     ollama_result = await _call_indexing_model(
         text=req.text,
         instruction=req.instruction or INDEXING_INSTRUCTION,
         options=req.options or {},
     )
+    logger.info("[ollama-service] /v1/indexing done")
     return _indexing_response_from_ollama(ollama_result)
 
 
@@ -175,6 +187,14 @@ async def indexing_batch(req: IndexingBatchRequest, api_key: str = Depends(verif
     options = req.options or {}
     semaphore = asyncio.Semaphore(settings.indexing_concurrency)
 
+    logger.info(
+        "[ollama-service] /v1/indexing/batch items=%d instruction_chars=%d model=%s concurrency=%d",
+        len(req.texts),
+        len(instruction),
+        settings.indexing_model,
+        settings.indexing_concurrency,
+    )
+
     async def call_one(index: int, text: str) -> tuple[int, dict[str, Any]]:
         async with semaphore:
             try:
@@ -192,6 +212,13 @@ async def indexing_batch(req: IndexingBatchRequest, api_key: str = Depends(verif
     for task in asyncio.as_completed(tasks):
         index, item = await task
         results[index] = item
+
+    error_count = sum(1 for item in results if isinstance(item, dict) and item.get("error"))
+    logger.info(
+        "[ollama-service] /v1/indexing/batch done items=%d errors=%d",
+        len(results),
+        error_count,
+    )
 
     return {"items": results}
 
@@ -331,6 +358,12 @@ async def _call_indexing_model(
     options: dict[str, Any],
 ) -> dict[str, Any]:
     prompt = build_indexing_prompt(instruction=instruction, text=text)
+    logger.info(
+        "[ollama-service] call indexing model=%s prompt_chars=%d text_chars=%d",
+        settings.indexing_model,
+        len(prompt),
+        len(text),
+    )
     payload: dict[str, Any] = {
         "model": settings.indexing_model,
         "prompt": prompt,

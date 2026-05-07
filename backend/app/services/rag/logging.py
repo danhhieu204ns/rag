@@ -116,7 +116,10 @@ def _emit_query_progress(
     if trace_id and trace_id != "-":
         text = f"[trace={trace_id}] {raw_text}{time_info}"
 
-    # Ghi vào per-request file logger (không ra terminal)
+    # Ghi ra terminal/app logger để debug realtime
+    logger.info(text)
+
+    # Ghi vào per-request file logger
     get_request_logger().info(text)
 
     # Hook vào QueryLog nếu đang trong context chat query
@@ -176,5 +179,8 @@ def _timed_query_step(
 
 def _emit_reindex_progress(message: str, *args: object) -> None:
     text = message % args if args else message
-    # Ghi vào per-request file logger (không ra terminal)
+    # Ghi ra terminal/app logger để debug realtime
+    logger.info(text)
+
+    # Ghi vào per-request file logger
     get_request_logger().info(text)

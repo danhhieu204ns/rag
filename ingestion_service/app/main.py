@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+import logging
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -19,6 +20,9 @@ from .services.document_processing import (
     parse_source_to_markdown,
     split_source_documents,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class SplitRequest(BaseModel):
@@ -69,6 +73,7 @@ def ready() -> dict[str, str]:
 @app.post("/v1/parse", response_model=ParseResponse)
 async def parse(file: UploadFile = File(...)) -> ParseResponse:
     suffix = Path(file.filename or "").suffix.lower()
+    logger.info("[ingestion] /v1/parse filename=%s suffix=%s", file.filename, suffix)
     if suffix not in {".pdf", ".txt", ".md"}:
         raise HTTPException(status_code=400, detail=f"Unsupported file extension: {suffix}")
 
@@ -82,8 +87,16 @@ async def parse(file: UploadFile = File(...)) -> ParseResponse:
         try:
             markdown, source_parser, source_type = parse_source_to_markdown(temp_path)
         except Exception as exc:  # pragma: no cover
+            logger.exception("[ingestion] /v1/parse failed filename=%s", file.filename)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    logger.info(
+        "[ingestion] /v1/parse done filename=%s parser=%s type=%s markdown_chars=%d",
+        file.filename,
+        source_parser,
+        source_type,
+        len(markdown),
+    )
     return ParseResponse(
         markdown=markdown,
         source_parser=source_parser,
@@ -93,6 +106,15 @@ async def parse(file: UploadFile = File(...)) -> ParseResponse:
 
 @app.post("/v1/split", response_model=SplitResponse)
 def split(request: SplitRequest) -> SplitResponse:
+    logger.info(
+        "[ingestion] /v1/split source=%s parser=%s type=%s chars=%d chunk_size=%d overlap=%d",
+        request.source_file_path,
+        request.source_parser,
+        request.source_type,
+        len(request.markdown),
+        request.chunk_size,
+        request.chunk_overlap,
+    )
     with TemporaryDirectory(prefix="ingestion_markdown_") as tmp_dir:
         markdown_path = Path(tmp_dir) / "parsed.md"
         markdown_path.write_text(request.markdown.strip(), encoding="utf-8")
@@ -110,8 +132,10 @@ def split(request: SplitRequest) -> SplitResponse:
                 chunk_overlap=request.chunk_overlap,
             )
         except Exception as exc:  # pragma: no cover
+            logger.exception("[ingestion] /v1/split failed source=%s", request.source_file_path)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    logger.info("[ingestion] /v1/split done source=%s chunks=%d", request.source_file_path, len(chunks))
     return SplitResponse(
         chunks=[
             ChunkPayload(page_content=item.page_content, metadata=dict(item.metadata or {}))

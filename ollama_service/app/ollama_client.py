@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -8,6 +9,9 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 
 from .core.settings import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 def model_dump(obj: BaseModel) -> dict[str, Any]:
@@ -66,36 +70,66 @@ def _timeout(total_seconds: float) -> httpx.Timeout:
 async def post_ollama(path: str, payload: dict[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=_timeout(timeout_seconds)) as client:
         try:
+            logger.info(
+                "[ollama-service] -> upstream POST %s base_url=%s timeout=%.1fs",
+                path,
+                settings.ollama_base_url,
+                timeout_seconds,
+            )
             response = await client.post(f"{settings.ollama_base_url}{path}", json=payload)
         except httpx.TimeoutException as exc:
+            logger.error("[ollama-service] upstream timeout POST %s: %s", path, exc)
             raise HTTPException(status_code=504, detail=f"Ollama timeout khi gọi {path}.") from exc
         except httpx.RequestError as exc:
+            logger.error("[ollama-service] upstream request error POST %s: %s", path, exc)
             raise HTTPException(status_code=502, detail=f"Không kết nối được Ollama: {exc}") from exc
 
     if response.status_code >= 400:
+        logger.error(
+            "[ollama-service] upstream returned HTTP %s for POST %s",
+            response.status_code,
+            path,
+        )
         raise HTTPException(status_code=response.status_code, detail=response.text)
 
     try:
+        logger.info("[ollama-service] upstream POST %s ok status=%s", path, response.status_code)
         return response.json()
     except ValueError as exc:
+        logger.error("[ollama-service] upstream JSON decode failed POST %s", path)
         raise HTTPException(status_code=502, detail=f"Ollama trả response không phải JSON từ {path}.") from exc
 
 
 async def get_ollama(path: str, *, timeout_seconds: float) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=_timeout(timeout_seconds)) as client:
         try:
+            logger.info(
+                "[ollama-service] -> upstream GET %s base_url=%s timeout=%.1fs",
+                path,
+                settings.ollama_base_url,
+                timeout_seconds,
+            )
             response = await client.get(f"{settings.ollama_base_url}{path}")
         except httpx.TimeoutException as exc:
+            logger.error("[ollama-service] upstream timeout GET %s: %s", path, exc)
             raise HTTPException(status_code=504, detail=f"Ollama timeout khi gọi {path}.") from exc
         except httpx.RequestError as exc:
+            logger.error("[ollama-service] upstream request error GET %s: %s", path, exc)
             raise HTTPException(status_code=502, detail=f"Không kết nối được Ollama: {exc}") from exc
 
     if response.status_code >= 400:
+        logger.error(
+            "[ollama-service] upstream returned HTTP %s for GET %s",
+            response.status_code,
+            path,
+        )
         raise HTTPException(status_code=response.status_code, detail=response.text)
 
     try:
+        logger.info("[ollama-service] upstream GET %s ok status=%s", path, response.status_code)
         return response.json()
     except ValueError as exc:
+        logger.error("[ollama-service] upstream JSON decode failed GET %s", path)
         raise HTTPException(status_code=502, detail=f"Ollama trả response không phải JSON từ {path}.") from exc
 
 
