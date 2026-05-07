@@ -113,6 +113,7 @@ Tại thư mục gốc dự án:
 cp backend/.env.example backend/.env
 cp ingestion_service/.env.example ingestion_service/.env
 cp ollama_service/.env.example ollama_service/.env
+cp retrieval_service/.env.example retrieval_service/.env
 cp frontend/.env.example frontend/.env
 ```
 
@@ -129,6 +130,8 @@ QDRANT_COLLECTION_NAME=global_child_chunks
 PDF_PARSER_MODE=marker
 INGESTION_SERVICE_URL=http://localhost:8100
 INGESTION_TIMEOUT_SECONDS=300
+RETRIEVAL_SERVICE_URL=http://localhost:8030
+RETRIEVAL_TIMEOUT_SECONDS=180
 ```
 
 `ollama_service/.env`:
@@ -146,6 +149,15 @@ EMBEDDING_MODEL=qwen3-embedding:0.6b
 ```env
 PDF_PARSER_MODE=marker
 INGESTION_STORAGE_DIR=ingestion_service/storage
+```
+
+`retrieval_service/.env`:
+
+```env
+OLLAMA_SERVICE_URL=http://localhost:8200
+OLLAMA_API_KEY=change-this-key
+QDRANT_COLLECTION_NAME=global_child_chunks
+RETRIEVAL_DATABASE_PATH=backend/storage/app.db
 ```
 
 `frontend/.env`:
@@ -487,3 +499,28 @@ Mục này tập trung vào các hạng mục chưa có trong code hiện tại 
 - Tốc độ: P95 `/api/chat/query` < 2.5s (không tính thời gian model lớn trong tải cao).
 - Indexing: thời gian embed theo tài liệu giảm >= 30% khi bật cache + batching.
 - Độ ổn định: tỷ lệ job indexing lỗi < 1% và có retry tự động.
+## Retrieval Service
+
+`retrieval_service/` is a standalone mini app for vector retrieval and indexing.
+It owns direct Qdrant access and calls `ollama_service` for embeddings.
+
+Run it on port `8030`:
+
+```powershell
+cd retrieval_service
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8030
+```
+
+Set `RETRIEVAL_SERVICE_URL=http://localhost:8030` in `backend/.env` to route
+backend retrieval, vector indexing, and document vector deletion through this
+service. Leave it empty to keep the previous in-process backend behavior.
+
+Main endpoints:
+
+- `GET /health`
+- `POST /v1/retrieve`
+- `POST /v1/search/vector`
+- `POST /v1/search/hybrid`
+- `POST /v1/index/chunks`
+- `DELETE /v1/index/document/{document_id}`
