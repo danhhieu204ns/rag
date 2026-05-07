@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 _embeddings: Embeddings | None = None
 _qdrant_client = None  # defined here so it won't conflict if moved
 _llm: ChatOllama | None = None
-_variant_llm: ChatOllama | None = None
 _reranker: Any = None
 _embeddings_lock = threading.Lock()
 _llm_lock = threading.Lock()

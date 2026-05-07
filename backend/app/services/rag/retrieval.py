@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextvars
 import logging
+import math
 import time
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from uuid import uuid4
 
@@ -13,11 +15,10 @@ from sqlalchemy.orm import Session
 from ...core.settings import settings
 from ...models import DocumentChunk
 from ..chunk_metadata import build_keyword_blob, extract_document_codes
-from ..query_rewriter import rewrite_for_vector
 from .logging import _emit_query_progress, _timed_query_step, _query_trace_id_ctx
 from .models import get_embeddings, get_reranker
 from .qdrant import _get_qdrant_client, _qdrant_collection_exists, load_index_if_available
-from .query import _maybe_rewrite_query, _generate_query_variants
+from .query import _maybe_rewrite_query
 from .utils import (
     _preview_text,
     _preview_ids,
@@ -316,6 +317,63 @@ def _keyword_match_score(
     return score
 
 
+def _keyword_parent_candidates_qdrant(
+    query: str,
+    top_k: int,
+    document_ids: list[int] | None,
+) -> list[int] | None:
+    """Keyword candidates via Qdrant full-text index. Returns None if index unavailable."""
+    from qdrant_client.http import models as qdrant_models
+
+    client = _get_qdrant_client()
+    if not _qdrant_collection_exists(client):
+        return None
+
+    probe_k = max(top_k * max(1, settings.hybrid_probe_multiplier), top_k)
+
+    must: list[qdrant_models.Condition] = [
+        qdrant_models.FieldCondition(
+            key="full_text_search",
+            match=qdrant_models.MatchText(text=query),
+        )
+    ]
+    if document_ids:
+        must.append(
+            qdrant_models.FieldCondition(
+                key="document_id",
+                match=qdrant_models.MatchAny(any=[int(d) for d in document_ids]),
+            )
+        )
+
+    try:
+        points, _ = client.scroll(
+            collection_name=settings.qdrant_collection_name,
+            scroll_filter=qdrant_models.Filter(must=must),
+            limit=probe_k * 5,
+            with_payload=["parent_chunk_id"],
+            with_vectors=False,
+        )
+    except Exception as exc:
+        _emit_query_progress("[query][keyword] Qdrant text search failed: %s — fallback to DB scan", exc)
+        return None
+
+    if not points:
+        # field may not be indexed yet (existing collection before migration)
+        return None
+
+    seen: set[int] = set()
+    parent_ids: list[int] = []
+    for point in points:
+        pid = _to_int((point.payload or {}).get("parent_chunk_id"))
+        if pid is not None and pid not in seen:
+            seen.add(pid)
+            parent_ids.append(pid)
+        if len(parent_ids) >= probe_k:
+            break
+
+    return parent_ids
+
+
 def _keyword_parent_candidates(
     query: str,
     top_k: int,
@@ -349,6 +407,30 @@ def _keyword_parent_candidates(
         )
         return []
 
+    # --- Phase 3: Qdrant full-text search (fast path via inverted index) ---
+    with _timed_query_step(
+        "keyword_candidates_qdrant",
+        event_prefix="keyword_candidates_qdrant",
+        details={"document_filter": document_ids or []},
+    ):
+        qdrant_results = _keyword_parent_candidates_qdrant(query, top_k, document_ids)
+
+    if qdrant_results is not None:
+        _emit_query_progress(
+            "[query][keyword] Qdrant text search: found=%d parent candidates",
+            len(qdrant_results),
+            event="keyword_candidates_qdrant_done",
+            details={"keyword_selected_count": len(qdrant_results), "keyword_selected_parent_ids": qdrant_results},
+        )
+        return qdrant_results
+
+    # --- Fallback: Python DB scan (for existing collections without full_text_search index) ---
+    _emit_query_progress(
+        "[query][keyword] Falling back to DB scan (full_text_search index not available)",
+        event="keyword_candidates_fallback",
+        details={"reason": "qdrant_text_index_unavailable"},
+    )
+
     with _timed_query_step(
         "load_keyword_candidates_from_db",
         event_prefix="keyword_candidates_db",
@@ -366,17 +448,55 @@ def _keyword_parent_candidates(
         event_prefix="keyword_candidates_score",
         details={"candidate_count": len(candidates)},
     ):
+        _BM25_K1 = 1.5
+        _BM25_B = 0.75
+
+        # First pass: build per-document word lists and corpus stats for BM25
+        doc_data: list[tuple[DocumentChunk, dict[str, object], list[str], set[str]]] = []
+        total_dl = 0
         for candidate in candidates:
             metadata = _compact_source_metadata(candidate.source_metadata_json)
-            score = _keyword_match_score(
-                query_terms=query_terms,
-                query_codes=query_codes,
-                metadata=metadata,
-                content=candidate.content,
-            )
+            keyword_blob = build_keyword_blob(metadata, candidate.content)
+            normalized_blob = _normalize_lookup_text(keyword_blob)
+            blob_words = normalized_blob.split()
+            total_dl += len(blob_words)
+            doc_data.append((candidate, metadata, blob_words, set(blob_words)))
+
+        corpus_n = len(doc_data)
+        corpus_avgdl = total_dl / corpus_n if corpus_n > 0 else 1.0
+        corpus_df: dict[str, int] = {
+            term: sum(1 for _, _, _, word_set in doc_data if term in word_set)
+            for term in query_terms
+        }
+
+        # Second pass: BM25 + document-code exact scoring
+        for candidate, metadata, blob_words, word_set in doc_data:
+            score = 0.0
+
+            # High-precision document code matching (unchanged from original)
+            metadata_codes = _metadata_document_codes(metadata)
+            for code in query_codes:
+                if code in metadata_codes:
+                    score += 12.0
+                elif _normalize_lookup_text(code) in " ".join(blob_words):
+                    score += 6.0
+
+            # BM25 term scoring
+            dl = len(blob_words)
+            tf_counts = Counter(blob_words)
+            for term in query_terms:
+                tf = tf_counts.get(term, 0)
+                if tf == 0:
+                    continue
+                df_t = corpus_df.get(term, 0)
+                idf = math.log((corpus_n - df_t + 0.5) / (df_t + 0.5) + 1)
+                tf_norm = tf * (_BM25_K1 + 1) / (
+                    tf + _BM25_K1 * (1 - _BM25_B + _BM25_B * dl / corpus_avgdl)
+                )
+                score += idf * tf_norm
+
             if score <= 0:
                 continue
-
             scored.append((candidate.id, score))
             scored_chunks[candidate.id] = candidate
 
@@ -466,112 +586,6 @@ def _rrf_merge(
     return merged_ids, scores
 
 
-def _rrf_merge_ranked_lists(
-    ranked_lists: list[list[int]],
-    top_k: int,
-) -> tuple[list[int], dict[int, float]]:
-    non_empty_lists = [items for items in ranked_lists if items]
-    if not non_empty_lists:
-        return [], {}
-
-    rrf_k = max(1, settings.hybrid_rrf_k)
-    scores: dict[int, float] = defaultdict(float)
-    for ranked in non_empty_lists:
-        for rank, chunk_id in enumerate(ranked, start=1):
-            scores[chunk_id] += 1.0 / (rrf_k + rank)
-
-    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    merged_ids = [chunk_id for chunk_id, _ in ranked[:top_k]]
-    _emit_query_progress(
-        "[query][multi] RRF merged %d ranked lists into %d parent ids",
-        len(non_empty_lists),
-        len(merged_ids),
-        event="multi_query_rrf_merge",
-        details={
-            "input_list_count": len(non_empty_lists),
-            "output_count": len(merged_ids),
-            "output_ids": merged_ids,
-        },
-    )
-    return merged_ids, scores
-
-
-def _vector_parent_candidates_multi_query(
-    queries: list[str],
-    top_k: int,
-    document_ids: list[int] | None,
-) -> tuple[list[int], dict[int, str]]:
-    filtered_queries = [item for item in queries if item.strip()]
-    if not filtered_queries:
-        _emit_query_progress(
-            "[query][multi] Skip multi-query vector search because query list is empty",
-            event="multi_query_vector_skip",
-            details={"reason": "empty_query_list"},
-        )
-        return [], {}
-
-    if len(filtered_queries) == 1:
-        _emit_query_progress(
-            "[query][multi] Single query mode, fallback to standard vector search",
-            event="multi_query_vector_single_mode",
-            details={"query_preview": _preview_text(filtered_queries[0])},
-        )
-        return _vector_parent_candidates(filtered_queries[0], top_k, document_ids)
-
-    max_workers = min(max(1, settings.multi_query_max_workers), len(filtered_queries))
-    _emit_query_progress(
-        "[query][multi] Parallel vector search start: queries=%d, workers=%d",
-        len(filtered_queries),
-        max_workers,
-        event="multi_query_vector_start",
-        details={
-            "query_count": len(filtered_queries),
-            "queries": [_preview_text(item) for item in filtered_queries],
-            "workers": max_workers,
-            "top_k": top_k,
-            "document_filter": document_ids or [],
-        },
-    )
-
-    ranked_lists: list[list[int]] = []
-    parent_child_type: dict[int, str] = {}
-    query_to_result: dict[str, list[int]] = {}
-    query_elapsed_ms: dict[str, float] = {}
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        query_start_ts = {variant_query: time.perf_counter() for variant_query in filtered_queries}
-        future_map = {
-            executor.submit(_vector_parent_candidates, variant_query, top_k, document_ids): variant_query
-            for variant_query in filtered_queries
-        }
-        for future in as_completed(future_map):
-            variant_query = future_map[future]
-            ids, child_type = future.result()
-            query_elapsed_ms[variant_query] = round((time.perf_counter() - query_start_ts[variant_query]) * 1000, 2)
-            ranked_lists.append(ids)
-            query_to_result[variant_query] = ids
-            for chunk_id, child_label in child_type.items():
-                if chunk_id not in parent_child_type:
-                    parent_child_type[chunk_id] = child_label
-
-    probe_multiplier = max(1, settings.hybrid_probe_multiplier)
-    probe_k = max(top_k * probe_multiplier, top_k)
-    merged_ids, _ = _rrf_merge_ranked_lists(ranked_lists, probe_k)
-
-    _emit_query_progress(
-        "[query][multi] Multi-query vector candidates done: queries=%d, merged=%d",
-        len(filtered_queries),
-        len(merged_ids),
-        event="multi_query_vector_done",
-        details={
-            "queries": filtered_queries,
-            "query_results": {q: _preview_ids(ids) for q, ids in query_to_result.items()},
-            "query_elapsed_ms": query_elapsed_ms,
-            "merged_parent_ids": merged_ids,
-        },
-    )
-
-    return merged_ids, parent_child_type
 
 
 def rerank_documents(
@@ -679,24 +693,17 @@ def similarity_search(
             details={"top_k": top_k, "db_mode": "hybrid" if db is not None else "vector_only"},
         ):
             effective_query, rewrite_details = _maybe_rewrite_query(query)
-            vector_queries = [effective_query]
-            if settings.multi_query_enabled:
-                variants = _generate_query_variants(effective_query, settings.multi_query_variants)
-                vector_queries.extend(variants)
 
         _emit_query_progress(
-            "[query] Query pipeline: original_terms=%d, effective_terms=%d, vector_queries=%d",
+            "[query] Query pipeline: original_terms=%d, effective_terms=%d",
             len(_lookup_terms(query)),
             len(_lookup_terms(effective_query)),
-            len(vector_queries),
             event="query_pipeline_summary",
             details={
                 "original_query_preview": _preview_text(query),
                 "effective_query_preview": _preview_text(effective_query),
                 "original_term_count": len(_lookup_terms(query)),
                 "effective_term_count": len(_lookup_terms(effective_query)),
-                "vector_queries": [_preview_text(item) for item in vector_queries],
-                "multi_query_enabled": settings.multi_query_enabled,
             },
         )
 
@@ -714,8 +721,6 @@ def similarity_search(
                 "query_preview": _preview_text(query),
                 "effective_query_preview": _preview_text(effective_query),
                 "rewrite": rewrite_details,
-                "multi_query_enabled": settings.multi_query_enabled,
-                "multi_query_count": len(vector_queries),
             },
         )
 
@@ -772,64 +777,29 @@ def similarity_search(
             )
             return vector_only_results
 
-        vector_query = rewrite_for_vector(query)
-        if vector_query != query:
-            _emit_query_progress(
-                "[query][rewrite] Vector query expanded: '%s' → '%s'",
-                _preview_text(query),
-                _preview_text(vector_query),
-                event="query_rewrite",
-                details={"original_query": query, "vector_query": vector_query},
-            )
+        ctx_vector = contextvars.copy_context()
+        ctx_keyword = contextvars.copy_context()
 
-        semantic_started_at = time.perf_counter()
-        vector_parent_ids, parent_child_type = _vector_parent_candidates(
-            vector_query,
-            top_k,
-            document_ids,
-        )
-        stage_timings_ms["semantic_candidates"] = _elapsed_ms(semantic_started_at)
+        def _run_vector():
+            t = time.perf_counter()
+            r = ctx_vector.run(_vector_parent_candidates, effective_query, top_k, document_ids)
+            return r, _elapsed_ms(t)
 
-        keyword_started_at = time.perf_counter()
-        keyword_parent_ids = _keyword_parent_candidates(
-            query,
-            top_k,
-            db,
-            document_ids,
-        )
-        stage_timings_ms["keyword_candidates"] = _elapsed_ms(keyword_started_at)
+        def _run_keyword():
+            t = time.perf_counter()
+            r = ctx_keyword.run(_keyword_parent_candidates, query, top_k, db, document_ids)
+            return r, _elapsed_ms(t)
 
-        load_semantic_chunks_started_at = time.perf_counter()
-        semantic_chunk_rows = _load_chunks_by_ids(db, vector_parent_ids)
-        stage_timings_ms["load_semantic_chunks"] = _elapsed_ms(load_semantic_chunks_started_at)
+        with ThreadPoolExecutor(max_workers=2) as _search_executor:
+            _vector_future = _search_executor.submit(_run_vector)
+            _keyword_future = _search_executor.submit(_run_keyword)
+            (vector_parent_ids, parent_child_type), sem_ms = _vector_future.result()
+            keyword_parent_ids, kw_ms = _keyword_future.result()
 
-        load_keyword_chunks_started_at = time.perf_counter()
-        keyword_chunk_rows = _load_chunks_by_ids(db, keyword_parent_ids)
-        stage_timings_ms["load_keyword_chunks"] = _elapsed_ms(load_keyword_chunks_started_at)
+        stage_timings_ms["semantic_candidates"] = sem_ms
+        stage_timings_ms["keyword_candidates"] = kw_ms
 
-        with _timed_query_step(
-            "vector_parent_candidates_multi_query",
-            event_prefix="similarity_vector_candidates",
-            details={"query_count": len(vector_queries), "top_k": top_k},
-        ):
-            vector_parent_ids, parent_child_type = _vector_parent_candidates_multi_query(
-                vector_queries,
-                top_k,
-                document_ids,
-            )
-
-        with _timed_query_step(
-            "keyword_parent_candidates",
-            event_prefix="similarity_keyword_candidates",
-            details={"top_k": top_k},
-        ):
-            keyword_parent_ids = _keyword_parent_candidates(
-                query,
-                top_k,
-                db,
-                document_ids,
-            )
-
+        all_candidate_ids = list(set(vector_parent_ids + keyword_parent_ids))
         with _timed_query_step(
             "load_candidate_chunks",
             event_prefix="similarity_load_candidate_chunks",
@@ -838,10 +808,10 @@ def similarity_search(
                 "keyword_parent_count": len(keyword_parent_ids),
             },
         ):
-            semantic_chunk_rows = _load_chunks_by_ids(db, vector_parent_ids)
-            keyword_chunk_rows = _load_chunks_by_ids(db, keyword_parent_ids)
-        semantic_chunk_by_id = {item.id: item for item in semantic_chunk_rows}
-        keyword_chunk_by_id = {item.id: item for item in keyword_chunk_rows}
+            candidate_chunks = _load_chunks_by_ids(db, all_candidate_ids)
+        chunk_by_id = {item.id: item for item in candidate_chunks}
+        semantic_chunk_by_id = chunk_by_id
+        keyword_chunk_by_id = chunk_by_id
 
         candidate_payload_started_at = time.perf_counter()
         semantic_chunk_details: list[dict[str, Any]] = []
@@ -884,14 +854,13 @@ def similarity_search(
 
         merge_k = settings.reranker_candidate_pool if settings.reranker_enabled else top_k
         rrf_started_at = time.perf_counter()
-        merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, merge_k)
-        stage_timings_ms["rrf_merge"] = _elapsed_ms(rrf_started_at)
         with _timed_query_step(
             "rrf_merge_candidates",
             event_prefix="similarity_rrf_merge",
             details={"merge_k": merge_k},
         ):
             merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, merge_k)
+        stage_timings_ms["rrf_merge"] = _elapsed_ms(rrf_started_at)
         if not merged_parent_ids:
             _emit_query_progress(
                 "[query] similarity_search stop: no merged parent ids",
@@ -904,9 +873,6 @@ def similarity_search(
             )
             return []
 
-        load_merged_chunks_started_at = time.perf_counter()
-        chunks = _load_chunks_by_ids(db, merged_parent_ids)
-        stage_timings_ms["load_merged_chunks"] = _elapsed_ms(load_merged_chunks_started_at)
         with _timed_query_step(
             "load_merged_chunks",
             event_prefix="similarity_load_merged_chunks",
@@ -943,14 +909,13 @@ def similarity_search(
 
         rerank_stage_started_at = time.perf_counter()
         if settings.reranker_enabled and len(results) > top_k:
-            final_results = rerank_documents(query, results, top_k)
-            stage_timings_ms["reranker"] = _elapsed_ms(rerank_stage_started_at)
             with _timed_query_step(
                 "rerank_documents",
                 event_prefix="similarity_rerank",
                 details={"input_count": len(results), "top_k": top_k},
             ):
                 final_results = rerank_documents(query, results, top_k)
+            stage_timings_ms["reranker"] = _elapsed_ms(rerank_stage_started_at)
         else:
             final_results = results[:top_k]
             stage_timings_ms["reranker"] = _elapsed_ms(rerank_stage_started_at)

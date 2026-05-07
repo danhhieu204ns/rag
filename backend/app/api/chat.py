@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..core.settings import settings
+from ..core.query_logger import query_logging_context
 from ..core.request_logger import request_logging_context, get_request_logger
 from ..db import get_db
 from ..models import ChatMessage, ChatSession
@@ -148,6 +149,21 @@ def _run_query_chat_stream(
     top_k: int,
     db: Session,
 ):
+    with query_logging_context(
+        query=user_text,
+        session_id=payload.session_id,
+        top_k=top_k,
+    ) as _qlog:
+        yield from _run_query_chat_stream_inner(payload, user_text, top_k, db, _qlog)
+
+
+def _run_query_chat_stream_inner(
+    payload: ChatQueryRequest,
+    user_text: str,
+    top_k: int,
+    db: Session,
+    _qlog,
+):
     request_started_at = time.perf_counter()
 
     _emit_query_progress(
@@ -232,7 +248,8 @@ def _run_query_chat_stream(
 
     answer_parts = []
     answer_started_at = time.perf_counter()
-    
+    _qlog.record_generation_start()
+
     try:
         from ..services.rag_runtime import generate_answer_stream
         for chunk in generate_answer_stream(
@@ -248,7 +265,8 @@ def _run_query_chat_stream(
         return
 
     answer = "".join(answer_parts)
-    
+    _qlog.record_generation_done(len(answer))
+
     _emit_query_progress(
         "[timing][chat.query] DONE step=generate_answer session_id=%d answer_len=%d elapsed_ms=%.2f",
         session.id,
@@ -265,8 +283,10 @@ def _run_query_chat_stream(
         created_at=datetime.utcnow(),
     )
     db.add(assistant_message)
-    session.updated_at = datetime.utcnow()
-    db.add(session)
+    # Re-fetch session để tránh StaleDataError do object bị expire sau commit trước đó
+    live_session = db.get(ChatSession, session.id)
+    if live_session is not None:
+        live_session.updated_at = datetime.utcnow()
     db.commit()
     
     _emit_query_progress("[chat.query] Completed request: session_id=%d", session.id)

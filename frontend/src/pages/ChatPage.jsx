@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import api from "../api";
+
+// ── Icons ──────────────────────────────────────────────────────────────────
 
 const IconMenu = () => (
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
@@ -52,6 +56,22 @@ const IconChevronDown = () => (
   </svg>
 );
 
+const IconDocument = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <polyline points="14 2 14 8 20 8" />
+    <line x1="16" y1="13" x2="8" y2="13" />
+    <line x1="16" y1="17" x2="8" y2="17" />
+  </svg>
+);
+
+const IconThink = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="10" />
+    <path d="M12 8v4l3 3" />
+  </svg>
+);
+
 const BotAvatar = () => (
   <div className="cgpt-avatar">
     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
@@ -59,6 +79,8 @@ const BotAvatar = () => (
     </svg>
   </div>
 );
+
+// ── Citation badge ─────────────────────────────────────────────────────────
 
 function CitationBadge({ chunkNum, source }) {
   const [open, setOpen] = useState(false);
@@ -106,24 +128,179 @@ function CitationBadge({ chunkNum, source }) {
   );
 }
 
-function renderWithCitations(text, sources) {
-  if (!text) return null;
-  // If no sources were retrieved, render plain text without badge wrappers
-  if (!sources?.length) return text;
-  const parts = text.split(/(\[Chunk \d+\])/g);
-  if (parts.length === 1) return text;
-  return parts.map((part, i) => {
-    const match = part.match(/\[Chunk (\d+)\]/);
-    if (match) {
-      const idx = parseInt(match[1], 10) - 1;
-      const source = sources[idx];
-      // Only render badge if the source actually exists in the array
-      if (!source) return part;
-      return <CitationBadge key={i} chunkNum={match[1]} source={source} />;
-    }
-    return part || null;
-  });
+// ── Markdown renderer with inline citations ────────────────────────────────
+
+function makeMdComponents(sources) {
+  function injectCitations(children) {
+    if (!sources?.length) return children;
+    const items = Array.isArray(children) ? children : [children];
+    return items.flatMap((item, i) => {
+      if (typeof item !== "string") return [item];
+      // Match [Chunk N] or [Chunk N, Chunk M, ...] patterns only
+      const parts = item.split(/(\[Chunk \d+(?:,\s*Chunk \d+)*\])/g);
+      if (parts.length === 1) return [item];
+      return parts.flatMap((part, j) => {
+        const chunkNums = [...part.matchAll(/Chunk (\d+)/g)].map((m) => m[1]);
+        if (chunkNums.length > 0) {
+          return chunkNums
+            .map((num, k) => {
+              const src = sources[parseInt(num, 10) - 1];
+              if (!src) return null;
+              return <CitationBadge key={`${i}-${j}-${k}`} chunkNum={num} source={src} />;
+            })
+            .filter(Boolean);
+        }
+        return part ? [part] : [];
+      });
+    });
+  }
+
+  return {
+    p:      ({ children }) => <p className="md-p">{injectCitations(children)}</p>,
+    h1:     ({ children }) => <h1 className="md-h1">{injectCitations(children)}</h1>,
+    h2:     ({ children }) => <h2 className="md-h2">{injectCitations(children)}</h2>,
+    h3:     ({ children }) => <h3 className="md-h3">{injectCitations(children)}</h3>,
+    h4:     ({ children }) => <h4 className="md-h4">{injectCitations(children)}</h4>,
+    h5:     ({ children }) => <h5 className="md-h5">{injectCitations(children)}</h5>,
+    li:     ({ children }) => <li>{injectCitations(children)}</li>,
+    strong: ({ children }) => <strong>{injectCitations(children)}</strong>,
+    em:     ({ children }) => <em>{injectCitations(children)}</em>,
+    code:   ({ children, className }) => (
+      <code className={`md-code${className ? " " + className : ""}`}>{children}</code>
+    ),
+    pre:    ({ children }) => <pre className="md-pre">{children}</pre>,
+  };
 }
+
+function MarkdownWithCitations({ content, sources }) {
+  // Strip any stray <think> tags that may leak into the answer
+  const clean = content.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<\/?think>/g, "").trim();
+  return (
+    <div className="md-body">
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMdComponents(sources)}>
+        {clean}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+// ── Think block ────────────────────────────────────────────────────────────
+
+function ThinkBlock({ content, isStreaming }) {
+  return (
+    <details className="think-block" open={isStreaming || undefined}>
+      <summary className="think-block-summary">
+        {isStreaming ? (
+          <>
+            <span className="think-spinner" />
+            <span>Đang phân tích...</span>
+          </>
+        ) : (
+          <>
+            <IconThink />
+            <span>Xem quá trình phân tích</span>
+          </>
+        )}
+      </summary>
+      <div className="think-block-body">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+      </div>
+    </details>
+  );
+}
+
+// ── Source card (NotebookLM style) ─────────────────────────────────────────
+
+function SourceCard({ source, index }) {
+  const sourceInfo = source?.source_metadata?.source_info;
+  const fileName =
+    sourceInfo?.file_name ||
+    (source?.document_id != null ? `Tài liệu #${source.document_id}` : `Nguồn ${index}`);
+  const page = source?.page ?? sourceInfo?.page_number;
+  const excerpt = source?.excerpt;
+  const shortExcerpt = excerpt
+    ? excerpt.substring(0, 140).trim() + (excerpt.length > 140 ? "…" : "")
+    : null;
+
+  return (
+    <div className="source-card">
+      <div className="source-card-header">
+        <div className="source-card-icon">
+          <IconDocument />
+        </div>
+        <div className="source-card-info">
+          <div className="source-card-name" title={fileName}>{fileName}</div>
+          {page != null && <div className="source-card-page">Trang {page}</div>}
+        </div>
+        <span className="source-card-num">{index}</span>
+      </div>
+      {shortExcerpt && <div className="source-card-excerpt">{shortExcerpt}</div>}
+    </div>
+  );
+}
+
+function SourcesPanel({ sources }) {
+  if (!sources?.length) return null;
+  return (
+    <div className="sources-panel">
+      <div className="sources-panel-label">
+        <IconDocument />
+        <span>{sources.length} NGUỒN THAM KHẢO</span>
+      </div>
+      <div className="sources-cards">
+        {sources.map((src, i) => (
+          <SourceCard key={i} source={src} index={i + 1} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Parse think block from message content ─────────────────────────────────
+
+function parseContent(content) {
+  const ts = content.indexOf("<think>");
+  const te = content.indexOf("</think>");
+  if (ts === -1) return { thinking: null, answer: content, isThinking: false };
+  if (te === -1) return { thinking: content.substring(ts + 7), answer: "", isThinking: true };
+
+  const thinking = content.substring(ts + 7, te).trim();
+  // Strip any extra <think>...</think> blocks the model may output in the answer
+  const answer = content
+    .substring(te + 8)
+    .replace(/<think>[\s\S]*?<\/think>/g, "")
+    .replace(/<\/?think>/g, "")
+    .trim();
+
+  return { thinking, answer, isThinking: false };
+}
+
+// ── AssistantMessage ───────────────────────────────────────────────────────
+
+function AssistantMessage({ msg }) {
+  const { thinking, answer, isThinking } = parseContent(msg.content);
+  const sources = msg.sources ?? [];
+  const answerText = thinking !== null ? answer : msg.content;
+
+  return (
+    <div className="cgpt-assistant-row">
+      <BotAvatar />
+      <div className="cgpt-assistant-content">
+        <div className="cgpt-assistant-name">ViettelRAG</div>
+
+        {thinking !== null && (
+          <ThinkBlock content={thinking} isStreaming={isThinking} />
+        )}
+
+        {answerText && (
+          <MarkdownWithCitations content={answerText} sources={sources} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── ChatPage ───────────────────────────────────────────────────────────────
 
 function ChatPage({ user, onLogout }) {
   const [sessions, setSessions] = useState([]);
@@ -162,10 +339,7 @@ function ChatPage({ user, onLogout }) {
   }
 
   async function fetchMessages(sessionId) {
-    if (!sessionId) {
-      setMessages([]);
-      return;
-    }
+    if (!sessionId) { setMessages([]); return; }
     const response = await api.get(`/chat/sessions/${sessionId}/messages`);
     setMessages(response.data);
   }
@@ -199,29 +373,22 @@ function ChatPage({ user, onLogout }) {
       ...prev,
       { id: `pending-${Date.now()}`, role: "user", content: userText, sources: [] },
     ]);
-    
-    let assistantMessageId = `assistant-${Date.now()}`;
+
+    const assistantMessageId = `assistant-${Date.now()}`;
     let isAssistantMessageAdded = false;
 
     try {
       const headers = { "Content-Type": "application/json" };
       const token = localStorage.getItem("rag_admin_token");
-      if (token) {
-        headers["Authorization"] = `Bearer ${token}`;
-      }
+      if (token) headers["Authorization"] = `Bearer ${token}`;
 
       const response = await fetch(`${api.defaults.baseURL}/chat/query`, {
         method: "POST",
         headers,
-        body: JSON.stringify({
-          session_id: activeSessionId,
-          message: userText,
-        }),
+        body: JSON.stringify({ session_id: activeSessionId, message: userText }),
       });
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
@@ -233,10 +400,7 @@ function ChatPage({ user, onLogout }) {
       let isRenderingQueue = false;
       let isStreamFinished = false;
       let resolveQueue = null;
-
-      const queuePromise = new Promise(resolve => {
-        resolveQueue = resolve;
-      });
+      const queuePromise = new Promise((resolve) => { resolveQueue = resolve; });
 
       const processQueue = () => {
         if (tokenQueue.length === 0) {
@@ -244,18 +408,16 @@ function ChatPage({ user, onLogout }) {
           if (isStreamFinished) resolveQueue();
           return;
         }
-        
         isRenderingQueue = true;
         const chunk = tokenQueue.shift();
-        
-        setMessages(prev => prev.map(msg => 
-          msg.id === assistantMessageId ? { ...msg, content: msg.content + chunk } : msg
-        ));
-
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === assistantMessageId ? { ...msg, content: msg.content + chunk } : msg
+          )
+        );
         let delay = 30;
         if (tokenQueue.length > 20) delay = 15;
         if (tokenQueue.length > 50) delay = 5;
-
         setTimeout(processQueue, delay);
       };
 
@@ -264,57 +426,49 @@ function ChatPage({ user, onLogout }) {
         doneReading = done;
         if (value) {
           buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
+          const lines = buffer.split("\n");
           buffer = lines.pop() || "";
-          
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(line.substring(6));
-                
-                if (!isAssistantMessageAdded && data.type !== 'error') {
-                  setMessages((prev) => [
-                    ...prev,
-                    { id: assistantMessageId, role: "assistant", content: "", sources: [] },
-                  ]);
-                  isAssistantMessageAdded = true;
-                  setIsReceiving(true);
-                }
 
-                if (data.type === 'session') {
-                  newSessionId = data.session_id;
-                } else if (data.type === 'sources') {
-                  setMessages(prev => prev.map(msg => 
-                    msg.id === assistantMessageId ? { ...msg, sources: data.sources } : msg
-                  ));
-                } else if (data.type === 'token') {
-                  tokenQueue.push(data.content);
-                  if (!isRenderingQueue) {
-                    processQueue();
-                  }
-                } else if (data.type === 'error') {
-                   setError(data.detail || "Có lỗi xảy ra trong quá trình tạo câu trả lời.");
-                } else if (data.type === 'done') {
-                   // finished
-                }
-              } catch (e) {
-                console.error("Error parsing SSE data", e, line);
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            try {
+              const data = JSON.parse(line.substring(6));
+              if (!isAssistantMessageAdded && data.type !== "error") {
+                setMessages((prev) => [
+                  ...prev,
+                  { id: assistantMessageId, role: "assistant", content: "", sources: [] },
+                ]);
+                isAssistantMessageAdded = true;
+                setIsReceiving(true);
               }
+              if (data.type === "session") {
+                newSessionId = data.session_id;
+              } else if (data.type === "sources") {
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === assistantMessageId ? { ...msg, sources: data.sources } : msg
+                  )
+                );
+              } else if (data.type === "token") {
+                tokenQueue.push(data.content);
+                if (!isRenderingQueue) processQueue();
+              } else if (data.type === "error") {
+                setError(data.detail || "Có lỗi xảy ra trong quá trình tạo câu trả lời.");
+              }
+            } catch (e) {
+              console.error("Error parsing SSE data", e, line);
             }
           }
         }
       }
-      
+
       isStreamFinished = true;
-      if (!isRenderingQueue && tokenQueue.length === 0) {
-        resolveQueue();
-      }
-      
+      if (!isRenderingQueue && tokenQueue.length === 0) resolveQueue();
       await queuePromise;
 
       await fetchSessions();
       if (newSessionId && newSessionId !== activeSessionId) {
-        setActiveSessionId(newSessionId); // This triggers fetchMessages
+        setActiveSessionId(newSessionId);
       } else if (newSessionId) {
         await fetchMessages(newSessionId);
       }
@@ -333,17 +487,6 @@ function ChatPage({ user, onLogout }) {
     sendMessage(event);
   }
 
-  function buildSourceLabel(source) {
-    const segments = [`Doc #${source.document_id ?? "?"}`];
-    if (source.page) {
-      segments.push(`Trang ${source.page}`);
-    }
-    if (source.chunk_index !== null && source.chunk_index !== undefined) {
-      segments.push(`Chunk ${source.chunk_index}`);
-    }
-    return segments.join(" | ");
-  }
-
   useEffect(() => {
     fetchSessions().catch(() => setError("Không thể tải danh sách phiên chat."));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -358,18 +501,10 @@ function ChatPage({ user, onLogout }) {
       {/* ── SIDEBAR ── */}
       <aside className="cgpt-sidebar">
         <div className="cgpt-sidebar-top">
-          <button
-            className="cgpt-icon-btn"
-            onClick={() => setIsSidebarOpen(false)}
-            aria-label="Đóng sidebar"
-          >
+          <button className="cgpt-icon-btn" onClick={() => setIsSidebarOpen(false)} aria-label="Đóng sidebar">
             <IconMenu />
           </button>
-          <button
-            className="cgpt-icon-btn"
-            onClick={createSession}
-            aria-label="Đoạn chat mới"
-          >
+          <button className="cgpt-icon-btn" onClick={createSession} aria-label="Đoạn chat mới">
             <IconEdit />
           </button>
         </div>
@@ -399,17 +534,10 @@ function ChatPage({ user, onLogout }) {
                   key={session.id}
                   className={`cgpt-session${session.id === activeSessionId ? " cgpt-session-active" : ""}`}
                 >
-                  <button
-                    className="cgpt-session-btn"
-                    onClick={() => setActiveSessionId(session.id)}
-                  >
+                  <button className="cgpt-session-btn" onClick={() => setActiveSessionId(session.id)}>
                     <span className="cgpt-session-title">{session.title}</span>
                   </button>
-                  <button
-                    className="cgpt-session-del"
-                    onClick={() => deleteSession(session.id)}
-                    aria-label="Xóa"
-                  >
+                  <button className="cgpt-session-del" onClick={() => deleteSession(session.id)} aria-label="Xóa">
                     <IconTrash />
                   </button>
                 </div>
@@ -425,16 +553,10 @@ function ChatPage({ user, onLogout }) {
 
       {/* ── MAIN ── */}
       <main className="cgpt-main">
-        {/* Backdrop – chỉ hiện trên mobile khi sidebar mở */}
         {isSidebarOpen && (
-          <div
-            className="cgpt-backdrop"
-            onClick={() => setIsSidebarOpen(false)}
-            aria-hidden="true"
-          />
+          <div className="cgpt-backdrop" onClick={() => setIsSidebarOpen(false)} aria-hidden="true" />
         )}
 
-        {/* Topbar */}
         <header className="cgpt-topbar">
           <div className="cgpt-topbar-left">
             <button
@@ -444,11 +566,7 @@ function ChatPage({ user, onLogout }) {
             >
               <IconMenu />
             </button>
-            <button
-              className="cgpt-icon-btn cgpt-topbar-edit"
-              onClick={createSession}
-              aria-label="Đoạn chat mới"
-            >
+            <button className="cgpt-icon-btn cgpt-topbar-edit" onClick={createSession} aria-label="Đoạn chat mới">
               <IconEdit />
             </button>
           </div>
@@ -462,7 +580,12 @@ function ChatPage({ user, onLogout }) {
                 Admin Dashboard
               </Link>
             )}
-            <button className="ghost-link" onClick={onLogout} aria-label="Đăng xuất" style={{ border: "none", background: "transparent", cursor: "pointer", padding: "0.4rem 0.8rem", fontSize: "0.9rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
+            <button
+              className="ghost-link"
+              onClick={onLogout}
+              aria-label="Đăng xuất"
+              style={{ border: "none", background: "transparent", cursor: "pointer", padding: "0.4rem 0.8rem", fontSize: "0.9rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}
+            >
               Đăng xuất
             </button>
           </div>
@@ -481,55 +604,7 @@ function ChatPage({ user, onLogout }) {
                   {msg.role === "user" ? (
                     <div className="cgpt-user-bubble">{msg.content}</div>
                   ) : (
-                    <div className="cgpt-assistant-row">
-                      <BotAvatar />
-                      <div className="cgpt-assistant-content">
-                        <div className="cgpt-assistant-name">ViettelRAG</div>
-                        {msg.content.includes("<think>") && msg.content.includes("</think>") ? (
-                          <>
-                            <details className="cgpt-think-block" style={{ marginBottom: '8px', fontSize: '13px', color: '#555' }}>
-                              <summary style={{ cursor: 'pointer', fontWeight: '500', color: '#666', userSelect: 'none' }}>
-                                Xem chi tiết suy luận
-                              </summary>
-                              <div style={{ marginTop: '6px', padding: '10px', background: '#f9f9f9', borderRadius: '6px', whiteSpace: 'pre-wrap' }}>
-                                {msg.content.substring(msg.content.indexOf("<think>") + 7, msg.content.indexOf("</think>")).trim()}
-                              </div>
-                            </details>
-                            <div className="cgpt-msg-text">
-                              {renderWithCitations(msg.content.substring(msg.content.indexOf("</think>") + 8).trim(), msg.sources)}
-                            </div>
-                          </>
-                        ) : msg.content.includes("<think>") ? (
-                          <>
-                            <details className="cgpt-think-block" open style={{ marginBottom: '8px', fontSize: '13px', color: '#555' }}>
-                              <summary style={{ cursor: 'pointer', fontWeight: '500', color: '#666', userSelect: 'none' }}>
-                                Đang suy nghĩ...
-                              </summary>
-                              <div style={{ marginTop: '6px', padding: '10px', background: '#f9f9f9', borderRadius: '6px', whiteSpace: 'pre-wrap' }}>
-                                {msg.content.substring(msg.content.indexOf("<think>") + 7).trim()}
-                              </div>
-                            </details>
-                          </>
-                        ) : (
-                          <div className="cgpt-msg-text">{renderWithCitations(msg.content, msg.sources)}</div>
-                        )}
-                        {msg.sources?.length > 0 && (
-                          <details className="cgpt-sources">
-                            <summary>
-                              Nguồn tham khảo ({msg.sources.length})
-                            </summary>
-                            <ul>
-                              {msg.sources.map((src, i) => (
-                                <li key={`${msg.id}-${i}`}>
-                                  <strong>Tài liệu #{src.document_id ?? "?"}</strong>:{" "}
-                                  {src.excerpt}
-                                </li>
-                              ))}
-                            </ul>
-                          </details>
-                        )}
-                      </div>
-                    </div>
+                    <AssistantMessage msg={msg} />
                   )}
                 </div>
               ))}
@@ -541,9 +616,7 @@ function ChatPage({ user, onLogout }) {
                     <div className="cgpt-assistant-content">
                       <div className="cgpt-assistant-name">ViettelRAG</div>
                       <div className="cgpt-typing">
-                        <span />
-                        <span />
-                        <span />
+                        <span /><span /><span />
                       </div>
                     </div>
                   </div>
@@ -558,11 +631,7 @@ function ChatPage({ user, onLogout }) {
         <div className="cgpt-composer-wrap">
           <form className="cgpt-composer" onSubmit={sendMessage}>
             <div className="cgpt-composer-inner">
-              <button
-                type="button"
-                className="cgpt-attach-btn"
-                aria-label="Thêm nội dung"
-              >
+              <button type="button" className="cgpt-attach-btn" aria-label="Thêm nội dung">
                 <IconPlus />
               </button>
               <textarea
@@ -585,9 +654,7 @@ function ChatPage({ user, onLogout }) {
             </div>
           </form>
           {error && <p className="cgpt-error">{error}</p>}
-          <p className="cgpt-disclaimer">
-            ViettelRAG có thể mắc lỗi. Hãy kiểm tra các thông tin quan trọng.
-          </p>
+          <p className="cgpt-disclaimer">ViettelRAG có thể mắc lỗi. Hãy kiểm tra các thông tin quan trọng.</p>
         </div>
       </main>
     </div>
