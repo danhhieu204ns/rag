@@ -10,6 +10,9 @@ class Settings:
     app_name: str
     storage_dir: Path
     pdf_parser_mode: str
+    retrieval_service_url: str
+    retrieval_timeout_seconds: float
+    api_key: str
 
 
 def _string_env(name: str, default: str) -> str:
@@ -35,6 +38,9 @@ def get_settings() -> Settings:
         app_name=_string_env("INGESTION_APP_NAME", "RAG Ingestion Service"),
         storage_dir=storage_dir,
         pdf_parser_mode=_pdf_parser_mode_env(),
+        retrieval_service_url=_string_env("RETRIEVAL_SERVICE_URL", "").rstrip("/"),
+        retrieval_timeout_seconds=float(_string_env("RETRIEVAL_TIMEOUT_SECONDS", "180")),
+        api_key=_string_env("OLLAMA_API_KEY", ""),
     )
 
 

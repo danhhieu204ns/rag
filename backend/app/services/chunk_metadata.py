@@ -574,6 +574,7 @@ def build_structured_chunk_metadata_batch(
         if not isinstance(raw_metadata, dict):
             raw_metadata = {}
 
+        context = contexts[idx]
         raw_chunk_index = item.get("chunk_index")
         chunk_index = idx if raw_chunk_index is None else int(raw_chunk_index)
         source_page = item.get("source_page")

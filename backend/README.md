@@ -10,16 +10,12 @@
 	- `context` (h2/h3)
 	- `search_optimization` (entities, organizations, dates, document_codes)
 	- `admin_tags` (security_level, department)
-- HyQ enrichment at indexing time (`summary` + hypothetical `questions`) is provided by `ollama_service`
-- HyQ LLM batching for metadata generation
-- Overlapped ingest pipeline: metadata/HyQ batch `N+1` can run while embedding batch `N` is in-flight
-- Metadata cache in SQLite (`chunk_metadata_cache`) keyed by `document_id + file_hash + chunk_fingerprint`
+- Full indexing delegation to `ingestion_service` (parse + clean + chunk + enrich + embed + index)
 - Parent-child retrieval: child vectors are indexed, parent chunk text is returned to LLM
 - Hybrid retrieval (vector + keyword) with reciprocal-rank-fusion
 - Qdrant as vector store backend (local mode by default, remote mode optional)
 - Chat query endpoint with persistent chat memory
-- Remote Indexing: Metadata, summary, and HyQ generation are handled by `ollama_service`.
-- Remote Ingestion: Document parse/split is handled by `ingestion_service`.
+- Remote Ingestion/Indexing: indexing phase is handled by `ingestion_service`.
 - Ollama Shield: Backend calls `ollama_service` instead of exposing raw Ollama directly.
 
 ## Role in the Service Architecture
@@ -35,7 +31,7 @@ backend / Orchestrator
    |----------------------|---------------------|
    v                      v                     v
 ingestion_service    retrieval_service     ollama_service
-parse + split        Qdrant search/index   chat + embedding + indexing LLM
+indexing pipeline    query retrieval       chat/indexing model gateway
 ```
 
 Backend owns:
@@ -43,7 +39,7 @@ Backend owns:
 - Public API for frontend (`/api/auth`, `/api/users`, `/api/documents`, `/api/chat`).
 - Auth, admin user management, document metadata, upload persistence and chat history.
 - RAG orchestration: receive question, call retrieval, build prompt, call LLM, attach sources.
-- Indexing orchestration: queue background document jobs, call ingestion, call Ollama enrichment, then upsert child payloads through retrieval service. In local fallback mode, backend also computes embeddings before direct Qdrant upsert.
+- Indexing orchestration: queue background document jobs, call ingestion indexing build/upsert APIs, then persist indexing state.
 - Fallback local Qdrant mode when `RETRIEVAL_SERVICE_URL` is empty.
 
 Backend should not own:
@@ -55,10 +51,10 @@ Backend should not own:
 Recommended production boundary:
 
 ```text
-backend -> ingestion_service        # parse/split documents
-backend -> ollama_service           # metadata/HyQ and answer generation
-backend -> retrieval_service        # vector upsert/search/delete
-retrieval_service -> ollama_service # chunk/query embeddings
+backend -> ingestion_service        # full indexing pipeline
+backend -> ollama_service           # answer generation
+backend -> retrieval_service        # vector search/delete
+retrieval_service -> ollama_service # query/chunk embeddings
 retrieval_service -> qdrant         # vector DB ownership
 ```
 
@@ -141,7 +137,7 @@ If `OLLAMA_BASE_URL` or `OLLAMA_API_KEY` is missing, or `ollama_service` is unav
 
 ### Ingestion & Retrieval
 - `PDF_PARSER_MODE`: `legacy` (PyMuPDF) or `marker`.
-- `INGESTION_SERVICE_URL`: Required URL for the parse/split service (example: `http://localhost:8100`).
+- `INGESTION_SERVICE_URL`: Required URL for the indexing service (example: `http://localhost:8100`).
 - `INGESTION_TIMEOUT_SECONDS`: HTTP timeout when backend calls ingestion service.
 - `RETRIEVAL_SERVICE_URL`: Recommended URL for vector search/index service (example: `http://localhost:8300` when running services manually). Empty means backend uses local retrieval/Qdrant code path.
 - `RETRIEVAL_TIMEOUT_SECONDS`: HTTP timeout when backend calls retrieval service.
@@ -161,7 +157,7 @@ cd ingestion_service
 pip install marker-pdf
 ```
 
-If `INGESTION_SERVICE_URL` is empty or the service is unavailable, document parse/split requests fail and backend returns an error.
+If `INGESTION_SERVICE_URL` is empty or the service is unavailable, document indexing requests fail and backend returns an error.
 
 If `RETRIEVAL_SERVICE_URL` is set, backend sends vector index/search/delete operations to `retrieval_service`:
 
@@ -201,9 +197,7 @@ This file is regenerated on each embed so you can quickly inspect parsing output
 - `POST /api/documents/reindex` is used to queue pending documents again after restart/failure.
 - Increasing `METADATA_LLM_BATCH_SIZE` and `VECTOR_BATCH_SIZE` can improve throughput but may increase RAM/VRAM usage.
 
-## Optimizations Applied for Indexing
+## Indexing Notes
 
-To resolve the bottleneck during metadata extraction and chunk indexing (which was spending time on LLM I/O and error-prone JSON parsing):
-1. **Delegation of Workload (Regex Fallback)**: The indexing process now uses optimized Regex for entity, organization, dates, and document code metadata extraction (search_optimization), bypassing the LLM for these fields entirely.
-2. **Structured Output Enforcement (Pydantic)**: The LLM is exclusively used for generating summaries and hypothetical questions (HyQ). It now utilizes ChatOllama.with_structured_output alongside Pydantic models (HyQResultModel), eliminating JSON parsing loops.
-3. **Optimized Prompts:** Prompt logic has been minimized to reduce the Time-To-First-Token (TTFT).
+- Indexing internals now live in `ingestion_service`.
+- Backend keeps only indexing orchestration, DB persistence, and state transitions.

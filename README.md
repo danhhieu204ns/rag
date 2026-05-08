@@ -35,8 +35,8 @@ Ranh giới trách nhiệm hiện tại:
 | Thành phần | Trách nhiệm |
 | --- | --- |
 | `backend` | API chính cho frontend, auth, document CRUD, chat history, điều phối RAG, prompt, generation và citation. |
-| `ingestion_service` | Parse file `.pdf`, `.txt`, `.md` thành markdown và split thành chunks. Đây là phần xử lý tài liệu nặng, tách khỏi backend để dễ scale. |
-| `retrieval_service` | Sở hữu truy cập Qdrant, nhận chunks để upsert, embedding query, vector search và trả context cho backend. |
+| `ingestion_service` | Indexing service: nhận tài liệu đầu vào, extract/clean/chunk, enrich metadata, embed và index (qua retrieval API). |
+| `retrieval_service` | Retrieval service: query embedding, vector search, filter, rerank và trả context cho backend. |
 | `ollama_service` | Gateway bảo vệ Ollama thật, ép model theo cấu hình, rate limit, phục vụ chat, embedding và metadata/HyQ. |
 | `qdrant` | Vector database nội bộ, không gọi trực tiếp từ frontend. |
 
@@ -46,9 +46,9 @@ Luồng chính:
 
 1. Frontend gọi backend qua `/api`.
 2. Backend lưu metadata, file upload và lịch sử chat trong SQLite.
-3. Backend gọi `ingestion_service` để parse/split tài liệu.
-4. Backend gọi `ollama_service` để sinh metadata/HyQ và câu trả lời.
-5. Backend gọi `retrieval_service` để ghi/truy vấn vector trong Qdrant. Khi bật `RETRIEVAL_SERVICE_URL`, embedding chunk/query do `retrieval_service` gọi `ollama_service`; nếu để rỗng, backend dùng Qdrant và embedding trực tiếp trong process.
+3. Backend gọi `ingestion_service` để xử lý indexing phase (parse -> enrich -> embed -> index).
+4. Backend gọi `retrieval_service` để truy vấn context.
+5. Backend gọi `ollama_service` để generation câu trả lời.
 
 Luồng upload và index tài liệu:
 
@@ -57,11 +57,7 @@ Frontend
    ↓
 Backend nhận upload và lưu metadata/file
    ↓
-Backend gọi Ingestion Service để parse + split
-   ↓
-Backend gọi Ollama Service để enrich metadata/HyQ
-   ↓
-Backend gọi Retrieval Service để embed chunks và upsert vào Qdrant
+Backend gọi Ingestion Service để parse + enrich + embed + index
    ↓
 Frontend xem trạng thái: uploaded / indexing / embedded / index_failed
 ```

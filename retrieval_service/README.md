@@ -3,6 +3,7 @@
 Standalone FastAPI service for retrieval and vector indexing.
 
 It owns direct access to Qdrant and calls only `ollama_service` for embeddings.
+Core role: query embedding + vector search + filter + rerank + context response.
 Other services should use this API instead of touching Qdrant directly.
 
 ## Run

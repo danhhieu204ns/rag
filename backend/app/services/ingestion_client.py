@@ -111,3 +111,45 @@ def split_source_documents(
             )
         )
     return output
+
+
+def build_index_bundle(file_path: Path) -> dict[str, Any]:
+    _require_service_url()
+    try:
+        url = _service_url("/v1/index/build")
+        with file_path.open("rb") as source:
+            files = {"file": (file_path.name, source, "application/octet-stream")}
+            with httpx.Client(timeout=settings.ingestion_timeout_seconds) as client:
+                response = client.post(url, files=files)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError("Ingestion service request timed out while building index bundle.") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"Failed to connect to ingestion service: {exc}") from exc
+
+    if response.status_code >= 400:
+        _raise_service_error(response)
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Ingestion service returned invalid index bundle payload.")
+    return payload
+
+
+def upsert_index_bundle(*, document_id: int, child_rows: list[dict[str, Any]]) -> int:
+    _require_service_url()
+    payload = {
+        "document_id": int(document_id),
+        "child_rows": child_rows,
+    }
+    try:
+        url = _service_url("/v1/index/upsert")
+        with httpx.Client(timeout=settings.ingestion_timeout_seconds) as client:
+            response = client.post(url, json=payload)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError("Ingestion service request timed out while upserting indexed chunks.") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"Failed to connect to ingestion service: {exc}") from exc
+
+    if response.status_code >= 400:
+        _raise_service_error(response)
+    result = response.json()
+    return int(result.get("indexed_chunks") or 0)

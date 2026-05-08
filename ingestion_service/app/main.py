@@ -4,9 +4,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 import logging
+import re
+import os
+import time
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
+import httpx
 from pydantic import BaseModel, Field
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +51,145 @@ class ParseResponse(BaseModel):
     markdown: str
     source_parser: str
     source_type: str
+
+
+class IndexBuildChunkPayload(BaseModel):
+    chunk_index: int
+    content: str
+    source_page: int | None = None
+    source_kind: str
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class IndexBuildChildPayload(BaseModel):
+    chunk_index: int
+    child_type: str
+    child_index: int
+    child_text: str
+    source_page: int | None = None
+    source_kind: str
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class IndexBuildResponse(BaseModel):
+    parent_chunks: list[IndexBuildChunkPayload]
+    child_rows: list[IndexBuildChildPayload]
+
+
+class IndexUpsertChildPayload(BaseModel):
+    document_id: int
+    parent_chunk_id: int
+    source_page: int | None = None
+    child_type: str
+    child_index: int
+    child_text: str
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class IndexUpsertRequest(BaseModel):
+    document_id: int
+    child_rows: list[IndexUpsertChildPayload] = Field(default_factory=list)
+
+
+class IndexUpsertResponse(BaseModel):
+    indexed_chunks: int
+
+
+_DATE_PATTERN = re.compile(r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4})\b")
+_DOC_CODE_PATTERN = re.compile(r"\b\d{1,6}[/-][A-Za-z]{1,12}(?:[/-][A-Za-z0-9]{1,16})+\b")
+
+
+def _normalize_spaces(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _extract_context(raw_metadata: dict[str, Any]) -> dict[str, str | None]:
+    headers = raw_metadata.get("markdown_headers")
+    if not isinstance(headers, dict):
+        return {"h2": None, "h3": None}
+    h2 = headers.get("h2") or headers.get("h1")
+    h3 = headers.get("h3") or headers.get("h4")
+    return {
+        "h2": _normalize_spaces(str(h2)) if h2 else None,
+        "h3": _normalize_spaces(str(h3)) if h3 else None,
+    }
+
+
+def _source_kind(metadata: dict[str, Any], suffix: str) -> str:
+    source_parser = str(metadata.get("source_parser") or "legacy").lower()
+    source_type = str(metadata.get("source_type") or "").lower() or ("pdf" if suffix == ".pdf" else "text")
+    if source_type == "pdf" and source_parser == "marker":
+        return "pdf_marker_page"
+    if source_type == "pdf":
+        return "pdf_page"
+    if source_type == "text":
+        return "text_chunk"
+    return source_type
+
+
+def _fallback_search(chunk_text: str) -> dict[str, list[str]]:
+    dates = list(dict.fromkeys(_DATE_PATTERN.findall(chunk_text)))[:15]
+    doc_codes = list(dict.fromkeys(code.upper() for code in _DOC_CODE_PATTERN.findall(chunk_text)))[:15]
+    keywords = [*doc_codes, *dates][:20]
+    return {
+        "keywords": keywords,
+        "entities": [],
+        "organizations": [],
+        "dates": dates,
+        "document_codes": doc_codes,
+    }
+
+
+def _build_hyq(summary: str, hyq_questions: list[str], context: dict[str, str | None]) -> dict[str, Any]:
+    normalized_questions = [q if q.endswith("?") else f"{q}?" for q in hyq_questions if str(q).strip()]
+    if not normalized_questions:
+        if context.get("h3"):
+            normalized_questions = [f"{context['h3']} được trình bày như thế nào?"]
+        elif context.get("h2"):
+            normalized_questions = [f"Nội dung trong mục {context['h2']} là gì?"]
+        else:
+            normalized_questions = ["Thông tin chính của đoạn này là gì?"]
+    return {
+        "summary": _normalize_spaces(summary) or "Không có tóm tắt.",
+        "questions": normalized_questions[:3],
+    }
+
+
+def _indexing_headers() -> dict[str, str]:
+    return {"x-api-key": settings.api_key} if settings.api_key else {}
+
+
+def _indexing_batch(chunk_texts: list[str]) -> list[dict[str, Any]]:
+    if not chunk_texts:
+        return []
+    ollama_base = str(os.getenv("OLLAMA_BASE_URL", "")).strip().rstrip("/")
+    if not ollama_base:
+        raise RuntimeError("OLLAMA_BASE_URL is required for indexing enrichment in ingestion_service.")
+    endpoint = f"{ollama_base}/v1/indexing/batch"
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            with httpx.Client(timeout=180.0, headers=_indexing_headers()) as client:
+                resp = client.post(endpoint, json={"texts": chunk_texts})
+            break
+        except httpx.ConnectError as exc:
+            last_exc = exc
+            if attempt == 3:
+                raise RuntimeError(f"Failed to connect to Ollama indexing endpoint {endpoint}: {exc}") from exc
+            time.sleep(0.5 * attempt)
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Ollama indexing request error at {endpoint}: {exc}") from exc
+    else:
+        if last_exc is not None:
+            raise RuntimeError(f"Failed to connect to Ollama indexing endpoint {endpoint}: {last_exc}") from last_exc
+        raise RuntimeError(f"Ollama indexing request failed unexpectedly at {endpoint}.")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Ollama indexing request failed at {endpoint}: {resp.status_code} {resp.text}")
+    payload = resp.json()
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        raise RuntimeError("Invalid response from /v1/indexing/batch.")
+    return [item if isinstance(item, dict) else {} for item in items]
 
 
 app = FastAPI(title=settings.app_name)
@@ -143,3 +286,159 @@ def split(request: SplitRequest) -> SplitResponse:
             if str(item.page_content or "").strip()
         ]
     )
+
+
+@app.post("/v1/index/build", response_model=IndexBuildResponse)
+async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".pdf", ".txt", ".md"}:
+        raise HTTPException(status_code=400, detail=f"Unsupported file extension: {suffix}")
+
+    with TemporaryDirectory(prefix="ingestion_index_build_") as tmp_dir:
+        temp_path = Path(tmp_dir) / (file.filename or "uploaded.bin")
+        payload = await file.read()
+        if not payload:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        temp_path.write_bytes(payload)
+
+        markdown, source_parser, source_type = parse_source_to_markdown(temp_path)
+        markdown_path = Path(tmp_dir) / "parsed.md"
+        markdown_path.write_text(markdown.strip(), encoding="utf-8")
+        loaded = load_documents_from_parsed_markdown(
+            markdown_path,
+            source_file_path=temp_path,
+            source_parser=source_parser,
+            source_type=source_type,
+        )
+        chunks = split_source_documents(
+            loaded,
+            chunk_size=1000,
+            chunk_overlap=150,
+        )
+
+    parent_chunks: list[IndexBuildChunkPayload] = []
+    child_rows: list[IndexBuildChildPayload] = []
+    texts: list[str] = []
+    raw_rows: list[tuple[int, str, int | None, str, dict[str, Any], dict[str, str | None]]] = []
+
+    for item in chunks:
+        text = str(item.page_content or "").strip()
+        if not text:
+            continue
+        metadata = dict(item.metadata or {})
+        chunk_index = len(parent_chunks)
+        source_page = metadata.get("source_page") if isinstance(metadata.get("source_page"), int) else None
+        source_kind = _source_kind(metadata, suffix)
+        context = _extract_context(metadata)
+        parent_chunks.append(
+            IndexBuildChunkPayload(
+                chunk_index=chunk_index,
+                content=text,
+                source_page=source_page,
+                source_kind=source_kind,
+                source_metadata={},
+            )
+        )
+        texts.append(text)
+        raw_rows.append((chunk_index, text, source_page, source_kind, metadata, context))
+
+    try:
+        llm_items = _indexing_batch(texts)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    for idx, raw in enumerate(raw_rows):
+        chunk_index, text, source_page, source_kind, metadata, context = raw
+        llm_item = llm_items[idx] if idx < len(llm_items) else {}
+        summary = str(llm_item.get("summary") or "")
+        hyq = llm_item.get("hyq")
+        questions = [str(q) for q in hyq] if isinstance(hyq, list) else []
+        meta = llm_item.get("metadata") if isinstance(llm_item.get("metadata"), dict) else {}
+        keywords = [str(k) for k in (meta.get("keywords") or []) if str(k).strip()]
+        search_opt = _fallback_search(text)
+        if keywords:
+            search_opt["keywords"] = list(dict.fromkeys([*search_opt["keywords"], *keywords]))[:20]
+            search_opt["entities"] = keywords[:15]
+
+        structured = {
+            "source_info": {
+                "file_name": str(file.filename or ""),
+                "page_number": source_page,
+                "doc_type": "Tài_liệu_nội_bộ",
+            },
+            "context": context,
+            "search_optimization": search_opt,
+            "admin_tags": {
+                "security_level": "Nội_bộ",
+                "department": "Tổng_hợp",
+            },
+            "hyq": _build_hyq(summary, questions, context),
+        }
+        parent_chunks[idx].source_metadata = structured
+        child_rows.append(
+            IndexBuildChildPayload(
+                chunk_index=chunk_index,
+                child_type="summary",
+                child_index=0,
+                child_text=f"Tóm tắt: {structured['hyq']['summary']}",
+                source_page=source_page,
+                source_kind=source_kind,
+                source_metadata=structured,
+            )
+        )
+        for q_idx, q in enumerate(structured["hyq"]["questions"], start=1):
+            child_rows.append(
+                IndexBuildChildPayload(
+                    chunk_index=chunk_index,
+                    child_type="question",
+                    child_index=q_idx,
+                    child_text=str(q),
+                    source_page=source_page,
+                    source_kind=source_kind,
+                    source_metadata=structured,
+                )
+            )
+
+    return IndexBuildResponse(parent_chunks=parent_chunks, child_rows=child_rows)
+
+
+@app.post("/v1/index/upsert", response_model=IndexUpsertResponse)
+def index_upsert(request: IndexUpsertRequest) -> IndexUpsertResponse:
+    if not settings.retrieval_service_url:
+        raise HTTPException(status_code=500, detail="RETRIEVAL_SERVICE_URL is not configured in ingestion_service.")
+    if not request.child_rows:
+        return IndexUpsertResponse(indexed_chunks=0)
+
+    chunks = [
+        {
+            "chunk_id": f"{row.parent_chunk_id}:{row.child_type}:{row.child_index}",
+            "document_id": row.document_id,
+            "content": row.child_text,
+            "page": row.source_page,
+            "metadata": {
+                "document_id": row.document_id,
+                "parent_chunk_id": row.parent_chunk_id,
+                "chunk_id": row.parent_chunk_id,
+                "source_page": row.source_page,
+                "source_metadata": row.source_metadata,
+                "child_type": row.child_type,
+                "child_index": row.child_index,
+            },
+        }
+        for row in request.child_rows
+    ]
+
+    batch_size = 100
+    indexed_total = 0
+    with httpx.Client(timeout=settings.retrieval_timeout_seconds, headers=_indexing_headers()) as client:
+        for start in range(0, len(chunks), batch_size):
+            batch = chunks[start : start + batch_size]
+            payload = {
+                "purge_document_ids": [request.document_id] if start == 0 else [],
+                "chunks": batch,
+            }
+            resp = client.post(f"{settings.retrieval_service_url}/v1/index/chunks", json=payload)
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"Retrieval indexing failed: {resp.status_code} {resp.text}")
+            result = resp.json()
+            indexed_total += int(result.get("indexed_chunks") or 0) if isinstance(result, dict) else 0
+    return IndexUpsertResponse(indexed_chunks=indexed_total)
