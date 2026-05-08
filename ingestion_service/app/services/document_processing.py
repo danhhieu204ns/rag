@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,11 @@ _RECURSIVE_SEPARATORS = ["\n\n", "\n", ". ", ", ", " ", ""]
 _HEADER_SPLIT_SPANS_KEY = "_marker_page_spans"
 _HEADER_SPLIT_START_KEY = "_header_split_start_index"
 _marker_models: dict[str, Any] | None = None
+logger = logging.getLogger(__name__)
+
+
+def _ms(started: float) -> float:
+    return (time.perf_counter() - started) * 1000.0
 
 
 def _to_int(value: Any) -> int | None:
@@ -518,6 +525,7 @@ def _markdown_documents_for_pdf(
 def parse_source_to_markdown(file_path: Path) -> tuple[str, str, str]:
     """Parse one source file to markdown text and return parser/source metadata."""
 
+    started = time.perf_counter()
     suffix = file_path.suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         raise ValueError(
@@ -526,19 +534,69 @@ def parse_source_to_markdown(file_path: Path) -> tuple[str, str, str]:
 
     if suffix == ".pdf":
         if settings.pdf_parser_mode == "marker":
+            stage_started = time.perf_counter()
             markdown, _ = _render_pdf_with_marker(file_path)
+            logger.info(
+                "[ingestion][timing] module=document_processing step=parse_pdf_marker elapsed_ms=%.2f source=%s markdown_chars=%d",
+                _ms(stage_started),
+                file_path,
+                len(markdown),
+            )
+            logger.info(
+                "[ingestion][timing] module=document_processing step=parse_source_to_markdown elapsed_ms=%.2f source=%s parser=marker",
+                _ms(started),
+                file_path,
+            )
             return markdown.strip(), "marker", "pdf"
 
+        stage_started = time.perf_counter()
         pages = _load_pdf_with_legacy_parser(file_path)
         markdown = "\n\n".join(str(item.page_content or "").strip() for item in pages if str(item.page_content or "").strip())
+        logger.info(
+            "[ingestion][timing] module=document_processing step=parse_pdf_legacy elapsed_ms=%.2f source=%s pages=%d markdown_chars=%d",
+            _ms(stage_started),
+            file_path,
+            len(pages),
+            len(markdown),
+        )
+        logger.info(
+            "[ingestion][timing] module=document_processing step=parse_source_to_markdown elapsed_ms=%.2f source=%s parser=legacy",
+            _ms(started),
+            file_path,
+        )
         return markdown.strip(), "legacy", "pdf"
 
     if suffix == ".md":
+        stage_started = time.perf_counter()
         markdown = file_path.read_text(encoding="utf-8")
+        logger.info(
+            "[ingestion][timing] module=document_processing step=parse_markdown_file elapsed_ms=%.2f source=%s markdown_chars=%d",
+            _ms(stage_started),
+            file_path,
+            len(markdown),
+        )
+        logger.info(
+            "[ingestion][timing] module=document_processing step=parse_source_to_markdown elapsed_ms=%.2f source=%s parser=legacy",
+            _ms(started),
+            file_path,
+        )
         return markdown.strip(), "legacy", "text"
 
+    stage_started = time.perf_counter()
     loaded = _load_text_or_markdown(file_path)
     markdown = "\n\n".join(str(item.page_content or "").strip() for item in loaded if str(item.page_content or "").strip())
+    logger.info(
+        "[ingestion][timing] module=document_processing step=parse_text_file elapsed_ms=%.2f source=%s docs=%d markdown_chars=%d",
+        _ms(stage_started),
+        file_path,
+        len(loaded),
+        len(markdown),
+    )
+    logger.info(
+        "[ingestion][timing] module=document_processing step=parse_source_to_markdown elapsed_ms=%.2f source=%s parser=legacy",
+        _ms(started),
+        file_path,
+    )
     return markdown.strip(), "legacy", "text"
 
 
@@ -551,6 +609,7 @@ def load_documents_from_parsed_markdown(
 ) -> list[Document]:
     """Load split-ready documents from parsed markdown generated in Step A."""
 
+    started = time.perf_counter()
     markdown = markdown_path.read_text(encoding="utf-8").strip()
     if not markdown:
         return []
@@ -560,13 +619,20 @@ def load_documents_from_parsed_markdown(
     normalized_parser = source_parser.strip().lower()
 
     if normalized_source_type == "pdf":
-        return _markdown_documents_for_pdf(
+        result = _markdown_documents_for_pdf(
             markdown,
             source=source,
             source_parser=normalized_parser or "marker",
         )
+        logger.info(
+            "[ingestion][timing] module=document_processing step=load_documents_from_parsed_markdown elapsed_ms=%.2f source=%s source_type=pdf docs=%d",
+            _ms(started),
+            source,
+            len(result),
+        )
+        return result
 
-    return [
+    result = [
         Document(
             page_content=markdown,
             metadata={
@@ -577,6 +643,13 @@ def load_documents_from_parsed_markdown(
             },
         )
     ]
+    logger.info(
+        "[ingestion][timing] module=document_processing step=load_documents_from_parsed_markdown elapsed_ms=%.2f source=%s source_type=text docs=%d",
+        _ms(started),
+        source,
+        len(result),
+    )
+    return result
 
 
 def _recursive_split(
@@ -662,22 +735,52 @@ def split_source_documents(
 ) -> list[Document]:
     """Split loaded documents into chunks for embedding."""
 
+    started = time.perf_counter()
     documents_for_header_split = documents
     if _is_marker_pdf_documents(documents):
+        merge_started = time.perf_counter()
         documents_for_header_split = _merge_marker_pdf_documents_for_header_split(documents)
+        logger.info(
+            "[ingestion][timing] module=document_processing step=merge_marker_pages elapsed_ms=%.2f input_docs=%d merged_docs=%d",
+            _ms(merge_started),
+            len(documents),
+            len(documents_for_header_split),
+        )
 
+    header_started = time.perf_counter()
     header_split_documents = _markdown_header_split(documents_for_header_split)
+    logger.info(
+        "[ingestion][timing] module=document_processing step=markdown_header_split elapsed_ms=%.2f input_docs=%d sections=%d",
+        _ms(header_started),
+        len(documents_for_header_split),
+        len(header_split_documents),
+    )
     if not header_split_documents:
         return []
 
+    log_started = time.perf_counter()
     log_path = _write_header_split_output_log(documents_for_header_split, header_split_documents)
+    logger.info(
+        "[ingestion][timing] module=document_processing step=write_header_split_log elapsed_ms=%.2f has_log=%s",
+        _ms(log_started),
+        bool(log_path),
+    )
     if log_path is not None:
         for item in header_split_documents:
             metadata = dict(item.metadata or {})
             metadata["header_split_log_path"] = log_path
             item.metadata = metadata
 
+    recursive_started = time.perf_counter()
     recursive_documents = _recursive_split(header_split_documents, chunk_size, chunk_overlap)
+    logger.info(
+        "[ingestion][timing] module=document_processing step=recursive_split elapsed_ms=%.2f sections=%d chunks=%d chunk_size=%d chunk_overlap=%d",
+        _ms(recursive_started),
+        len(header_split_documents),
+        len(recursive_documents),
+        chunk_size,
+        chunk_overlap,
+    )
     for item in recursive_documents:
         metadata = dict(item.metadata or {})
 
@@ -705,4 +808,10 @@ def split_source_documents(
         metadata.pop(_HEADER_SPLIT_START_KEY, None)
         item.metadata = metadata
 
+    logger.info(
+        "[ingestion][timing] module=document_processing step=split_source_documents elapsed_ms=%.2f input_docs=%d output_chunks=%d",
+        _ms(started),
+        len(documents),
+        len(recursive_documents),
+    )
     return recursive_documents

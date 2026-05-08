@@ -7,6 +7,7 @@ import logging
 import re
 import os
 import time
+from contextlib import contextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -27,6 +28,54 @@ from .services.document_processing import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_ingestion_file_logging() -> Path:
+    log_dir = settings.storage_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "ingestion_service.log"
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    file_handler_exists = False
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            base_filename = getattr(handler, "baseFilename", "")
+            if Path(base_filename) == log_path:
+                file_handler_exists = True
+                handler.setFormatter(formatter)
+                break
+
+    if not file_handler_exists:
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+
+    return log_path
+
+
+def _ms(start: float) -> float:
+    return (time.perf_counter() - start) * 1000.0
+
+
+@contextmanager
+def _timed_step(step: str, **context: Any):
+    started = time.perf_counter()
+    details = " ".join(f"{k}={v}" for k, v in context.items())
+    logger.info("[ingestion][timing] step=%s status=start %s", step, details)
+    try:
+        yield
+        logger.info("[ingestion][timing] step=%s status=ok elapsed_ms=%.2f %s", step, _ms(started), details)
+    except Exception:
+        logger.exception("[ingestion][timing] step=%s status=error elapsed_ms=%.2f %s", step, _ms(started), details)
+        raise
 
 
 class SplitRequest(BaseModel):
@@ -193,6 +242,8 @@ def _indexing_batch(chunk_texts: list[str]) -> list[dict[str, Any]]:
 
 
 app = FastAPI(title=settings.app_name)
+_INGESTION_LOG_PATH = _configure_ingestion_file_logging()
+logger.info("[ingestion] file logging enabled path=%s", _INGESTION_LOG_PATH)
 
 
 @app.get("/health")
@@ -215,6 +266,7 @@ def ready() -> dict[str, str]:
 
 @app.post("/v1/parse", response_model=ParseResponse)
 async def parse(file: UploadFile = File(...)) -> ParseResponse:
+    request_started = time.perf_counter()
     suffix = Path(file.filename or "").suffix.lower()
     logger.info("[ingestion] /v1/parse filename=%s suffix=%s", file.filename, suffix)
     if suffix not in {".pdf", ".txt", ".md"}:
@@ -222,13 +274,16 @@ async def parse(file: UploadFile = File(...)) -> ParseResponse:
 
     with TemporaryDirectory(prefix="ingestion_upload_") as tmp_dir:
         temp_path = Path(tmp_dir) / (file.filename or "uploaded.bin")
-        payload = await file.read()
+        with _timed_step("parse.read_upload", filename=file.filename):
+            payload = await file.read()
         if not payload:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-        temp_path.write_bytes(payload)
+        with _timed_step("parse.write_temp_file", temp_path=temp_path):
+            temp_path.write_bytes(payload)
 
         try:
-            markdown, source_parser, source_type = parse_source_to_markdown(temp_path)
+            with _timed_step("parse.to_markdown", parser_mode=settings.pdf_parser_mode, suffix=suffix):
+                markdown, source_parser, source_type = parse_source_to_markdown(temp_path)
         except Exception as exc:  # pragma: no cover
             logger.exception("[ingestion] /v1/parse failed filename=%s", file.filename)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -240,6 +295,11 @@ async def parse(file: UploadFile = File(...)) -> ParseResponse:
         source_type,
         len(markdown),
     )
+    logger.info(
+        "[ingestion][timing] route=/v1/parse status=ok total_elapsed_ms=%.2f filename=%s",
+        _ms(request_started),
+        file.filename,
+    )
     return ParseResponse(
         markdown=markdown,
         source_parser=source_parser,
@@ -249,6 +309,7 @@ async def parse(file: UploadFile = File(...)) -> ParseResponse:
 
 @app.post("/v1/split", response_model=SplitResponse)
 def split(request: SplitRequest) -> SplitResponse:
+    request_started = time.perf_counter()
     logger.info(
         "[ingestion] /v1/split source=%s parser=%s type=%s chars=%d chunk_size=%d overlap=%d",
         request.source_file_path,
@@ -260,25 +321,39 @@ def split(request: SplitRequest) -> SplitResponse:
     )
     with TemporaryDirectory(prefix="ingestion_markdown_") as tmp_dir:
         markdown_path = Path(tmp_dir) / "parsed.md"
-        markdown_path.write_text(request.markdown.strip(), encoding="utf-8")
+        with _timed_step("split.write_markdown", source=request.source_file_path):
+            markdown_path.write_text(request.markdown.strip(), encoding="utf-8")
 
         try:
-            loaded = load_documents_from_parsed_markdown(
-                markdown_path,
-                source_file_path=Path(request.source_file_path),
-                source_parser=request.source_parser,
-                source_type=request.source_type,
-            )
-            chunks = split_source_documents(
-                loaded,
+            with _timed_step("split.load_documents", source=request.source_file_path):
+                loaded = load_documents_from_parsed_markdown(
+                    markdown_path,
+                    source_file_path=Path(request.source_file_path),
+                    source_parser=request.source_parser,
+                    source_type=request.source_type,
+                )
+            with _timed_step(
+                "split.chunk_documents",
+                source=request.source_file_path,
                 chunk_size=request.chunk_size,
                 chunk_overlap=request.chunk_overlap,
-            )
+                loaded_docs=len(loaded),
+            ):
+                chunks = split_source_documents(
+                    loaded,
+                    chunk_size=request.chunk_size,
+                    chunk_overlap=request.chunk_overlap,
+                )
         except Exception as exc:  # pragma: no cover
             logger.exception("[ingestion] /v1/split failed source=%s", request.source_file_path)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     logger.info("[ingestion] /v1/split done source=%s chunks=%d", request.source_file_path, len(chunks))
+    logger.info(
+        "[ingestion][timing] route=/v1/split status=ok total_elapsed_ms=%.2f source=%s",
+        _ms(request_started),
+        request.source_file_path,
+    )
     return SplitResponse(
         chunks=[
             ChunkPayload(page_content=item.page_content, metadata=dict(item.metadata or {}))
@@ -290,31 +365,38 @@ def split(request: SplitRequest) -> SplitResponse:
 
 @app.post("/v1/index/build", response_model=IndexBuildResponse)
 async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
+    request_started = time.perf_counter()
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".pdf", ".txt", ".md"}:
         raise HTTPException(status_code=400, detail=f"Unsupported file extension: {suffix}")
 
     with TemporaryDirectory(prefix="ingestion_index_build_") as tmp_dir:
         temp_path = Path(tmp_dir) / (file.filename or "uploaded.bin")
-        payload = await file.read()
+        with _timed_step("index_build.read_upload", filename=file.filename):
+            payload = await file.read()
         if not payload:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-        temp_path.write_bytes(payload)
+        with _timed_step("index_build.write_temp_file", temp_path=temp_path):
+            temp_path.write_bytes(payload)
 
-        markdown, source_parser, source_type = parse_source_to_markdown(temp_path)
+        with _timed_step("index_build.parse_to_markdown", parser_mode=settings.pdf_parser_mode, suffix=suffix):
+            markdown, source_parser, source_type = parse_source_to_markdown(temp_path)
         markdown_path = Path(tmp_dir) / "parsed.md"
-        markdown_path.write_text(markdown.strip(), encoding="utf-8")
-        loaded = load_documents_from_parsed_markdown(
-            markdown_path,
-            source_file_path=temp_path,
-            source_parser=source_parser,
-            source_type=source_type,
-        )
-        chunks = split_source_documents(
-            loaded,
-            chunk_size=1000,
-            chunk_overlap=150,
-        )
+        with _timed_step("index_build.write_markdown", markdown_chars=len(markdown)):
+            markdown_path.write_text(markdown.strip(), encoding="utf-8")
+        with _timed_step("index_build.load_documents"):
+            loaded = load_documents_from_parsed_markdown(
+                markdown_path,
+                source_file_path=temp_path,
+                source_parser=source_parser,
+                source_type=source_type,
+            )
+        with _timed_step("index_build.chunk_documents", loaded_docs=len(loaded), chunk_size=1000, chunk_overlap=150):
+            chunks = split_source_documents(
+                loaded,
+                chunk_size=1000,
+                chunk_overlap=150,
+            )
 
     parent_chunks: list[IndexBuildChunkPayload] = []
     child_rows: list[IndexBuildChildPayload] = []
@@ -343,9 +425,11 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
         raw_rows.append((chunk_index, text, source_page, source_kind, metadata, context))
 
     try:
-        llm_items = _indexing_batch(texts)
+        with _timed_step("index_build.enrich_batch", parent_chunks=len(texts)):
+            llm_items = _indexing_batch(texts)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    enrich_started = time.perf_counter()
     for idx, raw in enumerate(raw_rows):
         chunk_index, text, source_page, source_kind, metadata, context = raw
         llm_item = llm_items[idx] if idx < len(llm_items) else {}
@@ -398,11 +482,25 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
                 )
             )
 
+    logger.info(
+        "[ingestion][timing] step=index_build.map_children status=ok elapsed_ms=%.2f parent_chunks=%d child_rows=%d",
+        _ms(enrich_started),
+        len(parent_chunks),
+        len(child_rows),
+    )
+    logger.info(
+        "[ingestion][timing] route=/v1/index/build status=ok total_elapsed_ms=%.2f filename=%s parent_chunks=%d child_rows=%d",
+        _ms(request_started),
+        file.filename,
+        len(parent_chunks),
+        len(child_rows),
+    )
     return IndexBuildResponse(parent_chunks=parent_chunks, child_rows=child_rows)
 
 
 @app.post("/v1/index/upsert", response_model=IndexUpsertResponse)
 def index_upsert(request: IndexUpsertRequest) -> IndexUpsertResponse:
+    request_started = time.perf_counter()
     if not settings.retrieval_service_url:
         raise HTTPException(status_code=500, detail="RETRIEVAL_SERVICE_URL is not configured in ingestion_service.")
     if not request.child_rows:
@@ -436,9 +534,24 @@ def index_upsert(request: IndexUpsertRequest) -> IndexUpsertResponse:
                 "purge_document_ids": [request.document_id] if start == 0 else [],
                 "chunks": batch,
             }
+            batch_started = time.perf_counter()
             resp = client.post(f"{settings.retrieval_service_url}/v1/index/chunks", json=payload)
             if resp.status_code >= 400:
                 raise HTTPException(status_code=502, detail=f"Retrieval indexing failed: {resp.status_code} {resp.text}")
             result = resp.json()
             indexed_total += int(result.get("indexed_chunks") or 0) if isinstance(result, dict) else 0
+            logger.info(
+                "[ingestion][timing] step=index_upsert.batch_post status=ok elapsed_ms=%.2f document_id=%s batch_start=%d batch_size=%d indexed_total=%d",
+                _ms(batch_started),
+                request.document_id,
+                start,
+                len(batch),
+                indexed_total,
+            )
+    logger.info(
+        "[ingestion][timing] route=/v1/index/upsert status=ok total_elapsed_ms=%.2f document_id=%s indexed_chunks=%d",
+        _ms(request_started),
+        request.document_id,
+        indexed_total,
+    )
     return IndexUpsertResponse(indexed_chunks=indexed_total)
