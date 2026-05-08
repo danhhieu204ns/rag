@@ -24,11 +24,13 @@ def _should_rewrite_query(query: str) -> tuple[bool, int, str]:
 def _rewrite_query(query: str) -> str:
     llm = get_llm()
     prompt = (
-        "Bạn đang hỗ trợ hệ thống tìm kiếm tài liệu khoa học tự nhiên. "
-        "Hãy viết lại câu hỏi sau thành phiên bản đầy đủ hơn, bổ sung các thuật ngữ chuyên môn "
-        "(định luật, công thức, khái niệm vật lý/hóa học/sinh học) nếu phù hợp, "
-        "để tối ưu việc truy xuất tài liệu. "
-        "Giữ nguyên ý nghĩa gốc. Chỉ trả về đúng một câu đã viết lại, không giải thích.\n\n"
+        "Bạn là bộ phận viết lại truy vấn cho hệ thống RAG. "
+        "Hãy viết lại câu hỏi sau thành một câu truy vấn đầy đủ, rõ nghĩa và giàu ngữ cảnh hơn "
+        "để tối ưu việc truy xuất thông tin từ mọi loại tài liệu như tài liệu chuyên môn, "
+        "báo cáo, quy trình, hợp đồng, văn bản hành chính, giáo trình, tài liệu kỹ thuật hoặc tài liệu nội bộ. "
+        "Bổ sung thuật ngữ chuyên ngành, đối tượng, phạm vi, tiêu chí, mốc thời gian hoặc bối cảnh liên quan nếu phù hợp. "
+        "Giữ nguyên ý nghĩa gốc, không bịa thêm thông tin. "
+        "Chỉ trả về đúng một câu đã viết lại, không giải thích.\n\n"
         f"Câu hỏi gốc: {query}\n"
         "Câu hỏi đã viết lại:"
     )
