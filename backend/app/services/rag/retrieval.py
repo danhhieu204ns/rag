@@ -17,6 +17,7 @@ from ...models import DocumentChunk
 from ..chunk_metadata import build_keyword_blob, extract_document_codes
 from .logging import _emit_query_progress, _timed_query_step, _query_trace_id_ctx
 from .models import get_embeddings, get_reranker
+from .orchestrator import OrchestrationPlan, classify_query
 from .qdrant import _get_qdrant_client, _qdrant_collection_exists, load_index_if_available
 from .query import _maybe_rewrite_query
 from .utils import (
@@ -546,6 +547,9 @@ def _rrf_merge(
     vector_ids: list[int],
     keyword_ids: list[int],
     top_k: int,
+    *,
+    vector_weight: float | None = None,
+    keyword_weight: float | None = None,
 ) -> tuple[list[int], dict[int, float]]:
     if not vector_ids and not keyword_ids:
         _emit_query_progress(
@@ -556,13 +560,15 @@ def _rrf_merge(
         return [], {}
 
     rrf_k = max(1, settings.hybrid_rrf_k)
+    v_weight = vector_weight if vector_weight is not None else settings.hybrid_vector_rrf_weight
+    k_weight = keyword_weight if keyword_weight is not None else settings.hybrid_keyword_rrf_weight
     scores: dict[int, float] = defaultdict(float)
 
     for rank, chunk_id in enumerate(vector_ids, start=1):
-        scores[chunk_id] += settings.hybrid_vector_rrf_weight / (rrf_k + rank)
+        scores[chunk_id] += v_weight / (rrf_k + rank)
 
     for rank, chunk_id in enumerate(keyword_ids, start=1):
-        scores[chunk_id] += settings.hybrid_keyword_rrf_weight / (rrf_k + rank)
+        scores[chunk_id] += k_weight / (rrf_k + rank)
 
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     merged_ids = [chunk_id for chunk_id, _ in ranked[:top_k]]
@@ -673,20 +679,259 @@ def rerank_documents(
     return reranked_docs
 
 
+def _run_hybrid_once(
+    query: str,
+    effective_query: str,
+    top_k: int,
+    db: Session,
+    document_ids: list[int] | None,
+    plan: OrchestrationPlan | None,
+    stage_timings_ms: dict[str, float],
+    query_started_at: float,
+) -> list[Document]:
+    """
+    One full hybrid retrieval pass: vector + keyword → RRF → (rerank) → top-k docs.
+
+    All parameters are driven by *plan* when provided; falls back to global
+    settings so the function is safe to call without an orchestration plan.
+    """
+    # ── Resolve plan parameters (with settings fallback) ──────────────────────
+    effective_top_k = plan.top_k if plan else top_k
+    v_weight = plan.vector_rrf_weight if plan else settings.hybrid_vector_rrf_weight
+    k_weight = plan.keyword_rrf_weight if plan else settings.hybrid_keyword_rrf_weight
+    use_reranker = plan.use_reranker if plan else settings.reranker_enabled
+    candidate_pool = plan.candidate_pool if plan else settings.reranker_candidate_pool
+
+    # ── Parallel vector + keyword retrieval ───────────────────────────────────
+    ctx_vector = contextvars.copy_context()
+    ctx_keyword = contextvars.copy_context()
+
+    def _run_vector() -> tuple[tuple[list[int], dict[int, str]], float]:
+        t = time.perf_counter()
+        r = ctx_vector.run(_vector_parent_candidates, effective_query, effective_top_k, document_ids)
+        return r, _elapsed_ms(t)
+
+    def _run_keyword() -> tuple[list[int], float]:
+        t = time.perf_counter()
+        r = ctx_keyword.run(_keyword_parent_candidates, query, effective_top_k, db, document_ids)
+        return r, _elapsed_ms(t)
+
+    with ThreadPoolExecutor(max_workers=2) as _executor:
+        _vf = _executor.submit(_run_vector)
+        _kf = _executor.submit(_run_keyword)
+        (vector_parent_ids, parent_child_type), sem_ms = _vf.result()
+        keyword_parent_ids, kw_ms = _kf.result()
+
+    stage_timings_ms["semantic_candidates"] = sem_ms
+    stage_timings_ms["keyword_candidates"] = kw_ms
+
+    # ── Load all candidate chunks (union) ─────────────────────────────────────
+    all_candidate_ids = list(set(vector_parent_ids + keyword_parent_ids))
+    with _timed_query_step(
+        "load_candidate_chunks",
+        event_prefix="similarity_load_candidate_chunks",
+        details={
+            "semantic_parent_count": len(vector_parent_ids),
+            "keyword_parent_count": len(keyword_parent_ids),
+        },
+    ):
+        candidate_chunks = _load_chunks_by_ids(db, all_candidate_ids)
+    chunk_by_id = {item.id: item for item in candidate_chunks}
+
+    # ── Debug payloads (unchanged behaviour) ──────────────────────────────────
+    candidate_payload_started_at = time.perf_counter()
+    semantic_chunk_details: list[dict[str, Any]] = [
+        _chunk_to_debug_payload(chunk_by_id[cid], rank=r, retrieval_mode="semantic")
+        for r, cid in enumerate(vector_parent_ids, 1)
+        if cid in chunk_by_id
+    ]
+    keyword_chunk_details: list[dict[str, Any]] = [
+        _chunk_to_debug_payload(chunk_by_id[cid], rank=r, retrieval_mode="keyword")
+        for r, cid in enumerate(keyword_parent_ids, 1)
+        if cid in chunk_by_id
+    ]
+    stage_timings_ms["build_candidate_debug_payloads"] = _elapsed_ms(candidate_payload_started_at)
+
+    _emit_query_progress(
+        "[query] Candidate chunk details: semantic=%d, keyword=%d",
+        len(semantic_chunk_details),
+        len(keyword_chunk_details),
+        event="candidate_chunk_details",
+        details={
+            "semantic_chunks": semantic_chunk_details,
+            "keyword_chunks": keyword_chunk_details,
+        },
+    )
+
+    # ── RRF merge with plan-driven weights ────────────────────────────────────
+    merge_k = candidate_pool if use_reranker else effective_top_k
+    rrf_started_at = time.perf_counter()
+    with _timed_query_step(
+        "rrf_merge_candidates",
+        event_prefix="similarity_rrf_merge",
+        details={"merge_k": merge_k},
+    ):
+        merged_parent_ids, scores = _rrf_merge(
+            vector_parent_ids,
+            keyword_parent_ids,
+            merge_k,
+            vector_weight=v_weight,
+            keyword_weight=k_weight,
+        )
+    stage_timings_ms["rrf_merge"] = _elapsed_ms(rrf_started_at)
+
+    if not merged_parent_ids:
+        _emit_query_progress(
+            "[query] similarity_search stop: no merged parent ids",
+            event="similarity_search_stop",
+            details={
+                "reason": "no_merged_parent_ids",
+                "stage_timings_ms": stage_timings_ms,
+                "total_elapsed_ms": _elapsed_ms(query_started_at),
+            },
+        )
+        return []
+
+    # ── Build context documents ───────────────────────────────────────────────
+    with _timed_query_step(
+        "load_merged_chunks",
+        event_prefix="similarity_load_merged_chunks",
+        details={"merged_count": len(merged_parent_ids)},
+    ):
+        chunks = _load_chunks_by_ids(db, merged_parent_ids)
+
+    vector_set = set(vector_parent_ids)
+    keyword_set = set(keyword_parent_ids)
+    build_docs_at = time.perf_counter()
+    results: list[Document] = []
+    with _timed_query_step(
+        "build_context_documents",
+        event_prefix="similarity_build_context_documents",
+        details={"chunk_count": len(chunks)},
+    ):
+        for chunk in chunks:
+            if chunk.id in vector_set and chunk.id in keyword_set:
+                retrieval_mode = "hybrid"
+            elif chunk.id in keyword_set:
+                retrieval_mode = "keyword"
+            else:
+                retrieval_mode = "vector"
+            results.append(
+                _chunk_to_context_document(
+                    chunk,
+                    retrieval_mode=retrieval_mode,
+                    retrieval_score=scores.get(chunk.id),
+                    child_type=parent_child_type.get(chunk.id),
+                )
+            )
+    stage_timings_ms["build_context_documents"] = _elapsed_ms(build_docs_at)
+
+    # ── Rerank (plan controls whether reranker fires) ─────────────────────────
+    rerank_at = time.perf_counter()
+    if use_reranker and len(results) > effective_top_k:
+        with _timed_query_step(
+            "rerank_documents",
+            event_prefix="similarity_rerank",
+            details={"input_count": len(results), "top_k": effective_top_k},
+        ):
+            final_results = rerank_documents(query, results, effective_top_k)
+        stage_timings_ms["reranker"] = _elapsed_ms(rerank_at)
+    else:
+        final_results = results[:effective_top_k]
+        stage_timings_ms["reranker"] = _elapsed_ms(rerank_at)
+        stage_timings_ms["reranker_skipped"] = 1.0
+
+    # ── Final logging ─────────────────────────────────────────────────────────
+    mode_counts: dict[str, int] = defaultdict(int)
+    for item in final_results:
+        mode_counts[str(item.metadata.get("retrieval_mode") or "unknown")] += 1
+
+    final_chunk_ids = [_to_int(item.metadata.get("chunk_id")) or -1 for item in final_results]
+    final_payload_at = time.perf_counter()
+    final_chunk_details: list[dict[str, Any]] = [
+        {
+            "rank": rank,
+            "chunk_id": _to_int(item.metadata.get("chunk_id")),
+            "document_id": _to_int(item.metadata.get("document_id")),
+            "chunk_index": _to_int(item.metadata.get("chunk_index")),
+            "source_page": _to_int(item.metadata.get("source_page")),
+            "source_kind": str(item.metadata.get("source_kind") or ""),
+            "retrieval_mode": str(item.metadata.get("retrieval_mode") or ""),
+            "retrieval_score": _to_float(item.metadata.get("retrieval_score")),
+            "reranker_score": _to_float(item.metadata.get("reranker_score")) if use_reranker else None,
+            "child_type": str(item.metadata.get("child_type") or ""),
+            "source_metadata": item.metadata.get("source_metadata"),
+            "content": item.page_content,
+        }
+        for rank, item in enumerate(final_results, 1)
+    ]
+    stage_timings_ms["build_final_payload"] = _elapsed_ms(final_payload_at)
+    stage_timings_ms["total"] = _elapsed_ms(query_started_at)
+
+    _emit_query_progress(
+        "[query][timing] semantic=%.2fms keyword=%.2fms rrf=%.2fms reranker=%.2fms total=%.2fms",
+        stage_timings_ms.get("semantic_candidates", 0.0),
+        stage_timings_ms.get("keyword_candidates", 0.0),
+        stage_timings_ms.get("rrf_merge", 0.0),
+        stage_timings_ms.get("reranker", 0.0),
+        stage_timings_ms.get("total", 0.0),
+        event="similarity_search_timing",
+        details={
+            "stage_timings_ms": stage_timings_ms,
+            "top_k": effective_top_k,
+            "semantic_candidate_count": len(vector_parent_ids),
+            "keyword_candidate_count": len(keyword_parent_ids),
+            "merged_candidate_count": len(merged_parent_ids),
+            "final_result_count": len(final_results),
+        },
+    )
+
+    _emit_query_progress(
+        "[query] similarity_search done: parent_chunks=%d, final_results=%d, modes=%s, chunk_ids=%s",
+        len(chunks),
+        len(final_results),
+        dict(mode_counts),
+        _preview_ids(final_chunk_ids),
+        event="similarity_search_done",
+        details={
+            "semantic_parent_ids": vector_parent_ids,
+            "keyword_parent_ids": keyword_parent_ids,
+            "final_parent_count": len(chunks),
+            "final_result_count": len(final_results),
+            "final_modes": dict(mode_counts),
+            "final_chunk_ids": final_chunk_ids,
+            "final_chunks": final_chunk_details,
+            "stage_timings_ms": stage_timings_ms,
+            "total_elapsed_ms": stage_timings_ms.get("total", 0.0),
+        },
+    )
+
+    return final_results
+
+
 def similarity_search(
     query: str,
     top_k: int,
     db: Session | None = None,
     document_ids: list[int] | None = None,
+    plan: OrchestrationPlan | None = None,
 ) -> list[Document]:
-    """Search relevant parent chunks using hybrid (vector + keyword) retrieval."""
+    """
+    Search relevant parent chunks using orchestrated hybrid retrieval.
 
+    plan — when provided by the caller (e.g. chat.py that already ran
+           classify_query()), it is used as-is; internal classification is
+           skipped.  When omitted, classification runs here if
+           ORCHESTRATOR_ENABLED=true.
+    """
     trace_id = f"q-{int(time.time() * 1000)}-{uuid4().hex[:8]}"
     token = _query_trace_id_ctx.set(trace_id)
     query_started_at = time.perf_counter()
     stage_timings_ms: dict[str, float] = {}
     started_at = time.perf_counter()
+
     try:
+        # ── Query rewrite ─────────────────────────────────────────────────────
         with _timed_query_step(
             "prepare_effective_query",
             event_prefix="similarity_prepare_query",
@@ -707,6 +952,16 @@ def similarity_search(
             },
         )
 
+        # ── Orchestration (hybrid path only) ──────────────────────────────────
+        # Use the caller-supplied plan when available; classify only when not.
+        if plan is None and settings.orchestrator_enabled and db is not None:
+            with _timed_query_step(
+                "orchestrate_query",
+                event_prefix="similarity_orchestrate",
+                details={"top_k": top_k},
+            ):
+                plan = classify_query(query, top_k)
+
         _emit_query_progress(
             "[query] Start similarity_search: top_k=%d, db_mode=%s, document_filter=%s, query='%s'",
             top_k,
@@ -721,16 +976,19 @@ def similarity_search(
                 "query_preview": _preview_text(query),
                 "effective_query_preview": _preview_text(effective_query),
                 "rewrite": rewrite_details,
+                "orchestration_plan": {
+                    "query_type": plan.query_type,
+                    "strategy": plan.strategy,
+                    "signals": plan.signals,
+                } if plan else None,
             },
         )
 
+        # ── Index availability check ───────────────────────────────────────────
         index_check_started_at = time.perf_counter()
         index_available = load_index_if_available()
         stage_timings_ms["index_check"] = _elapsed_ms(index_check_started_at)
-        with _timed_query_step(
-            "check_index_available",
-            event_prefix="similarity_check_index",
-        ):
+        with _timed_query_step("check_index_available", event_prefix="similarity_check_index"):
             index_available = load_index_if_available()
 
         if not index_available:
@@ -745,16 +1003,16 @@ def similarity_search(
             )
             return []
 
+        # ── Vector-only path (no DB session) ──────────────────────────────────
         if db is None:
             vector_only_started_at = time.perf_counter()
-            vector_only_results = _search_qdrant_children(query, limit=top_k)
-            stage_timings_ms["vector_only_search"] = _elapsed_ms(vector_only_started_at)
             with _timed_query_step(
                 "vector_only_search",
                 event_prefix="similarity_vector_only",
                 details={"top_k": top_k},
             ):
                 vector_only_results = _search_qdrant_children(effective_query, limit=top_k)
+            stage_timings_ms["vector_only_search"] = _elapsed_ms(vector_only_started_at)
             _emit_query_progress(
                 "[query] similarity_search done (vector_only): result_count=%d, elapsed=%.2fms",
                 len(vector_only_results),
@@ -777,223 +1035,51 @@ def similarity_search(
             )
             return vector_only_results
 
-        ctx_vector = contextvars.copy_context()
-        ctx_keyword = contextvars.copy_context()
+        # ── Hybrid path with orchestrated iteration ────────────────────────────
+        max_iters = plan.max_iterations if plan else 1
+        final_results: list[Document] = []
 
-        def _run_vector():
-            t = time.perf_counter()
-            r = ctx_vector.run(_vector_parent_candidates, effective_query, top_k, document_ids)
-            return r, _elapsed_ms(t)
-
-        def _run_keyword():
-            t = time.perf_counter()
-            r = ctx_keyword.run(_keyword_parent_candidates, query, top_k, db, document_ids)
-            return r, _elapsed_ms(t)
-
-        with ThreadPoolExecutor(max_workers=2) as _search_executor:
-            _vector_future = _search_executor.submit(_run_vector)
-            _keyword_future = _search_executor.submit(_run_keyword)
-            (vector_parent_ids, parent_child_type), sem_ms = _vector_future.result()
-            keyword_parent_ids, kw_ms = _keyword_future.result()
-
-        stage_timings_ms["semantic_candidates"] = sem_ms
-        stage_timings_ms["keyword_candidates"] = kw_ms
-
-        all_candidate_ids = list(set(vector_parent_ids + keyword_parent_ids))
-        with _timed_query_step(
-            "load_candidate_chunks",
-            event_prefix="similarity_load_candidate_chunks",
-            details={
-                "semantic_parent_count": len(vector_parent_ids),
-                "keyword_parent_count": len(keyword_parent_ids),
-            },
-        ):
-            candidate_chunks = _load_chunks_by_ids(db, all_candidate_ids)
-        chunk_by_id = {item.id: item for item in candidate_chunks}
-        semantic_chunk_by_id = chunk_by_id
-        keyword_chunk_by_id = chunk_by_id
-
-        candidate_payload_started_at = time.perf_counter()
-        semantic_chunk_details: list[dict[str, Any]] = []
-        for rank, chunk_id in enumerate(vector_parent_ids, start=1):
-            chunk = semantic_chunk_by_id.get(chunk_id)
-            if chunk is None:
-                continue
-            semantic_chunk_details.append(
-                _chunk_to_debug_payload(
-                    chunk,
-                    rank=rank,
-                    retrieval_mode="semantic",
+        for iteration in range(max_iters):
+            if iteration > 0:
+                # Widen search on retry
+                plan = plan.with_broader_search()  # type: ignore[union-attr]
+                _emit_query_progress(
+                    "[orchestrator] Iteration %d: results thin (%d < %d), retrying with broader plan",
+                    iteration + 1,
+                    len(final_results),
+                    max(1, (plan.top_k if plan else top_k) // 2),
+                    event="orchestrator_retry",
+                    details={
+                        "iteration": iteration + 1,
+                        "prev_result_count": len(final_results),
+                        "new_plan": {
+                            "query_type": plan.query_type,
+                            "strategy": plan.strategy,
+                            "vector_rrf_weight": plan.vector_rrf_weight,
+                            "keyword_rrf_weight": plan.keyword_rrf_weight,
+                        } if plan else None,
+                    },
                 )
+
+            final_results = _run_hybrid_once(
+                query=query,
+                effective_query=effective_query,
+                top_k=top_k,
+                db=db,
+                document_ids=document_ids,
+                plan=plan,
+                stage_timings_ms=stage_timings_ms,
+                query_started_at=query_started_at,
             )
 
-        keyword_chunk_details: list[dict[str, Any]] = []
-        for rank, chunk_id in enumerate(keyword_parent_ids, start=1):
-            chunk = keyword_chunk_by_id.get(chunk_id)
-            if chunk is None:
-                continue
-            keyword_chunk_details.append(
-                _chunk_to_debug_payload(
-                    chunk,
-                    rank=rank,
-                    retrieval_mode="keyword",
-                )
-            )
-        stage_timings_ms["build_candidate_debug_payloads"] = _elapsed_ms(candidate_payload_started_at)
-
-        _emit_query_progress(
-            "[query] Candidate chunk details: semantic=%d, keyword=%d",
-            len(semantic_chunk_details),
-            len(keyword_chunk_details),
-            event="candidate_chunk_details",
-            details={
-                "semantic_chunks": semantic_chunk_details,
-                "keyword_chunks": keyword_chunk_details,
-            },
-        )
-
-        merge_k = settings.reranker_candidate_pool if settings.reranker_enabled else top_k
-        rrf_started_at = time.perf_counter()
-        with _timed_query_step(
-            "rrf_merge_candidates",
-            event_prefix="similarity_rrf_merge",
-            details={"merge_k": merge_k},
-        ):
-            merged_parent_ids, scores = _rrf_merge(vector_parent_ids, keyword_parent_ids, merge_k)
-        stage_timings_ms["rrf_merge"] = _elapsed_ms(rrf_started_at)
-        if not merged_parent_ids:
-            _emit_query_progress(
-                "[query] similarity_search stop: no merged parent ids",
-                event="similarity_search_stop",
-                details={
-                    "reason": "no_merged_parent_ids",
-                    "stage_timings_ms": stage_timings_ms,
-                    "total_elapsed_ms": _elapsed_ms(query_started_at),
-                },
-            )
-            return []
-
-        with _timed_query_step(
-            "load_merged_chunks",
-            event_prefix="similarity_load_merged_chunks",
-            details={"merged_count": len(merged_parent_ids)},
-        ):
-            chunks = _load_chunks_by_ids(db, merged_parent_ids)
-        vector_set = set(vector_parent_ids)
-        keyword_set = set(keyword_parent_ids)
-
-        build_context_docs_started_at = time.perf_counter()
-        results: list[Document] = []
-        with _timed_query_step(
-            "build_context_documents",
-            event_prefix="similarity_build_context_documents",
-            details={"chunk_count": len(chunks)},
-        ):
-            for chunk in chunks:
-                if chunk.id in vector_set and chunk.id in keyword_set:
-                    retrieval_mode = "hybrid"
-                elif chunk.id in keyword_set:
-                    retrieval_mode = "keyword"
-                else:
-                    retrieval_mode = "vector"
-
-                results.append(
-                    _chunk_to_context_document(
-                        chunk,
-                        retrieval_mode=retrieval_mode,
-                        retrieval_score=scores.get(chunk.id),
-                        child_type=parent_child_type.get(chunk.id),
-                    )
-                )
-        stage_timings_ms["build_context_documents"] = _elapsed_ms(build_context_docs_started_at)
-
-        rerank_stage_started_at = time.perf_counter()
-        if settings.reranker_enabled and len(results) > top_k:
-            with _timed_query_step(
-                "rerank_documents",
-                event_prefix="similarity_rerank",
-                details={"input_count": len(results), "top_k": top_k},
-            ):
-                final_results = rerank_documents(query, results, top_k)
-            stage_timings_ms["reranker"] = _elapsed_ms(rerank_stage_started_at)
-        else:
-            final_results = results[:top_k]
-            stage_timings_ms["reranker"] = _elapsed_ms(rerank_stage_started_at)
-            if not settings.reranker_enabled:
-                stage_timings_ms["reranker_skipped"] = 1.0
-            elif len(results) <= top_k:
-                stage_timings_ms["reranker_skipped"] = 1.0
-        
-        mode_counts: dict[str, int] = defaultdict(int)
-        for item in final_results:
-            mode = str(item.metadata.get("retrieval_mode") or "unknown")
-            mode_counts[mode] += 1
-
-        final_chunk_ids = [
-            _to_int(item.metadata.get("chunk_id")) or -1
-            for item in final_results
-        ]
-        final_payload_started_at = time.perf_counter()
-        final_chunk_details: list[dict[str, Any]] = []
-        for rank, item in enumerate(final_results, start=1):
-            final_chunk_details.append(
-                {
-                    "rank": rank,
-                    "chunk_id": _to_int(item.metadata.get("chunk_id")),
-                    "document_id": _to_int(item.metadata.get("document_id")),
-                    "chunk_index": _to_int(item.metadata.get("chunk_index")),
-                    "source_page": _to_int(item.metadata.get("source_page")),
-                    "source_kind": str(item.metadata.get("source_kind") or ""),
-                    "retrieval_mode": str(item.metadata.get("retrieval_mode") or ""),
-                    "retrieval_score": _to_float(item.metadata.get("retrieval_score")),
-                    "reranker_score": _to_float(item.metadata.get("reranker_score")) if settings.reranker_enabled else None,
-                    "child_type": str(item.metadata.get("child_type") or ""),
-                    "source_metadata": item.metadata.get("source_metadata"),
-                    "content": item.page_content,
-                }
-            )
-        stage_timings_ms["build_final_payload"] = _elapsed_ms(final_payload_started_at)
-        stage_timings_ms["total"] = _elapsed_ms(query_started_at)
-
-        _emit_query_progress(
-            "[query][timing] semantic=%.2fms keyword=%.2fms rrf=%.2fms reranker=%.2fms total=%.2fms",
-            stage_timings_ms.get("semantic_candidates", 0.0),
-            stage_timings_ms.get("keyword_candidates", 0.0),
-            stage_timings_ms.get("rrf_merge", 0.0),
-            stage_timings_ms.get("reranker", 0.0),
-            stage_timings_ms.get("total", 0.0),
-            event="similarity_search_timing",
-            details={
-                "stage_timings_ms": stage_timings_ms,
-                "top_k": top_k,
-                "semantic_candidate_count": len(vector_parent_ids),
-                "keyword_candidate_count": len(keyword_parent_ids),
-                "merged_candidate_count": len(merged_parent_ids),
-                "final_result_count": len(final_results),
-            },
-        )
-
-        _emit_query_progress(
-            "[query] similarity_search done: parent_chunks=%d, final_results=%d, modes=%s, chunk_ids=%s",
-            len(chunks),
-            len(final_results),
-            dict(mode_counts),
-            _preview_ids(final_chunk_ids),
-            event="similarity_search_done",
-            details={
-                "semantic_parent_ids": vector_parent_ids,
-                "keyword_parent_ids": keyword_parent_ids,
-                "final_parent_count": len(chunks),
-                "final_result_count": len(final_results),
-                "final_modes": dict(mode_counts),
-                "final_chunk_ids": final_chunk_ids,
-                "final_chunks": final_chunk_details,
-                "stage_timings_ms": stage_timings_ms,
-                "total_elapsed_ms": stage_timings_ms.get("total", 0.0),
-            },
-        )
+            # Relevance gate: if we got enough results, no need to retry
+            effective_top_k = plan.top_k if plan else top_k
+            sufficient = max(1, effective_top_k // 2)
+            if len(final_results) >= sufficient:
+                break
 
         return final_results
+
     finally:
         total_elapsed_ms = (time.perf_counter() - started_at) * 1000
         _emit_query_progress(

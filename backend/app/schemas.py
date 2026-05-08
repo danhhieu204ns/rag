@@ -167,6 +167,13 @@ class ChatQueryRequest(BaseModel):
     message: str = Field(min_length=1)
     top_k: int | None = Field(default=None, ge=1, le=20)
     document_ids: list[int] | None = None
+    output_mode: str | None = Field(
+        default=None,
+        description=(
+            "Explicit output mode override. When provided, skips auto-detection. "
+            "Allowed: 'qa' | 'outline' | 'script' | 'quiz' | 'summary_doc'"
+        ),
+    )
 
 
 class ChatQueryResponse(BaseModel):
