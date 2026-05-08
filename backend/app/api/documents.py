@@ -38,7 +38,12 @@ from ..services.ingestion_client import (
 )
 from .auth import require_admin
 from ..models import User as AdminUser
-from ..services.rag_runtime import delete_vectors_by_document_id, get_embeddings, upsert_child_documents
+from ..services.rag_runtime import (
+    delete_vectors_by_document_id,
+    get_embeddings,
+    retrieval_service_enabled,
+    upsert_child_documents,
+)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
@@ -353,6 +358,7 @@ def _build_document_chunks_for_indexing(
     parsed_markdown_path: Path,
     source_parser: str,
     source_type: str,
+    precompute_child_vectors: bool,
 ) -> tuple[list[DocumentChunk], list[tuple[str, str]], list[dict[str, Any]]]:
     load_started_at = time.perf_counter()
     with _timed_progress("load_parsed_markdown", document_id=document_id):
@@ -510,7 +516,6 @@ def _build_document_chunks_for_indexing(
         prepare_started_at = time.perf_counter()
 
         llm_batch_size = max(1, settings.metadata_llm_batch_size)
-        # Use embedding_batch_size from settings for chunks processing
         embedding_batch_size = max(1, settings.embedding_batch_size)
         
         # We group candidates into batches for processing. 
@@ -522,7 +527,7 @@ def _build_document_chunks_for_indexing(
         ]
 
         loop = asyncio.get_running_loop()
-        embeddings_client = get_embeddings()
+        embeddings_client = get_embeddings() if precompute_child_vectors else None
 
         # Use separate pools so embedding jobs are not queued behind pending metadata jobs.
         # This preserves metadata->embedding overlap across batches.
@@ -596,9 +601,13 @@ def _build_document_chunks_for_indexing(
 
             if not texts:
                 return []
+            if not precompute_child_vectors:
+                return payload_rows
 
             # Process in batches of embedding_batch_size to optimize /api/embed calls
             all_vectors: list[list[float]] = []
+            if embeddings_client is None:
+                raise RuntimeError("Embedding client is unavailable while precomputing child vectors.")
             for i in range(0, len(texts), embedding_batch_size):
                 batch_texts = texts[i : i + embedding_batch_size]
                 batch_vectors = embeddings_client.embed_documents(batch_texts)
@@ -697,7 +706,12 @@ def _build_document_chunks_for_indexing(
         )
 
     if uncached_candidates or candidates:
-        with _timed_progress("prepare_metadata_and_child_embeddings", document_id=document_id):
+        prepare_step = (
+            "prepare_metadata_and_child_embeddings"
+            if precompute_child_vectors
+            else "prepare_metadata_and_child_payloads"
+        )
+        with _timed_progress(prepare_step, document_id=document_id):
             asyncio.run(_prepare_with_overlap())
 
     if any(item is None for item in prepared_metadata):
@@ -900,6 +914,7 @@ def _do_full_indexing_job(
             parsed_markdown_path=markdown_path,
             source_parser=source_parser,
             source_type=source_type,
+            precompute_child_vectors=not retrieval_service_enabled(),
         )
         chunk_rows, metadata_cache_payloads, precomputed_child_rows = new_chunks_data
         log.step_done(
@@ -985,7 +1000,11 @@ def _do_full_indexing_job(
                     for item in child_documents
                 ],
                 purge_document_ids=[document_id],
-                precomputed_vectors=child_vectors,
+                precomputed_vectors=(
+                    child_vectors
+                    if len(child_vectors) == len(child_documents)
+                    else None
+                ),
             )
             log.step_done("upsert_to_qdrant", indexed_count=indexed_count)
         else:

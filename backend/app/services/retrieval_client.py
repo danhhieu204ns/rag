@@ -33,7 +33,14 @@ def _request(method: str, path: str, **kwargs: Any) -> httpx.Response:
     timeout = httpx.Timeout(settings.retrieval_timeout_seconds, connect=10.0)
     with httpx.Client(timeout=timeout, headers=_headers()) as client:
         response = client.request(method, f"{settings.retrieval_service_url}{path}", **kwargs)
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = response.text.strip()
+        raise RuntimeError(
+            f"Retrieval Service request failed: {response.status_code} {response.reason_phrase}"
+            f" for {path}. {detail}"
+        ) from exc
     return response
 
 
@@ -92,7 +99,7 @@ def similarity_search(
 ) -> list[Document]:
     response = _request(
         "POST",
-        "/v1/retrieve",
+        "/v1/search/hybrid",
         json={
             "query": query,
             "top_k": top_k,

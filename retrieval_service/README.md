@@ -10,13 +10,13 @@ Other services should use this API instead of touching Qdrant directly.
 ```powershell
 cd retrieval_service
 pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8030
+uvicorn app.main:app --host 0.0.0.0 --port 8300
 ```
 
 Health check:
 
 ```text
-GET http://localhost:8030/health
+GET http://localhost:8300/health
 ```
 
 ## API
@@ -46,6 +46,7 @@ Example retrieve:
 }
 ```
 
-`/v1/search/hybrid` currently keeps the same contract as `/v1/retrieve` and uses
-vector retrieval. BM25/rerank can be added behind this route without changing the
-RAG Orchestrator contract.
+`/v1/search/hybrid` combines vector retrieval from Qdrant with keyword matching
+over `document_chunks` in the shared metadata database, then merges candidates
+with reciprocal-rank fusion. The route keeps the same contract as `/v1/retrieve`
+so the Orchestrator does not need to know the retrieval strategy.

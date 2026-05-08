@@ -22,6 +22,46 @@
 - Remote Ingestion: Document parse/split is handled by `ingestion_service`.
 - Ollama Shield: Backend calls `ollama_service` instead of exposing raw Ollama directly.
 
+## Role in the Service Architecture
+
+`backend` is the Orchestrator service. It is the only service the frontend should call directly.
+
+```text
+Frontend
+   |
+   v
+backend / Orchestrator
+   |
+   |----------------------|---------------------|
+   v                      v                     v
+ingestion_service    retrieval_service     ollama_service
+parse + split        Qdrant search/index   chat + embedding + indexing LLM
+```
+
+Backend owns:
+
+- Public API for frontend (`/api/auth`, `/api/users`, `/api/documents`, `/api/chat`).
+- Auth, admin user management, document metadata, upload persistence and chat history.
+- RAG orchestration: receive question, call retrieval, build prompt, call LLM, attach sources.
+- Indexing orchestration: queue background document jobs, call ingestion, call Ollama enrichment, then upsert child payloads through retrieval service. In local fallback mode, backend also computes embeddings before direct Qdrant upsert.
+- Fallback local Qdrant mode when `RETRIEVAL_SERVICE_URL` is empty.
+
+Backend should not own:
+
+- Heavy document parsing when `ingestion_service` is configured.
+- Direct frontend access to Ollama or Qdrant.
+- Long-term vector DB implementation details when `retrieval_service` is enabled.
+
+Recommended production boundary:
+
+```text
+backend -> ingestion_service        # parse/split documents
+backend -> ollama_service           # metadata/HyQ and answer generation
+backend -> retrieval_service        # vector upsert/search/delete
+retrieval_service -> ollama_service # chunk/query embeddings
+retrieval_service -> qdrant         # vector DB ownership
+```
+
 ## Auth Model
 
 - Document APIs (`/api/documents/*`) require admin JWT Bearer token.
@@ -68,6 +108,7 @@ OLLAMA_API_KEY=change-this-key
 OLLAMA_CHAT_MODEL=default
 OLLAMA_EMBEDDING_MODEL=default
 INGESTION_SERVICE_URL=http://localhost:8100
+RETRIEVAL_SERVICE_URL=http://localhost:8300
 ```
 
 ## Environment
@@ -102,6 +143,8 @@ If `OLLAMA_BASE_URL` or `OLLAMA_API_KEY` is missing, or `ollama_service` is unav
 - `PDF_PARSER_MODE`: `legacy` (PyMuPDF) or `marker`.
 - `INGESTION_SERVICE_URL`: Required URL for the parse/split service (example: `http://localhost:8100`).
 - `INGESTION_TIMEOUT_SECONDS`: HTTP timeout when backend calls ingestion service.
+- `RETRIEVAL_SERVICE_URL`: Recommended URL for vector search/index service (example: `http://localhost:8300` when running services manually). Empty means backend uses local retrieval/Qdrant code path.
+- `RETRIEVAL_TIMEOUT_SECONDS`: HTTP timeout when backend calls retrieval service.
 - `CHUNK_SIZE`: Target chunk length (default: 1000).
 - `CHUNK_OVERLAP`: Overlap between chunks (default: 150).
 - `RERANKER_ENABLED`: Enable BGE Reranker (default: true).
@@ -119,6 +162,14 @@ pip install marker-pdf
 ```
 
 If `INGESTION_SERVICE_URL` is empty or the service is unavailable, document parse/split requests fail and backend returns an error.
+
+If `RETRIEVAL_SERVICE_URL` is set, backend sends vector index/search/delete operations to `retrieval_service`:
+
+- `POST /v1/index/chunks`
+- `DELETE /v1/index/document/{document_id}`
+- `POST /v1/retrieve`
+
+If `RETRIEVAL_SERVICE_URL` is empty, backend uses its in-process retrieval implementation and direct Qdrant access. This fallback is useful for local compatibility, but the preferred service boundary is to let `retrieval_service` own Qdrant.
 
 When using remote ingestion, parsed markdown is cached by backend at:
 

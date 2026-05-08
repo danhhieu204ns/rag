@@ -108,8 +108,8 @@ run_service "ingestion_service" "$ROOT_DIR/ingestion_service" "$ROOT_DIR/ingesti
 wait_ready "ingestion_service" "http://127.0.0.1:8100/ready"
 
 run_service "retrieval_service" "$ROOT_DIR/retrieval_service" "$ROOT_DIR/retrieval_service/.env" \
-  python -m uvicorn app.main:app --host 0.0.0.0 --port 8030
-wait_ready "retrieval_service" "http://127.0.0.1:8030/ready"
+  python -m uvicorn app.main:app --host 0.0.0.0 --port 8300
+wait_ready "retrieval_service" "http://127.0.0.1:8300/ready"
 
 run_service "backend" "$ROOT_DIR/backend" "$ROOT_DIR/backend/.env" \
   python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000

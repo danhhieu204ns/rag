@@ -26,6 +26,7 @@ from .services.qdrant_store import (
     collection_exists,
     collection_name,
     delete_document_vectors,
+    search_hybrid_contexts,
     search_contexts,
     upsert_chunks,
 )
@@ -102,9 +103,10 @@ def _ollama_ready() -> dict[str, Any]:
             if response.status_code == 404:
                 response = client.get(f"{settings.ollama_service_url}/health")
         return {
-            "ready": response.status_code < 500,
+            "ready": 200 <= response.status_code < 300,
             "status_code": response.status_code,
             "url": settings.ollama_service_url,
+            "error": response.text if response.status_code >= 400 else None,
         }
     except Exception as exc:
         return {
@@ -143,9 +145,17 @@ def search_vector(request: VectorSearchRequest) -> RetrieveResponse:
 
 @app.post("/v1/search/hybrid", response_model=RetrieveResponse)
 async def search_hybrid(request: RetrieveRequest) -> RetrieveResponse:
-    # First version uses vector retrieval. Keep this route stable so BM25/rerank
-    # can be added behind the same contract later.
-    return await retrieve(request)
+    name = collection_name(request.collection)
+    vector = (await embed_texts([request.query]))[0]
+    return RetrieveResponse(
+        contexts=search_hybrid_contexts(
+            query=request.query,
+            vector=vector,
+            name=name,
+            top_k=request.top_k or settings.default_top_k,
+            filters=request.filters,
+        )
+    )
 
 
 @app.post("/v1/index/chunks", response_model=IndexChunksResponse)

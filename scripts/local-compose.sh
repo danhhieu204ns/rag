@@ -193,9 +193,9 @@ up() {
      OLLAMA_API_KEY='$OLLAMA_API_KEY' \
      QDRANT_URL='${QDRANT_URL:-http://127.0.0.1:6333}' \
      RETRIEVAL_DATABASE_PATH='${RETRIEVAL_DATABASE_PATH:-$ROOT_DIR/backend/storage/app.db}' \
-     python -m uvicorn app.main:app --host 0.0.0.0 --port 8030"
+     python -m uvicorn app.main:app --host 0.0.0.0 --port 8300"
 
-  wait_url "http://127.0.0.1:8030/ready" "retrieval-service" 120
+  wait_url "http://127.0.0.1:8300/ready" "retrieval-service" 120
 
   start_service "api-gateway" "$ROOT_DIR/backend" \
     "source .venv/bin/activate && \
@@ -203,7 +203,7 @@ up() {
      OLLAMA_BASE_URL='${OLLAMA_BASE_URL:-http://127.0.0.1:$OLLAMA_SERVICE_PORT}' \
      OLLAMA_API_KEY='$OLLAMA_API_KEY' \
      INGESTION_SERVICE_URL='${INGESTION_SERVICE_URL:-http://127.0.0.1:8100}' \
-     RETRIEVAL_SERVICE_URL='${RETRIEVAL_SERVICE_URL:-http://127.0.0.1:8030}' \
+     RETRIEVAL_SERVICE_URL='${RETRIEVAL_SERVICE_URL:-http://127.0.0.1:8300}' \
      QDRANT_URL='${QDRANT_URL:-http://127.0.0.1:6333}' \
      python -m uvicorn app.main:app --host 0.0.0.0 --port $API_GATEWAY_PORT"
 

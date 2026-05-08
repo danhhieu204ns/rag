@@ -232,12 +232,17 @@ def _run_query_chat_stream_inner(
     _emit_query_progress("[chat.query] Loaded history messages: count=%d", len(history))
 
     retrieval_started_at = time.perf_counter()
-    retrieved_docs = similarity_search(
-        user_text,
-        top_k=top_k,
-        db=db,
-        document_ids=payload.document_ids,
-    )
+    try:
+        retrieved_docs = similarity_search(
+            user_text,
+            top_k=top_k,
+            db=db,
+            document_ids=payload.document_ids,
+        )
+    except Exception as exc:  # pragma: no cover - depends on external services
+        _emit_query_progress("[chat.query] Retrieve context failed: %s", exc)
+        yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)})}\n\n"
+        return
     _emit_query_progress("[chat.query] Retrieved context docs: count=%d", len(retrieved_docs))
 
     sources = build_sources(retrieved_docs)

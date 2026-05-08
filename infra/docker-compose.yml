@@ -22,7 +22,7 @@ services:
       OLLAMA_BASE_URL: http://ollama-service:8020
       OLLAMA_API_KEY: ${SHIELD_API_KEY:-change-this-key}
       INGESTION_SERVICE_URL: http://ingestion-service:8100
-      RETRIEVAL_SERVICE_URL: http://retrieval-service:8030
+      RETRIEVAL_SERVICE_URL: http://retrieval-service:8300
       QDRANT_URL: http://qdrant:6333
     ports:
       - "${API_GATEWAY_PORT:-8000}:8000"
@@ -102,7 +102,7 @@ services:
       QDRANT_URL: http://qdrant:6333
       RETRIEVAL_DATABASE_PATH: /backend-storage/app.db
     expose:
-      - "8030"
+      - "8300"
     volumes:
       - backend-storage:/backend-storage
     depends_on:
@@ -116,7 +116,7 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8030/ready', timeout=5)"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/ready', timeout=5)"
     logging: *default-logging
 
   ingestion-service:

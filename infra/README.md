@@ -27,7 +27,7 @@ Only these services are published to the host by default:
 Internal services are reachable only inside the Compose network:
 
 - `ollama-service:8020`
-- `retrieval-service:8030`
+- `retrieval-service:8300`
 - `ingestion-service:8100`
 - `qdrant:6333`
 - `ollama:11434`

@@ -60,6 +60,10 @@ def load_index_if_available() -> bool:
     return _load_index_if_available_local()
 
 
+def retrieval_service_enabled() -> bool:
+    return retrieval_client.enabled()
+
+
 def similarity_search(
     query: str,
     top_k: int,
@@ -88,6 +92,7 @@ __all__ = [
     "upsert_child_documents",
     "rebuild_index_from_chunks",
     "load_index_if_available",
+    "retrieval_service_enabled",
     "similarity_search",
     "rerank_documents",
     "generate_answer",
