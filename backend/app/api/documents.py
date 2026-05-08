@@ -794,6 +794,7 @@ async def upload_document(
 
     safe_original_name = Path(file.filename).name
     generated_name = f"{uuid.uuid4().hex}_{safe_original_name}"
+    settings.uploads_dir.mkdir(parents=True, exist_ok=True)
     target_path = settings.uploads_dir / generated_name
 
     with target_path.open("wb") as destination:
