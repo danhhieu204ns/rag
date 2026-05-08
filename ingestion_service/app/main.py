@@ -8,6 +8,7 @@ import re
 import os
 import time
 from contextlib import contextmanager
+from datetime import datetime
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -33,7 +34,8 @@ logger = logging.getLogger(__name__)
 def _configure_ingestion_file_logging() -> Path:
     log_dir = settings.storage_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "ingestion_service.log"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"ingestion_service_{timestamp}.log"
 
     formatter = logging.Formatter(
         fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -403,6 +405,7 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
     texts: list[str] = []
     raw_rows: list[tuple[int, str, int | None, str, dict[str, Any], dict[str, str | None]]] = []
 
+    prepare_started = time.perf_counter()
     for item in chunks:
         text = str(item.page_content or "").strip()
         if not text:
@@ -423,14 +426,23 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
         )
         texts.append(text)
         raw_rows.append((chunk_index, text, source_page, source_kind, metadata, context))
+    logger.info(
+        "[ingestion][timing] step=enrich_batch.prepare_payload status=ok elapsed_ms=%.2f batch_size=%d input_chars=%d",
+        _ms(prepare_started),
+        len(texts),
+        sum(len(t) for t in texts),
+    )
 
     try:
-        with _timed_step("index_build.enrich_batch", parent_chunks=len(texts)):
+        with _timed_step("enrich_batch.call_indexing_batch_api", model_name="ollama_indexing_batch", batch_size=len(texts)):
             llm_items = _indexing_batch(texts)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    enrich_started = time.perf_counter()
+    generate_started = time.perf_counter()
+    total_children_generated = 0
+    total_parent_elapsed_ms = 0.0
     for idx, raw in enumerate(raw_rows):
+        parent_started = time.perf_counter()
         chunk_index, text, source_page, source_kind, metadata, context = raw
         llm_item = llm_items[idx] if idx < len(llm_items) else {}
         summary = str(llm_item.get("summary") or "")
@@ -443,6 +455,7 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
             search_opt["keywords"] = list(dict.fromkeys([*search_opt["keywords"], *keywords]))[:20]
             search_opt["entities"] = keywords[:15]
 
+        metadata_started = time.perf_counter()
         structured = {
             "source_info": {
                 "file_name": str(file.filename or ""),
@@ -457,7 +470,13 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
             },
             "hyq": _build_hyq(summary, questions, context),
         }
+        logger.info(
+            "[ingestion][timing] step=enrich_batch.build_metadata status=ok elapsed_ms=%.2f chunk_index=%d",
+            _ms(metadata_started),
+            chunk_index,
+        )
         parent_chunks[idx].source_metadata = structured
+        children_before = len(child_rows)
         child_rows.append(
             IndexBuildChildPayload(
                 chunk_index=chunk_index,
@@ -481,12 +500,25 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
                     source_metadata=structured,
                 )
             )
+        generated_for_parent = len(child_rows) - children_before
+        total_children_generated += generated_for_parent
+        parent_elapsed_ms = _ms(parent_started)
+        total_parent_elapsed_ms += parent_elapsed_ms
+        elapsed_per_child_ms = parent_elapsed_ms / generated_for_parent if generated_for_parent > 0 else 0.0
+        logger.info(
+            "[ingestion][timing] step=enrich_batch.generate_child_chunks status=ok chunk_index=%d output_children=%d elapsed_per_parent_ms=%.2f elapsed_per_child_ms=%.2f",
+            chunk_index,
+            generated_for_parent,
+            parent_elapsed_ms,
+            elapsed_per_child_ms,
+        )
 
     logger.info(
-        "[ingestion][timing] step=index_build.map_children status=ok elapsed_ms=%.2f parent_chunks=%d child_rows=%d",
-        _ms(enrich_started),
+        "[ingestion][timing] step=enrich_batch.postprocess status=ok elapsed_ms=%.2f parent_chunks=%d output_children=%d avg_elapsed_per_parent_ms=%.2f",
+        _ms(generate_started),
         len(parent_chunks),
-        len(child_rows),
+        total_children_generated,
+        (total_parent_elapsed_ms / len(raw_rows)) if raw_rows else 0.0,
     )
     logger.info(
         "[ingestion][timing] route=/v1/index/build status=ok total_elapsed_ms=%.2f filename=%s parent_chunks=%d child_rows=%d",
