@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
 class Settings:
     app_name: str
+    storage_dir: Path
     ollama_base_url: str
     shield_api_key: str
     chat_model: str
@@ -54,12 +56,16 @@ def _float_env(name: str, default: float) -> float:
 
 
 def get_settings() -> Settings:
+    root = Path(__file__).resolve().parents[2]
+    storage_dir = Path(_string_env("OLLAMA_STORAGE_DIR", str(root / "storage")))
+    storage_dir.mkdir(parents=True, exist_ok=True)
     ollama_base_url = _string_env(
         "UPSTREAM_OLLAMA_BASE_URL",
         _string_env("OLLAMA_UPSTREAM_BASE_URL", _string_env("OLLAMA_BASE_URL", "http://127.0.0.1:11434")),
     ).rstrip("/")
     return Settings(
         app_name=_string_env("OLLAMA_SHIELD_APP_NAME", "Ollama FastAPI Shield"),
+        storage_dir=storage_dir,
         ollama_base_url=ollama_base_url,
         shield_api_key=_string_env("SHIELD_API_KEY", ""),
         chat_model=_string_env("CHAT_MODEL", "qwen3:30b-a3b-instruct-2507-q4_K_M"),

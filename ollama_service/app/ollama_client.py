@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -14,6 +15,10 @@ from .core.settings import settings
 logger = logging.getLogger(__name__)
 
 
+def _ms(start: float) -> float:
+    return (time.perf_counter() - start) * 1000.0
+
+
 def model_dump(obj: BaseModel) -> dict[str, Any]:
     if hasattr(obj, "model_dump"):
         return obj.model_dump(exclude_none=True)
@@ -24,7 +29,7 @@ def validate_text_length(text: str, max_chars: int, field_name: str) -> None:
     if len(str(text or "")) > max_chars:
         raise HTTPException(
             status_code=413,
-            detail=f"{field_name} quá dài. Tối đa {max_chars} ký tự.",
+            detail=f"{field_name} quÃ¡ dÃ i. Tá»‘i Ä‘a {max_chars} kÃ½ tá»±.",
         )
 
 
@@ -40,7 +45,7 @@ def validate_text_batch(
         return
 
     if len(texts) > max_items:
-        raise HTTPException(status_code=413, detail=f"Tối đa {max_items} đoạn text/lần.")
+        raise HTTPException(status_code=413, detail=f"Tá»‘i Ä‘a {max_items} Ä‘oáº¡n text/láº§n.")
 
     for index, item in enumerate(texts):
         validate_text_length(str(item), max_chars, f"{field_name}[{index}]")
@@ -68,36 +73,59 @@ def _timeout(total_seconds: float) -> httpx.Timeout:
 
 
 async def post_ollama(path: str, payload: dict[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
+    started = time.perf_counter()
+    model_name = payload.get("model")
     async with httpx.AsyncClient(timeout=_timeout(timeout_seconds)) as client:
         try:
             logger.info(
-                "[ollama-service] -> upstream POST %s base_url=%s timeout=%.1fs",
+                "[ollama-service] -> upstream POST %s base_url=%s timeout=%.1fs model=%s",
                 path,
                 settings.ollama_base_url,
                 timeout_seconds,
+                model_name,
             )
             response = await client.post(f"{settings.ollama_base_url}{path}", json=payload)
         except httpx.TimeoutException as exc:
-            logger.error("[ollama-service] upstream timeout POST %s: %s", path, exc)
-            raise HTTPException(status_code=504, detail=f"Ollama timeout khi gọi {path}.") from exc
+            logger.error(
+                "[ollama-service][timing] upstream timeout POST %s model=%s elapsed_ms=%.2f: %s",
+                path,
+                model_name,
+                _ms(started),
+                exc,
+            )
+            raise HTTPException(status_code=504, detail=f"Ollama timeout khi gá»i {path}.") from exc
         except httpx.RequestError as exc:
-            logger.error("[ollama-service] upstream request error POST %s: %s", path, exc)
-            raise HTTPException(status_code=502, detail=f"Không kết nối được Ollama: {exc}") from exc
+            logger.error(
+                "[ollama-service][timing] upstream request error POST %s model=%s elapsed_ms=%.2f: %s",
+                path,
+                model_name,
+                _ms(started),
+                exc,
+            )
+            raise HTTPException(status_code=502, detail=f"KhÃ´ng káº¿t ná»‘i Ä‘Æ°á»£c Ollama: {exc}") from exc
 
     if response.status_code >= 400:
         logger.error(
-            "[ollama-service] upstream returned HTTP %s for POST %s",
+            "[ollama-service][timing] upstream returned HTTP %s for POST %s model=%s elapsed_ms=%.2f",
             response.status_code,
             path,
+            model_name,
+            _ms(started),
         )
         raise HTTPException(status_code=response.status_code, detail=response.text)
 
     try:
-        logger.info("[ollama-service] upstream POST %s ok status=%s", path, response.status_code)
+        logger.info(
+            "[ollama-service][timing] upstream POST %s ok status=%s model=%s elapsed_ms=%.2f",
+            path,
+            response.status_code,
+            model_name,
+            _ms(started),
+        )
         return response.json()
     except ValueError as exc:
         logger.error("[ollama-service] upstream JSON decode failed POST %s", path)
-        raise HTTPException(status_code=502, detail=f"Ollama trả response không phải JSON từ {path}.") from exc
+        raise HTTPException(status_code=502, detail=f"Ollama tráº£ response khÃ´ng pháº£i JSON tá»« {path}.") from exc
 
 
 async def get_ollama(path: str, *, timeout_seconds: float) -> dict[str, Any]:
@@ -112,10 +140,10 @@ async def get_ollama(path: str, *, timeout_seconds: float) -> dict[str, Any]:
             response = await client.get(f"{settings.ollama_base_url}{path}")
         except httpx.TimeoutException as exc:
             logger.error("[ollama-service] upstream timeout GET %s: %s", path, exc)
-            raise HTTPException(status_code=504, detail=f"Ollama timeout khi gọi {path}.") from exc
+            raise HTTPException(status_code=504, detail=f"Ollama timeout khi gá»i {path}.") from exc
         except httpx.RequestError as exc:
             logger.error("[ollama-service] upstream request error GET %s: %s", path, exc)
-            raise HTTPException(status_code=502, detail=f"Không kết nối được Ollama: {exc}") from exc
+            raise HTTPException(status_code=502, detail=f"KhÃ´ng káº¿t ná»‘i Ä‘Æ°á»£c Ollama: {exc}") from exc
 
     if response.status_code >= 400:
         logger.error(
@@ -130,7 +158,7 @@ async def get_ollama(path: str, *, timeout_seconds: float) -> dict[str, Any]:
         return response.json()
     except ValueError as exc:
         logger.error("[ollama-service] upstream JSON decode failed GET %s", path)
-        raise HTTPException(status_code=502, detail=f"Ollama trả response không phải JSON từ {path}.") from exc
+        raise HTTPException(status_code=502, detail=f"Ollama tráº£ response khÃ´ng pháº£i JSON tá»« {path}.") from exc
 
 
 def parse_ollama_json_response(ollama_result: dict[str, Any]) -> dict[str, Any]:
@@ -141,7 +169,7 @@ def parse_ollama_json_response(ollama_result: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(
             status_code=502,
             detail={
-                "message": "Model không trả về JSON hợp lệ.",
+                "message": "Model khÃ´ng tráº£ vá» JSON há»£p lá»‡.",
                 "raw_response": raw_response,
             },
         ) from exc
@@ -150,7 +178,7 @@ def parse_ollama_json_response(ollama_result: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(
             status_code=502,
             detail={
-                "message": "Model JSON response không phải object.",
+                "message": "Model JSON response khÃ´ng pháº£i object.",
                 "raw_response": raw_response,
             },
         )
