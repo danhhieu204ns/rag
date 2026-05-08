@@ -388,30 +388,40 @@ class MetadataBundleGenerator:
     ) -> list[ChunkEnrichmentResult | None]:
         results: list[ChunkEnrichmentResult | None] = [None] * len(chunk_texts)
         headers = ollama_service_headers()
+        instruction = (
+            "Bạn là hệ thống xử lý tài liệu cho RAG indexing.\n"
+            "Hãy phân tích văn bản và trả về JSON hợp lệ, không giải thích thêm.\n"
+            "Schema bắt buộc gồm các field: summary (string), hyq (list[string]), metadata.keywords (list[string])."
+        )
 
-        payload = {"texts": chunk_texts}
-        try:
-            client = self._get_http_client()
-            r = client.post(
-                f"{self.base_url}/v1/indexing/batch",
-                json=payload,
-                headers=headers,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception as exc:
-            raise RuntimeError(f"Ollama service request failed at /v1/indexing/batch: {exc}") from exc
+        def build_prompt(text: str) -> str:
+            return f"{instruction}\n\nVăn bản cần xử lý:\n\"\"\"\n{text}\n\"\"\""
 
-        items = data.get("items") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            raise RuntimeError("Ollama service returned an invalid response for /v1/indexing/batch.")
+        client = self._get_http_client()
+        items: list[dict[str, Any]] = []
+        for index, text in enumerate(chunk_texts):
+            try:
+                r = client.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "prompt": build_prompt(text),
+                        "format": "json",
+                        "options": {"num_predict": 768},
+                    },
+                    headers=headers,
+                )
+                r.raise_for_status()
+                data = r.json()
+                raw_response = str(data.get("response") or "")
+                item = json.loads(raw_response)
+            except Exception as exc:
+                raise RuntimeError(f"Ollama service indexing failed for chunk {index}: {exc}") from exc
+
+            if not isinstance(item, dict):
+                raise RuntimeError(f"Ollama service returned non-object JSON at chunk {index}.")
+            items.append(item)
 
         for index, item in enumerate(items):
-            if not isinstance(item, dict):
-                raise RuntimeError(f"Ollama service returned an invalid batch item at index {index}.")
-            if item.get("error"):
-                raise RuntimeError(f"Ollama service indexing failed for chunk {index}: {item.get('error')}")
-
             summary = item.get("summary") or ""
             hyq = item.get("hyq") or []
             metadata = item.get("metadata") or {}

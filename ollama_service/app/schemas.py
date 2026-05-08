@@ -16,19 +16,14 @@ class ChatRequest(BaseModel):
 
 
 class GenerateRequest(BaseModel):
+    model: str | None = None
     prompt: str = Field(..., min_length=1)
     system: str | None = None
     options: dict[str, Any] | None = None
 
 
-class IndexingRequest(BaseModel):
-    text: str = Field(..., min_length=1)
-    instruction: str | None = None
-    options: dict[str, Any] | None = None
-
-
 class IndexingBatchRequest(BaseModel):
-    texts: list[str] = Field(..., min_length=1)
+    texts: list[str] = Field(..., min_length=1, max_length=100)
     instruction: str | None = None
     options: dict[str, Any] | None = None
 

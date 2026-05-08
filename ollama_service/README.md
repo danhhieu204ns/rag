@@ -3,10 +3,10 @@
 Service shield/proxy đặt trước Ollama. Backend chỉ gọi service này, còn service sẽ:
 
 - Bảo vệ API bằng header `x-api-key`.
-- Ép model theo cấu hình server cho chat, indexing và embedding.
+- Ép model theo cấu hình server cho chat và embedding.
 - Giới hạn số request/phút, độ dài prompt và `num_predict`.
 - Cung cấp endpoint tương thích Ollama cho `ChatOllama` và `OllamaEmbeddings`.
-- Cung cấp endpoint `/v1/indexing/batch` cho pipeline sinh summary, HyQ và metadata.
+- Chỉ cung cấp inference endpoints (`generate` / `embed` / `chat`), không chứa business logic RAG.
 
 ## Run
 
@@ -66,7 +66,6 @@ Protected bằng `x-api-key`:
 - `GET /api/tags`
 - `POST /v1/chat`
 - `POST /v1/generate`
-- `POST /v1/indexing`
 - `POST /v1/indexing/batch`
 - `POST /v1/embed`
 - `POST /api/chat`
@@ -80,6 +79,6 @@ Backend hiện dùng:
 
 - Chat/RAG: `POST /api/chat` qua `ChatOllama`.
 - Embedding: `POST /api/embed` qua `OllamaEmbeddings`.
-- Metadata indexing: `POST /v1/indexing/batch` qua `backend/app/services/chunk_metadata.py`.
+- Metadata indexing: ingestion service gọi `POST /v1/indexing/batch`; shield tự build prompt/schema và fan-out sang Ollama.
 
 Service này giữ cả `/api/embed` và `/api/embeddings` để tương thích với các phiên bản Ollama client mới/cũ.

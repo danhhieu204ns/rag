@@ -7,6 +7,12 @@ Bạn là hệ thống xử lý tài liệu cho RAG indexing.
 Hãy phân tích văn bản và trả về JSON hợp lệ, không giải thích thêm.
 
 Schema bắt buộc:
+Ràng buộc output:
+- Chỉ trả về đúng 1 JSON object.
+- `summary` tối đa 5 câu.
+- `hyq` đúng 3 câu hỏi, mỗi câu tối đa 160 ký tự.
+- Không lặp lại bảng, HTML, số trang, danh mục dẫn chiếu hoặc nội dung dạng `<br>`.
+
 {
   "summary": "Tóm tắt ngắn 3-5 câu",
   "hyq": [

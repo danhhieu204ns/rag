@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-from datetime import datetime
 
 import httpx
 from dotenv import load_dotenv
@@ -34,7 +34,6 @@ from .schemas import (
     EmbedRequest,
     GenerateRequest,
     IndexingBatchRequest,
-    IndexingRequest,
     OllamaNativeChatRequest,
     OllamaNativeEmbedRequest,
     OllamaNativeEmbeddingsRequest,
@@ -77,8 +76,8 @@ def _configure_ollama_file_logging() -> Path:
 
 app = FastAPI(
     title=settings.app_name,
-    version="2.1.0",
-    description="Protected API gateway for Ollama models: chat, indexing, embedding.",
+    version="2.2.0",
+    description="Protected API gateway for Ollama inference: chat, generate, embed.",
 )
 _OLLAMA_LOG_PATH = _configure_ollama_file_logging()
 logger.info("[ollama-service] file logging enabled path=%s", _OLLAMA_LOG_PATH)
@@ -164,8 +163,9 @@ async def generate(req: GenerateRequest, api_key: str = Depends(verify_api_key))
     if req.system:
         validate_text_length(req.system, settings.max_chat_chars, "system")
 
+    model_name = (req.model or "").strip() or settings.indexing_model
     payload: dict[str, Any] = {
-        "model": settings.chat_model,
+        "model": model_name,
         "prompt": req.prompt,
         "options": req.options or {},
     }
@@ -180,30 +180,77 @@ async def generate(req: GenerateRequest, api_key: str = Depends(verify_api_key))
     )
 
 
-@app.post("/v1/indexing")
-async def indexing(req: IndexingRequest, api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
-    enforce_rate_limit(api_key, "indexing")
-    validate_text_length(req.text, settings.max_indexing_chars, "text")
-
-    logger.info(
-        "[ollama-service] /v1/indexing text_chars=%d instruction_chars=%d model=%s",
-        len(req.text),
-        len(req.instruction or INDEXING_INSTRUCTION),
-        settings.indexing_model,
+async def _call_indexing_model(
+    *,
+    text: str,
+    instruction: str,
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "model": settings.indexing_model,
+        "prompt": build_indexing_prompt(instruction, text),
+        "format": "json",
+        "options": options,
+    }
+    payload = enforce_num_predict(payload, settings.max_indexing_num_predict)
+    return await post_ollama(
+        "/api/generate",
+        payload,
+        timeout_seconds=settings.ollama_indexing_timeout_seconds,
     )
 
-    ollama_result = await _call_indexing_model(
-        text=req.text,
-        instruction=req.instruction or INDEXING_INSTRUCTION,
-        options=req.options or {},
+
+def _normalize_indexing_response(parsed: dict[str, Any], ollama_result: dict[str, Any]) -> dict[str, Any]:
+    summary = str(parsed.get("summary") or "").strip()
+    hyq = parsed.get("hyq")
+    questions = [str(item).strip()[:240] for item in hyq if str(item).strip()] if isinstance(hyq, list) else []
+    metadata = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
+    language = str(parsed.get("language") or "vi").strip() or "vi"
+    return {
+        "summary": summary[:1200],
+        "hyq": questions[:3],
+        "metadata": metadata,
+        "language": language[:16],
+        "usage": usage_payload(ollama_result),
+    }
+
+
+def _fallback_indexing_response(text: str, ollama_result: dict[str, Any], error: Exception) -> dict[str, Any]:
+    raw_response = str(ollama_result.get("response") or "")
+    summary = " ".join(str(text or "").split())[:700] or "Không có tóm tắt."
+    logger.warning(
+        "[ollama-service] indexing JSON parse failed; using fallback text_chars=%d raw_chars=%d error=%s",
+        len(text),
+        len(raw_response),
+        error,
     )
-    logger.info("[ollama-service] /v1/indexing done")
-    return _indexing_response_from_ollama(ollama_result)
+    return {
+        "summary": summary,
+        "hyq": [
+            "Nội dung chính của đoạn này là gì?",
+            "Đoạn này chứa các thông tin quan trọng nào?",
+            "Có thể dùng đoạn này để trả lời câu hỏi nào?",
+        ],
+        "metadata": {"keywords": [], "risk_level": "low"},
+        "language": "vi",
+        "usage": usage_payload(ollama_result),
+        "fallback": {
+            "reason": "invalid_model_json",
+            "raw_response_preview": raw_response[:500],
+        },
+    }
+
+
+def _indexing_response_from_ollama(text: str, ollama_result: dict[str, Any]) -> dict[str, Any]:
+    try:
+        parsed = parse_ollama_json_response(ollama_result)
+    except Exception as exc:
+        return _fallback_indexing_response(text, ollama_result, exc)
+    return _normalize_indexing_response(parsed, ollama_result)
 
 
 @app.post("/v1/indexing/batch")
 async def indexing_batch(req: IndexingBatchRequest, api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
-    request_started = time.perf_counter()
     enforce_rate_limit(api_key, "indexing_batch")
 
     if len(req.texts) > 100:
@@ -221,80 +268,34 @@ async def indexing_batch(req: IndexingBatchRequest, api_key: str = Depends(verif
     instruction = req.instruction or INDEXING_INSTRUCTION
     options = req.options or {}
     semaphore = asyncio.Semaphore(settings.indexing_concurrency)
-    input_chars = sum(len(str(item or "")) for item in req.texts)
 
     logger.info(
-        "[ollama-service] /v1/indexing/batch items=%d instruction_chars=%d model=%s concurrency=%d input_chars=%d",
+        "[ollama-service] /v1/indexing/batch items=%d instruction_chars=%d model=%s concurrency=%d",
         len(req.texts),
         len(instruction),
         settings.indexing_model,
         settings.indexing_concurrency,
-        input_chars,
-    )
-    logger.info(
-        "[ollama-service][timing] step=enrich_batch.prepare_payload status=ok batch_size=%d input_chars=%d model_name=%s",
-        len(req.texts),
-        input_chars,
-        settings.indexing_model,
     )
 
     async def call_one(index: int, text: str) -> tuple[int, dict[str, Any]]:
         async with semaphore:
-            started = time.perf_counter()
             try:
                 ollama_result = await _call_indexing_model(
                     text=text,
                     instruction=instruction,
                     options=options,
                 )
-                item = _indexing_response_from_ollama(ollama_result)
-                hyq = item.get("hyq")
-                output_children = (1 + len(hyq)) if isinstance(hyq, list) else 1
-                usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
-                logger.info(
-                    "[ollama-service][timing] step=enrich_batch.generate_child_chunks status=ok index=%d output_children=%d elapsed_per_parent_ms=%.2f elapsed_per_child_ms=%.2f prompt_eval_count=%s eval_count=%s",
-                    index,
-                    output_children,
-                    _ms(started),
-                    (_ms(started) / output_children) if output_children > 0 else 0.0,
-                    usage.get("prompt_eval_count"),
-                    usage.get("eval_count"),
-                )
-                return index, item
+                return index, _indexing_response_from_ollama(text, ollama_result)
             except Exception as exc:
-                logger.exception(
-                    "[ollama-service][timing] step=enrich_batch.generate_child_chunks status=error index=%d elapsed_per_parent_ms=%.2f",
-                    index,
-                    _ms(started),
-                )
                 return index, {"error": str(exc)}
 
-    api_started = time.perf_counter()
     tasks = [call_one(index, text) for index, text in enumerate(req.texts)]
     results: list[dict[str, Any] | None] = [None] * len(tasks)
     for task in asyncio.as_completed(tasks):
         index, item = await task
         results[index] = item
-    logger.info(
-        "[ollama-service][timing] step=enrich_batch.call_indexing_batch_api status=ok elapsed_ms=%.2f batch_size=%d model_name=%s",
-        _ms(api_started),
-        len(req.texts),
-        settings.indexing_model,
-    )
 
     error_count = sum(1 for item in results if isinstance(item, dict) and item.get("error"))
-    output_children = 0
-    for item in results:
-        if not isinstance(item, dict) or item.get("error"):
-            continue
-        hyq = item.get("hyq")
-        output_children += 1 + (len(hyq) if isinstance(hyq, list) else 0)
-    logger.info(
-        "[ollama-service][timing] step=enrich_batch.postprocess status=ok output_children=%d errors=%d elapsed_ms=%.2f",
-        output_children,
-        error_count,
-        _ms(request_started),
-    )
     logger.info(
         "[ollama-service] /v1/indexing/batch done items=%d errors=%d",
         len(results),
@@ -322,11 +323,12 @@ async def embed(req: EmbedRequest, api_key: str = Depends(verify_api_key)) -> di
     if req.options:
         payload["options"] = req.options
 
+    input_batch = req.input if isinstance(req.input, list) else [req.input]
     logger.info(
-        "[ollama-service][timing] step=enrich_batch.generate_embedding status=start model_name=%s batch_size=%d input_chars=%d",
+        "[ollama-service][timing] step=generate_embedding status=start model_name=%s batch_size=%d input_chars=%d",
         settings.embedding_model,
-        len(req.input),
-        sum(len(str(item or "")) for item in req.input),
+        len(input_batch),
+        sum(len(str(item or "")) for item in input_batch),
     )
     result = await post_ollama(
         "/api/embed",
@@ -336,7 +338,7 @@ async def embed(req: EmbedRequest, api_key: str = Depends(verify_api_key)) -> di
     embeddings = result.get("embeddings")
     output_vectors = len(embeddings) if isinstance(embeddings, list) else 0
     logger.info(
-        "[ollama-service][timing] step=enrich_batch.generate_embedding status=ok model_name=%s output_vectors=%d elapsed_ms=%.2f",
+        "[ollama-service][timing] step=generate_embedding status=ok model_name=%s output_vectors=%d elapsed_ms=%.2f",
         settings.embedding_model,
         output_vectors,
         _ms(started),
@@ -429,7 +431,7 @@ async def native_generate(req: OllamaNativeGenerateRequest, api_key: str = Depen
     validate_text_length(req.prompt, settings.max_chat_chars, "prompt")
 
     payload: dict[str, Any] = {
-        "model": settings.chat_model,
+        "model": settings.indexing_model,
         "prompt": req.prompt,
         "options": req.options or {},
     }
@@ -446,54 +448,6 @@ async def native_generate(req: OllamaNativeGenerateRequest, api_key: str = Depen
         payload,
         timeout_seconds=settings.ollama_chat_timeout_seconds,
     )
-
-
-async def _call_indexing_model(
-    *,
-    text: str,
-    instruction: str,
-    options: dict[str, Any],
-) -> dict[str, Any]:
-    started = time.perf_counter()
-    prompt = build_indexing_prompt(instruction=instruction, text=text)
-    logger.info(
-        "[ollama-service] call indexing model=%s prompt_chars=%d text_chars=%d",
-        settings.indexing_model,
-        len(prompt),
-        len(text),
-    )
-    payload: dict[str, Any] = {
-        "model": settings.indexing_model,
-        "prompt": prompt,
-        "format": "json",
-        "options": dict(options),
-    }
-    payload = enforce_num_predict(payload, settings.max_indexing_num_predict)
-    result = await post_ollama(
-        "/api/generate",
-        payload,
-        timeout_seconds=settings.ollama_indexing_timeout_seconds,
-    )
-    logger.info(
-        "[ollama-service][timing] step=model_generate status=ok model_name=%s input_chars=%d elapsed_ms=%.2f prompt_eval_count=%s eval_count=%s",
-        settings.indexing_model,
-        len(text),
-        _ms(started),
-        result.get("prompt_eval_count"),
-        result.get("eval_count"),
-    )
-    return result
-
-
-def _indexing_response_from_ollama(ollama_result: dict[str, Any]) -> dict[str, Any]:
-    parsed = parse_ollama_json_response(ollama_result)
-    return {
-        "summary": parsed.get("summary"),
-        "hyq": parsed.get("hyq", []),
-        "metadata": parsed.get("metadata", {}),
-        "language": parsed.get("language"),
-        "usage": usage_payload(ollama_result),
-    }
 
 
 def _validate_messages(messages: list[Any]) -> None:

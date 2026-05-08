@@ -148,6 +148,37 @@ class IndexUpsertResponse(BaseModel):
 
 _DATE_PATTERN = re.compile(r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4})\b")
 _DOC_CODE_PATTERN = re.compile(r"\b\d{1,6}[/-][A-Za-z]{1,12}(?:[/-][A-Za-z0-9]{1,16})+\b")
+_INDEXING_INSTRUCTION = """
+Bạn là hệ thống xử lý tài liệu cho RAG indexing.
+
+Hãy phân tích văn bản và trả về JSON hợp lệ, không giải thích thêm.
+Ràng buộc output:
+- Chỉ trả về đúng 1 JSON object.
+- `summary` tối đa 5 câu.
+- `hyq` đúng 3 câu hỏi, mỗi câu tối đa 160 ký tự.
+- Không lặp lại bảng, HTML, số trang, danh mục dẫn chiếu hoặc nội dung dạng `<br>`.
+
+Schema bắt buộc:
+{
+  "summary": "Tóm tắt ngắn 3-5 câu",
+  "hyq": [
+    "Câu hỏi giả định 1",
+    "Câu hỏi giả định 2",
+    "Câu hỏi giả định 3"
+  ],
+  "metadata": {
+    "title": null,
+    "topic": null,
+    "keywords": [],
+    "document_type": null,
+    "department_or_unit": null,
+    "date": null,
+    "people": [],
+    "risk_level": "low"
+  },
+  "language": "vi"
+}
+""".strip()
 
 
 def _normalize_spaces(text: str) -> str:
@@ -217,31 +248,52 @@ def _indexing_batch(chunk_texts: list[str]) -> list[dict[str, Any]]:
     if not ollama_base:
         raise RuntimeError("OLLAMA_BASE_URL is required for indexing enrichment in ingestion_service.")
     endpoint = f"{ollama_base}/v1/indexing/batch"
-    last_exc: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            with httpx.Client(timeout=180.0, headers=_indexing_headers()) as client:
-                resp = client.post(endpoint, json={"texts": chunk_texts})
-            break
-        except httpx.ConnectError as exc:
-            last_exc = exc
-            if attempt == 3:
-                raise RuntimeError(f"Failed to connect to Ollama indexing endpoint {endpoint}: {exc}") from exc
-            time.sleep(0.5 * attempt)
-        except httpx.RequestError as exc:
-            raise RuntimeError(f"Ollama indexing request error at {endpoint}: {exc}") from exc
-    else:
-        if last_exc is not None:
-            raise RuntimeError(f"Failed to connect to Ollama indexing endpoint {endpoint}: {last_exc}") from last_exc
-        raise RuntimeError(f"Ollama indexing request failed unexpectedly at {endpoint}.")
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Ollama indexing request failed at {endpoint}: {resp.status_code} {resp.text}")
-    payload = resp.json()
-    items = payload.get("items") if isinstance(payload, dict) else None
-    if not isinstance(items, list):
-        raise RuntimeError("Invalid response from /v1/indexing/batch.")
-    return [item if isinstance(item, dict) else {} for item in items]
 
+    results: list[dict[str, Any]] = []
+    batch_size = 100
+    with httpx.Client(timeout=settings.retrieval_timeout_seconds, headers=_indexing_headers()) as client:
+        for start in range(0, len(chunk_texts), batch_size):
+            batch = chunk_texts[start : start + batch_size]
+            payload = {
+                "texts": batch,
+                "instruction": _INDEXING_INSTRUCTION,
+                "options": {"num_predict": 768},
+            }
+            batch_started = time.perf_counter()
+            response = client.post(endpoint, json=payload)
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Indexing batch request failed for chunks {start}-{start + len(batch) - 1}: "
+                    f"{response.status_code} {response.text}"
+                )
+            try:
+                upstream = response.json()
+            except ValueError as exc:
+                raise RuntimeError(f"Indexing batch returned non-JSON response for chunks {start}-{start + len(batch) - 1}.") from exc
+            items = upstream.get("items") if isinstance(upstream, dict) else None
+            if not isinstance(items, list):
+                raise RuntimeError(f"Indexing batch response missing items list for chunks {start}-{start + len(batch) - 1}.")
+            if len(items) != len(batch):
+                raise RuntimeError(
+                    f"Indexing batch response item count mismatch for chunks {start}-{start + len(batch) - 1}: "
+                    f"expected {len(batch)}, got {len(items)}."
+                )
+
+            for offset, item in enumerate(items):
+                index = start + offset
+                if not isinstance(item, dict):
+                    raise RuntimeError(f"Indexing batch returned invalid item at index {index}.")
+                if item.get("error"):
+                    raise RuntimeError(f"Index enrichment failed for chunk {index}: {item['error']}")
+                results.append(item)
+            logger.info(
+                "[ingestion][timing] step=enrich_batch.call_indexing_batch_api.sub_batch status=ok elapsed_ms=%.2f batch_start=%d batch_size=%d indexed_total=%d",
+                _ms(batch_started),
+                start,
+                len(batch),
+                len(results),
+            )
+    return results
 
 app = FastAPI(title=settings.app_name)
 _INGESTION_LOG_PATH = _configure_ingestion_file_logging()
