@@ -28,6 +28,7 @@ class Settings:
     query_rewrite_enabled: bool
     query_rewrite_min_terms: int
     query_rewrite_max_terms: int
+    orchestrator_enabled: bool
     # Hybrid retrieval
     hybrid_probe_multiplier: int
     hybrid_rrf_k: int
@@ -145,6 +146,7 @@ def get_settings() -> Settings:
             _int_env_any(("QUERY_REWRITE_MIN_TERMS", "QUERY_REWRITE_MIN_WORDS"), 5),
         ),
         query_rewrite_max_terms=max(1, _int_env("QUERY_REWRITE_MAX_TERMS", 12)),
+        orchestrator_enabled=_bool_env("ORCHESTRATOR_ENABLED", True),
         hybrid_probe_multiplier=max(1, _int_env("HYBRID_PROBE_MULTIPLIER", 4)),
         hybrid_rrf_k=max(1, _int_env("HYBRID_RRF_K", 60)),
         hybrid_vector_rrf_weight=_float_env("HYBRID_VECTOR_RRF_WEIGHT", 1.0),
