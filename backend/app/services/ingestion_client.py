@@ -13,12 +13,17 @@ from ..core.settings import settings
 logger = logging.getLogger(__name__)
 
 
-def _service_enabled() -> bool:
-    return bool(settings.ingestion_service_url.strip())
+def _require_service_url() -> str:
+    service_url = settings.ingestion_service_url.strip()
+    if not service_url:
+        raise RuntimeError(
+            "INGESTION_SERVICE_URL is not configured. Backend requires the ingestion service for document parse/split."
+        )
+    return service_url
 
 
 def _service_url(path: str) -> str:
-    return f"{settings.ingestion_service_url}{path}"
+    return f"{_require_service_url()}{path}"
 
 
 def _raise_service_error(response: httpx.Response) -> None:
@@ -35,11 +40,7 @@ def _raise_service_error(response: httpx.Response) -> None:
 
 
 def parse_source_to_markdown(file_path: Path) -> tuple[str, str, str]:
-    if not _service_enabled():
-        logger.info("[ingestion-client] Using local parse for %s because INGESTION_SERVICE_URL is empty.", file_path)
-        from .document_processing import parse_source_to_markdown as _local_parse_source_to_markdown
-
-        return _local_parse_source_to_markdown(file_path)
+    _require_service_url()
 
     try:
         url = _service_url("/v1/parse")
@@ -76,17 +77,7 @@ def load_documents_from_parsed_markdown(
     source_parser: str,
     source_type: str,
 ) -> list[Document]:
-    if not _service_enabled():
-        from .document_processing import (
-            load_documents_from_parsed_markdown as _local_load_documents_from_parsed_markdown,
-        )
-
-        return _local_load_documents_from_parsed_markdown(
-            markdown_path,
-            source_file_path=source_file_path,
-            source_parser=source_parser,
-            source_type=source_type,
-        )
+    _require_service_url()
 
     markdown = markdown_path.read_text(encoding="utf-8").strip()
     if not markdown:
@@ -110,18 +101,7 @@ def split_source_documents(
     chunk_size: int,
     chunk_overlap: int,
 ) -> list[Document]:
-    if not _service_enabled():
-        logger.info(
-            "[ingestion-client] Using local split for %d documents because INGESTION_SERVICE_URL is empty.",
-            len(documents),
-        )
-        from .document_processing import split_source_documents as _local_split_source_documents
-
-        return _local_split_source_documents(
-            documents,
-            chunk_size,
-            chunk_overlap,
-        )
+    _require_service_url()
 
     if not documents:
         return []

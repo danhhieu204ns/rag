@@ -19,7 +19,7 @@
 - Qdrant as vector store backend (local mode by default, remote mode optional)
 - Chat query endpoint with persistent chat memory
 - Remote Indexing: Offloads metadata, summary, and HyQ generation to a remote Shield API.
-- Remote Ingestion: Offloads document parse/split to `ingestion_service` when `INGESTION_SERVICE_URL` is configured.
+- Remote Ingestion: Document parse/split is handled by `ingestion_service`.
 - Ollama Shield: Backend calls `ollama_service` instead of exposing raw Ollama directly.
 
 ## Auth Model
@@ -98,7 +98,7 @@ INGESTION_SERVICE_URL=http://localhost:8100
 
 ### Ingestion & Retrieval
 - `PDF_PARSER_MODE`: `legacy` (PyMuPDF) or `marker`.
-- `INGESTION_SERVICE_URL`: Optional URL for external parse/split service (example: `http://localhost:8100`).
+- `INGESTION_SERVICE_URL`: Required URL for the parse/split service (example: `http://localhost:8100`).
 - `INGESTION_TIMEOUT_SECONDS`: HTTP timeout when backend calls ingestion service.
 - `CHUNK_SIZE`: Target chunk length (default: 1000).
 - `CHUNK_OVERLAP`: Overlap between chunks (default: 150).
@@ -116,7 +116,7 @@ cd ingestion_service
 pip install marker-pdf
 ```
 
-If `INGESTION_SERVICE_URL` is empty, backend falls back to local parsing and parser dependencies must be available in the backend venv.
+If `INGESTION_SERVICE_URL` is empty or the service is unavailable, document parse/split requests fail and backend returns an error.
 
 When using remote ingestion, parsed markdown is cached by backend at:
 
@@ -125,10 +125,6 @@ When using remote ingestion, parsed markdown is cached by backend at:
 Marker/debug markdown logs are written by the process that performs parsing. With remote ingestion this is usually:
 
 - `ingestion_service/storage/markdown_logs/marker/<uploaded_file_stem>.md`
-
-With backend local parsing this is:
-
-- `backend/storage/markdown_logs/marker/<uploaded_file_stem>.md`
 
 This file is regenerated on each embed so you can quickly inspect parsing output.
 
