@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
-from contextlib import contextmanager
 from datetime import datetime
 import hashlib
 import json
@@ -11,7 +9,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.exc import OperationalError
@@ -19,7 +17,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..core.settings import settings
-from ..core.request_logger import request_logging_context, get_request_logger
+from ..core.request_logger import request_logging_context
 from ..db import SessionLocal, get_db
 from ..models import ChunkMetadataCache, Document, DocumentChunk, DocumentIndexState
 from ..schemas import (
@@ -32,7 +30,6 @@ from ..schemas import (
 )
 from ..services.chunk_metadata import build_hyq_children, build_structured_chunk_metadata_batch
 from ..services.ingestion_client import (
-    load_documents_from_parsed_markdown,
     parse_source_to_markdown,
     split_source_documents,
 )
@@ -47,37 +44,6 @@ from ..services.rag_runtime import (
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
-
-
-def _emit_progress(message: str, *args: object) -> None:
-    text = message % args if args else message
-    logger.info(text)
-    get_request_logger().info(text)
-
-
-@contextmanager
-def _timed_progress(step: str, *, document_id: int | None = None) -> Iterator[None]:
-    started_at = time.perf_counter()
-    document_suffix = f" document_id={document_id}" if document_id is not None else ""
-    _emit_progress("[timing][embed_document] START step=%s%s", step, document_suffix)
-    try:
-        yield
-    except Exception:
-        elapsed_ms = (time.perf_counter() - started_at) * 1000
-        _emit_progress(
-            "[timing][embed_document] FAIL step=%s%s elapsed_ms=%.2f",
-            step,
-            document_suffix,
-            elapsed_ms,
-        )
-        raise
-    elapsed_ms = (time.perf_counter() - started_at) * 1000
-    _emit_progress(
-        "[timing][embed_document] DONE step=%s%s elapsed_ms=%.2f",
-        step,
-        document_suffix,
-        elapsed_ms,
-    )
 
 
 def _to_int(value: Any) -> int | None:
@@ -160,83 +126,6 @@ def _compute_file_hash(file_path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _parsed_markdown_dir() -> Path:
-    return settings.storage_dir / "parsed_markdown"
-
-
-def _parsed_markdown_path(document_id: int) -> Path:
-    return _parsed_markdown_dir() / f"{document_id}.md"
-
-
-def _parsed_markdown_meta_path(document_id: int) -> Path:
-    return _parsed_markdown_dir() / f"{document_id}.meta.json"
-
-
-def _load_parsed_markdown_meta(document_id: int) -> dict[str, Any] | None:
-    meta_path = _parsed_markdown_meta_path(document_id)
-    if not meta_path.exists():
-        return None
-
-    try:
-        payload = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return payload
-
-
-def _save_parsed_markdown(
-    *,
-    document_id: int,
-    markdown: str,
-    file_hash: str,
-    source_parser: str,
-    source_type: str,
-    source_file_path: Path,
-) -> tuple[Path, Path]:
-    cache_dir = _parsed_markdown_dir()
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    markdown_path = _parsed_markdown_path(document_id)
-    meta_path = _parsed_markdown_meta_path(document_id)
-    markdown_path.write_text(markdown.strip() + "\n", encoding="utf-8")
-
-    meta_payload = {
-        "document_id": document_id,
-        "file_hash": file_hash,
-        "source_parser": source_parser,
-        "source_type": source_type,
-        "source_file_path": str(source_file_path),
-        "parsed_markdown_path": str(markdown_path),
-        "updated_at_utc": datetime.utcnow().isoformat(),
-    }
-    meta_path.write_text(
-        json.dumps(meta_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return markdown_path, meta_path
-
-
-def _delete_parsed_markdown(document_id: int) -> None:
-    for path in (_parsed_markdown_path(document_id), _parsed_markdown_meta_path(document_id)):
-        if path.exists():
-            try:
-                path.unlink()
-            except OSError:
-                continue
-
-
-def _normalize_source_parser(value: Any) -> str:
-    parser = str(value or "").strip().lower()
-    return parser or "legacy"
-
-
-def _normalize_source_type(value: Any) -> str:
-    source_type = str(value or "").strip().lower()
-    return source_type or "text"
 
 
 def _compute_chunk_fingerprint(
@@ -355,94 +244,40 @@ def _build_document_chunks_for_indexing(
     original_filename: str,
     file_path: Path,
     file_hash: str,
-    parsed_markdown_path: Path,
-    source_parser: str,
-    source_type: str,
     precompute_child_vectors: bool,
 ) -> tuple[list[DocumentChunk], list[tuple[str, str]], list[dict[str, Any]]]:
-    load_started_at = time.perf_counter()
-    with _timed_progress("load_parsed_markdown", document_id=document_id):
-        loaded_documents = load_documents_from_parsed_markdown(
-            parsed_markdown_path,
-            source_file_path=file_path,
-            source_parser=source_parser,
-            source_type=source_type,
+    from langchain_core.documents import Document as LCDocument
+
+    markdown, source_parser, source_type = parse_source_to_markdown(file_path)
+    if not markdown.strip():
+        raise RuntimeError("Parsed markdown is empty.")
+
+    loaded_documents = [
+        LCDocument(
+            page_content=markdown,
+            metadata={
+                "source": str(file_path),
+                "source_parser": source_parser,
+                "source_type": source_type,
+                "source_page": 1,
+            },
         )
-    load_elapsed = time.perf_counter() - load_started_at
-    _emit_progress(
-        "[embed_document][bg] Loaded %d source document blocks for document_id=%s",
-        len(loaded_documents),
-        document_id,
-    )
-
-    loaded_source_type_counter: Counter[str] = Counter()
-    loaded_parser_counter: Counter[str] = Counter()
-    loaded_text_lengths: list[int] = []
-    for item in loaded_documents:
-        metadata = dict(item.metadata or {})
-        loaded_source_type_counter[str(metadata.get("source_type") or "unknown")] += 1
-        loaded_parser_counter[str(metadata.get("source_parser") or "legacy")] += 1
-        loaded_text_lengths.append(len(str(item.page_content or "")))
-
-    avg_loaded_chars = (
-        sum(loaded_text_lengths) / len(loaded_text_lengths)
-        if loaded_text_lengths
-        else 0.0
-    )
-    _emit_progress(
-        "[embed_document][bg][debug] Load stats document_id=%s elapsed=%.2fs avg_chars=%.1f source_types=%s parsers=%s",
-        document_id,
-        load_elapsed,
-        avg_loaded_chars,
-        dict(loaded_source_type_counter),
-        dict(loaded_parser_counter),
-    )
-
-    split_started_at = time.perf_counter()
-    with _timed_progress("split_source_documents", document_id=document_id):
-        split_documents = split_source_documents(
-            loaded_documents,
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
-        )
-    split_elapsed = time.perf_counter() - split_started_at
-    _emit_progress(
-        "[embed_document][bg] Split into %d chunks for document_id=%s",
-        len(split_documents),
-        document_id,
-    )
-
-    split_lengths = [len(str(item.page_content or "")) for item in split_documents]
-    split_avg_chars = sum(split_lengths) / len(split_lengths) if split_lengths else 0.0
-    split_min_chars = min(split_lengths) if split_lengths else 0
-    split_max_chars = max(split_lengths) if split_lengths else 0
-    _emit_progress(
-        "[embed_document][bg][debug] Split stats document_id=%s elapsed=%.2fs min_chars=%d avg_chars=%.1f max_chars=%d chunk_size=%d overlap=%d",
-        document_id,
-        split_elapsed,
-        split_min_chars,
-        split_avg_chars,
-        split_max_chars,
-        settings.chunk_size,
-        settings.chunk_overlap,
+    ]
+    split_documents = split_source_documents(
+        loaded_documents,
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
     )
 
     candidates: list[dict[str, Any]] = []
-    source_kind_counter: Counter[str] = Counter()
-    source_pages: list[int] = []
-    skipped_empty_chunks = 0
     for item in split_documents:
         text = item.page_content.strip()
         if not text:
-            skipped_empty_chunks += 1
             continue
 
         item_metadata = dict(item.metadata or {})
         source_page = _extract_source_page(item_metadata)
         source_kind = _extract_source_kind(item_metadata, file_path.suffix.lower())
-        source_kind_counter[source_kind] += 1
-        if source_page is not None:
-            source_pages.append(source_page)
         chunk_index = len(candidates)
         fingerprint = _compute_chunk_fingerprint(
             chunk_text=text,
@@ -461,59 +296,42 @@ def _build_document_chunks_for_indexing(
             }
         )
 
-    with _timed_progress("load_metadata_cache", document_id=document_id):
-        metadata_cache = _load_metadata_cache(
-            db=db,
-            document_id=document_id,
-            file_hash=file_hash,
-            chunk_fingerprints=[str(item["fingerprint"]) for item in candidates],
-        )
+    metadata_cache = _load_metadata_cache(
+        db=db,
+        document_id=document_id,
+        file_hash=file_hash,
+        chunk_fingerprints=[str(item["fingerprint"]) for item in candidates],
+    )
     cached_count = sum(1 for item in candidates if item["fingerprint"] in metadata_cache)
     uncached_count = len(candidates) - cached_count
     cache_ratio = (cached_count / len(candidates) * 100.0) if candidates else 0.0
     metadata_batch_size = max(1, settings.metadata_llm_batch_size)
     metadata_batch_count = (uncached_count + metadata_batch_size - 1) // metadata_batch_size if uncached_count else 0
 
-    _emit_progress(
-        "[embed_document][bg] Preparing metadata for %d chunks (cache_hit=%d, document_id=%s)",
+    logger.info(
+        "[index] document_id=%s chunks=%d cache_hit=%d (%.1f%%) uncached=%d metadata_batch_size=%d metadata_batches=%d",
+        document_id,
         len(candidates),
         cached_count,
-        document_id,
-    )
-    _emit_progress(
-        "[embed_document][bg][debug] Candidate stats document_id=%s non_empty=%d empty_skipped=%d cache_hit_ratio=%.1f%% uncached=%d batch_size=%d batch_count=%d source_kinds=%s page_span=%s",
-        document_id,
-        len(candidates),
-        skipped_empty_chunks,
         cache_ratio,
         uncached_count,
         metadata_batch_size,
         metadata_batch_count,
-        dict(source_kind_counter),
-        (
-            f"{min(source_pages)}-{max(source_pages)}"
-            if source_pages
-            else "n/a"
-        ),
     )
 
     prepared_metadata: list[dict[str, Any] | None] = [None] * len(candidates)
-    uncached_candidates: list[dict[str, Any]] = []
 
     for item in candidates:
         cached_metadata = metadata_cache.get(str(item["fingerprint"]))
         if cached_metadata is not None:
             prepared_metadata[int(item["chunk_index"])] = cached_metadata
             continue
-        uncached_candidates.append(item)
 
     precomputed_child_rows: list[dict[str, Any]] = []
 
     async def _prepare_with_overlap() -> None:
         if not candidates:
             return
-
-        prepare_started_at = time.perf_counter()
 
         llm_batch_size = max(1, settings.metadata_llm_batch_size)
         embedding_batch_size = max(1, settings.embedding_batch_size)
@@ -639,16 +457,7 @@ def _build_document_chunks_for_indexing(
             embed_tasks: list[asyncio.Task[tuple[int, list[dict[str, Any]], float]]] = []
 
             for batch_index, batch in enumerate(batches, start=1):
-                metadata_started_at = time.perf_counter()
                 prepared_batch = await loop.run_in_executor(metadata_executor, _prepare_batch_metadata, batch)
-                metadata_batch_elapsed_ms = (time.perf_counter() - metadata_started_at) * 1000
-                _emit_progress(
-                    "[timing][embed_document] DONE step=prepare_batch_metadata batch=%d/%d document_id=%s elapsed_ms=%.2f",
-                    batch_index,
-                    len(batches),
-                    document_id,
-                    metadata_batch_elapsed_ms,
-                )
 
                 embed_started_at = time.perf_counter()
                 embed_future = loop.run_in_executor(
@@ -669,50 +478,19 @@ def _build_document_chunks_for_indexing(
                     )
                     embed_tasks = list(pending)
                     for embed_task in done:
-                        done_batch_index, embedded_rows, child_embedding_elapsed_ms = await embed_task
-                        _emit_progress(
-                            "[timing][embed_document] DONE step=embed_children_from_batch batch=%d/%d document_id=%s rows=%d elapsed_ms=%.2f",
-                            done_batch_index,
-                            len(batches),
-                            document_id,
-                            len(embedded_rows),
-                            child_embedding_elapsed_ms,
-                        )
+                        _, embedded_rows, _ = await embed_task
                         precomputed_child_rows.extend(embedded_rows)
 
             if embed_tasks:
                 for embed_task in asyncio.as_completed(embed_tasks):
-                    batch_index_done, embedded_rows, child_embedding_elapsed_ms = await embed_task
-                    _emit_progress(
-                        "[timing][embed_document] DONE step=embed_children_from_batch batch=%d/%d document_id=%s rows=%d elapsed_ms=%.2f",
-                        batch_index_done,
-                        len(batches),
-                        document_id,
-                        len(embedded_rows),
-                        child_embedding_elapsed_ms,
-                    )
+                    _, embedded_rows, _ = await embed_task
                     precomputed_child_rows.extend(embedded_rows)
         finally:
             metadata_executor.shutdown(wait=False)
             embedding_executor.shutdown(wait=False)
 
-        prepare_elapsed_ms = (time.perf_counter() - prepare_started_at) * 1000
-        _emit_progress(
-            "[timing][embed_document] DONE step=prepare_with_overlap document_id=%s batches=%d child_rows=%d elapsed_ms=%.2f",
-            document_id,
-            len(batches),
-            len(precomputed_child_rows),
-            prepare_elapsed_ms,
-        )
-
-    if uncached_candidates or candidates:
-        prepare_step = (
-            "prepare_metadata_and_child_embeddings"
-            if precompute_child_vectors
-            else "prepare_metadata_and_child_payloads"
-        )
-        with _timed_progress(prepare_step, document_id=document_id):
-            asyncio.run(_prepare_with_overlap())
+    if candidates:
+        asyncio.run(_prepare_with_overlap())
 
     if any(item is None for item in prepared_metadata):
         raise RuntimeError("Failed to build chunk metadata for all chunks.")
@@ -759,8 +537,8 @@ def _write_document_chunks(
             if target_document is None:
                 raise RuntimeError("Document not found while writing chunks.")
 
-            _emit_progress(
-                "[embed_document][bg] Writing chunks to DB document_id=%s (attempt=%d/%d, chunks=%d)",
+            logger.info(
+                "[index] writing_chunks document_id=%s attempt=%d/%d chunks=%d",
                 document_id,
                 attempt + 1,
                 write_attempts,
@@ -774,7 +552,6 @@ def _write_document_chunks(
                 db.add_all(new_chunks)
 
             db.commit()
-            _emit_progress("[embed_document][bg] DB write committed for document_id=%s", document_id)
             return
         except OperationalError as exc:
             db.rollback()
@@ -829,7 +606,7 @@ def _save_index_state(
 def _run_full_indexing_job(
     document_id: int,
 ) -> None:
-    """Unified background task: Parse (if needed) + Chunking + Metadata + Vectors."""
+    """Unified background task: Parse + Chunking + Metadata + Vectors."""
     logger.info("[process_document] Background indexing job started for document_id=%s", document_id)
     with request_logging_context("index", doc=document_id) as log:
         try:
@@ -864,46 +641,7 @@ def _do_full_indexing_job(
 
         file_hash = _compute_file_hash(file_path)
 
-        # --- Step 1: Parse (if needed) ---
-        log.step_start("check_parse_cache", file_hash=file_hash)
-        cached_meta = _load_parsed_markdown_meta(document_id)
-        markdown_path = _parsed_markdown_path(document_id)
-
-        need_parse = True
-        if (
-            cached_meta is not None
-            and markdown_path.exists()
-            and str(cached_meta.get("file_hash") or "") == file_hash
-        ):
-            log.info("Parsed markdown cache hit. Reusing existing markdown.")
-            need_parse = False
-            source_parser = _normalize_source_parser(cached_meta.get("source_parser"))
-            source_type = _normalize_source_type(cached_meta.get("source_type"))
-
-        log.step_done("check_parse_cache", need_parse=need_parse)
-
-        if need_parse:
-            log.step_start("parse_source_to_markdown")
-            try:
-                markdown, source_parser, source_type = parse_source_to_markdown(file_path)
-            except Exception as exc:
-                log.step_fail("parse_source_to_markdown", str(exc))
-                raise
-
-            if not markdown.strip():
-                raise RuntimeError("Parsed markdown is empty.")
-
-            _save_parsed_markdown(
-                document_id=document_id,
-                markdown=markdown,
-                file_hash=file_hash,
-                source_parser=source_parser,
-                source_type=source_type,
-                source_file_path=file_path,
-            )
-            log.step_done("parse_source_to_markdown", parser=source_parser, type=source_type)
-
-        # --- Step 2: Indexing (Embedding + Metadata) ---
+        # --- Indexing (Parse + split via ingestion service, then metadata + vectors) ---
         log.step_start("build_document_chunks")
         new_chunks_data = _build_document_chunks_for_indexing(
             db=db,
@@ -911,9 +649,6 @@ def _do_full_indexing_job(
             original_filename=original_filename,
             file_path=file_path,
             file_hash=file_hash,
-            parsed_markdown_path=markdown_path,
-            source_parser=source_parser,
-            source_type=source_type,
             precompute_child_vectors=not retrieval_service_enabled(),
         )
         chunk_rows, metadata_cache_payloads, precomputed_child_rows = new_chunks_data
@@ -1059,7 +794,7 @@ def process_document(
 
     logger.info("[process_document] Queueing background indexing for document_id=%s status=%s", document_id, document.status)
     background_tasks.add_task(_run_full_indexing_job, document_id)
-    _emit_progress("[process_document] Queued background indexing for document_id=%s", document_id)
+    logger.info("[process_document] queued document_id=%s", document_id)
 
     return EmbedDocumentResponse(
         document_id=document_id,
@@ -1240,12 +975,7 @@ def delete_document(
     if file_path.exists():
         file_path.unlink()
 
-    _delete_parsed_markdown(document_id)
-
-    _emit_progress(
-        "[delete_document] Deleted document_id=%s from DB and VectorDB.",
-        document_id,
-    )
+    logger.info("[delete_document] deleted document_id=%s", document_id)
 
 
 @router.post(
@@ -1257,7 +987,7 @@ def parse_document(
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
 ) -> ParseDocumentResponse:
-    """Step A: Parse source file to markdown once and persist to disk."""
+    """Validate parsing by calling ingestion service directly."""
 
     document = db.get(Document, document_id)
     if document is None:
@@ -1266,22 +996,6 @@ def parse_document(
     file_path = settings.uploads_dir / document.stored_filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Stored file does not exist.")
-
-    file_hash = _compute_file_hash(file_path)
-    cached_meta = _load_parsed_markdown_meta(document_id)
-    markdown_path = _parsed_markdown_path(document_id)
-    if (
-        cached_meta is not None
-        and markdown_path.exists()
-        and str(cached_meta.get("file_hash") or "") == file_hash
-    ):
-        return ParseDocumentResponse(
-            document_id=document_id,
-            parsed_markdown_path=str(markdown_path),
-            parser=_normalize_source_parser(cached_meta.get("source_parser")),
-            source_type=_normalize_source_type(cached_meta.get("source_type")),
-            reused=True,
-        )
 
     try:
         markdown, source_parser, source_type = parse_source_to_markdown(file_path)
@@ -1293,29 +1007,22 @@ def parse_document(
     if not markdown.strip():
         raise HTTPException(status_code=422, detail="Parsed markdown is empty.")
 
-    markdown_path, _ = _save_parsed_markdown(
-        document_id=document_id,
-        markdown=markdown,
-        file_hash=file_hash,
-        source_parser=source_parser,
-        source_type=source_type,
-        source_file_path=file_path,
-    )
-
     if document.status != "embedded":
         document.status = "parsed"
         db.add(document)
         db.commit()
 
-    _emit_progress(
-        "[parse_document] Parsed markdown saved for document_id=%s at %s",
+    logger.info(
+        "[parse_document] parsed document_id=%s parser=%s type=%s chars=%d",
         document_id,
-        markdown_path,
+        source_parser,
+        source_type,
+        len(markdown),
     )
 
     return ParseDocumentResponse(
         document_id=document_id,
-        parsed_markdown_path=str(markdown_path),
+        parsed_markdown_path=f"ingestion://v1/parse/{document_id}",
         parser=source_parser,
         source_type=source_type,
         reused=False,
@@ -1333,7 +1040,7 @@ def embed_document(
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
 ) -> EmbedDocumentResponse:
-    """Queue one document for background HyQ + embedding indexing."""
+    """Queue one document for background indexing."""
 
     document = db.get(Document, document_id)
     if document is None:
@@ -1347,23 +1054,6 @@ def embed_document(
         raise HTTPException(status_code=404, detail="Stored file does not exist.")
 
     file_hash = _compute_file_hash(file_path)
-    parsed_meta = _load_parsed_markdown_meta(document_id)
-    parsed_markdown_path = _parsed_markdown_path(document_id)
-
-    if parsed_meta is None or not parsed_markdown_path.exists():
-        raise HTTPException(
-            status_code=409,
-            detail="Parsed markdown not found. Run Step A (parse) first.",
-        )
-
-    if str(parsed_meta.get("file_hash") or "") != file_hash:
-        raise HTTPException(
-            status_code=409,
-            detail="Source file changed. Run Step A (parse) again before embedding.",
-        )
-
-    source_parser = _normalize_source_parser(parsed_meta.get("source_parser"))
-    source_type = _normalize_source_type(parsed_meta.get("source_type"))
 
     existing_index_state = db.get(DocumentIndexState, document_id)
     if (
@@ -1377,10 +1067,7 @@ def embed_document(
             .scalar()
             or 0
         )
-        _emit_progress(
-            "[embed_document] Skip document_id=%s because file_hash is unchanged and already indexed.",
-            document_id,
-        )
+        logger.info("[embed_document] skip unchanged document_id=%s", document_id)
         return EmbedDocumentResponse(
             document_id=document_id,
             chunks_created=int(parent_chunk_count),
@@ -1395,10 +1082,7 @@ def embed_document(
         _run_full_indexing_job,
         document_id,
     )
-    _emit_progress(
-        "[embed_document] Queued background indexing for document_id=%s",
-        document_id,
-    )
+    logger.info("[embed_document] queued document_id=%s", document_id)
 
     return EmbedDocumentResponse(
         document_id=document_id,
@@ -1425,23 +1109,14 @@ def rebuild_global_index(
         if not file_path.exists():
             continue
 
-        parsed_meta = _load_parsed_markdown_meta(document.id)
-        if parsed_meta is None or not _parsed_markdown_path(document.id).exists():
-            continue
-
         current_hash = _compute_file_hash(file_path)
-        if str(parsed_meta.get("file_hash") or "") != current_hash:
-            continue
 
         tracked = state_by_document_id.get(document.id)
         if tracked is not None and tracked.file_hash == current_hash and document.status == "embedded":
             continue
         pending.append((document.id, current_hash))
 
-    _emit_progress(
-        "[rebuild_global_index] Pending documents for incremental indexing: %d",
-        len(pending),
-    )
+    logger.info("[rebuild_global_index] pending_documents=%d", len(pending))
 
     if not pending:
         return EmbedDocumentResponse(
@@ -1452,16 +1127,11 @@ def rebuild_global_index(
 
     queued_documents = 0
 
-    for document_id, file_hash in pending:
+    for document_id, _ in pending:
         target_document = db.get(Document, document_id)
         if target_document is None:
             continue
         if target_document.status == "indexing":
-            continue
-
-        parsed_meta = _load_parsed_markdown_meta(document_id)
-        parsed_markdown_path = _parsed_markdown_path(document_id)
-        if parsed_meta is None or not parsed_markdown_path.exists():
             continue
 
         target_document.status = "indexing"
@@ -1470,10 +1140,7 @@ def rebuild_global_index(
         queued_documents += 1
 
     db.commit()
-    _emit_progress(
-        "[rebuild_global_index] Queued %d documents for background indexing.",
-        queued_documents,
-    )
+    logger.info("[rebuild_global_index] queued_documents=%d", queued_documents)
 
     return EmbedDocumentResponse(
         document_id=0,

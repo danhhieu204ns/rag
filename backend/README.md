@@ -167,13 +167,9 @@ If `RETRIEVAL_SERVICE_URL` is set, backend sends vector index/search/delete oper
 
 - `POST /v1/index/chunks`
 - `DELETE /v1/index/document/{document_id}`
-- `POST /v1/retrieve`
+- `POST /v1/search/hybrid`
 
 If `RETRIEVAL_SERVICE_URL` is empty, backend uses its in-process retrieval implementation and direct Qdrant access. This fallback is useful for local compatibility, but the preferred service boundary is to let `retrieval_service` own Qdrant.
-
-When using remote ingestion, parsed markdown is cached by backend at:
-
-- `backend/storage/parsed_markdown/<document_id>.md`
 
 Marker/debug markdown logs are written by the process that performs parsing. With remote ingestion this is usually:
 
@@ -184,7 +180,7 @@ This file is regenerated on each embed so you can quickly inspect parsing output
 ## Async Indexing Behavior
 
 - `POST /api/documents/{document_id}/embed` now queues background indexing and returns `202 Accepted` immediately.
-- `POST /api/documents/{document_id}/process` runs parse-if-needed + indexing in one background job and is the preferred UI path.
+- `POST /api/documents/{document_id}/process` runs parse + indexing in one background job and is the preferred UI path.
 - `POST /api/documents/reindex` now queues pending documents in background instead of blocking request time.
 - Document `status` transitions: `uploaded` -> `indexing` -> `embedded` (or `index_failed` when background task fails).
 - Qdrant upsert is executed with async write mode (`wait=false`) for faster ingestion throughput.

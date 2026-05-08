@@ -361,7 +361,7 @@ Document và user APIs yêu cầu JWT admin. Chat API hiện không bắt buộc
 - `OLLAMA_BASE_URL`: URL của `ollama_service` đối với backend.
 - `OLLAMA_API_KEY` và `SHIELD_API_KEY`: phải trùng nhau.
 - `UPSTREAM_OLLAMA_BASE_URL`: Ollama thật phía sau shield.
-- `INGESTION_SERVICE_URL`: URL parse/split service; để rỗng nếu muốn backend parse local.
+- `INGESTION_SERVICE_URL`: URL parse/split service; backend yêu cầu service này cho luồng parse/split tài liệu.
 - `RETRIEVAL_SERVICE_URL`: URL retrieval service; để rỗng nếu muốn backend truy cập Qdrant trực tiếp.
 - `QDRANT_URL`: URL Qdrant server; để rỗng thì dùng Qdrant local embedded path.
 - `PDF_PARSER_MODE`: `legacy` hoặc `marker`.
@@ -374,7 +374,7 @@ Document và user APIs yêu cầu JWT admin. Chat API hiện không bắt buộc
 
 Các thư mục sau được sinh tự động và đã được ignore:
 
-- `backend/storage/`: SQLite DB, uploads, parsed markdown, local Qdrant, logs.
+- `backend/storage/`: SQLite DB, uploads, local Qdrant, logs.
 - `ingestion_service/storage/`: cache/log parser.
 - `retrieval_service/storage/`: storage runtime của retrieval service.
 - `frontend/node_modules/`, `frontend/dist/`.
