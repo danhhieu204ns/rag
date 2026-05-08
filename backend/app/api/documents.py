@@ -39,28 +39,10 @@ from ..services.rag_runtime import (
     delete_vectors_by_document_id,
     upsert_child_documents,
 )
+from ..services.rag.utils import _json_safe_value, _to_int
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
-
-
-def _to_int(value: Any) -> int | None:
-    try:
-        if value is None:
-            return None
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _json_safe_value(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        return {str(key): _json_safe_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe_value(item) for item in value]
-    return str(value)
 
 
 def _extract_source_page(metadata: dict[str, Any]) -> int | None:
@@ -113,6 +95,26 @@ def _parse_source_metadata(raw_json: str | None) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     return payload
+
+
+def _queue_full_indexing_job(
+    *,
+    document: Document,
+    document_id: int,
+    background_tasks: BackgroundTasks,
+    log_prefix: str,
+) -> EmbedDocumentResponse:
+    if document.status == "indexing":
+        raise HTTPException(status_code=409, detail="Document is already indexing.")
+
+    logger.info("[%s] Queueing background indexing for document_id=%s status=%s", log_prefix, document_id, document.status)
+    background_tasks.add_task(_run_full_indexing_job, document_id)
+    logger.info("[%s] queued document_id=%s", log_prefix, document_id)
+    return EmbedDocumentResponse(
+        document_id=document_id,
+        chunks_created=0,
+        indexed_chunks=0,
+    )
 
 
 def _compute_file_hash(file_path: Path) -> str:
@@ -753,17 +755,11 @@ def process_document(
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found.")
 
-    if document.status == "indexing":
-        raise HTTPException(status_code=409, detail="Document is already indexing.")
-
-    logger.info("[process_document] Queueing background indexing for document_id=%s status=%s", document_id, document.status)
-    background_tasks.add_task(_run_full_indexing_job, document_id)
-    logger.info("[process_document] queued document_id=%s", document_id)
-
-    return EmbedDocumentResponse(
+    return _queue_full_indexing_job(
+        document=document,
         document_id=document_id,
-        chunks_created=0,
-        indexed_chunks=0,
+        background_tasks=background_tasks,
+        log_prefix="process_document",
     )
 
 
@@ -1042,16 +1038,11 @@ def embed_document(
     db.add(document)
     db.commit()
 
-    background_tasks.add_task(
-        _run_full_indexing_job,
-        document_id,
-    )
-    logger.info("[embed_document] queued document_id=%s", document_id)
-
-    return EmbedDocumentResponse(
+    return _queue_full_indexing_job(
+        document=document,
         document_id=document_id,
-        chunks_created=0,
-        indexed_chunks=0,
+        background_tasks=background_tasks,
+        log_prefix="embed_document",
     )
 
 

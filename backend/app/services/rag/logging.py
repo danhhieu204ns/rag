@@ -21,16 +21,18 @@ _LEGACY_QUERY_LOG_FILE_NAME = "query_trace.jsonl"
 _query_trace_id_ctx: ContextVar[str] = ContextVar("query_trace_id", default="-")
 
 
-def _query_log_file_path() -> Path:
+def _query_log_dir() -> Path:
     log_dir = settings.storage_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir / _QUERY_LOG_FILE_NAME
+    return log_dir
+
+
+def _query_log_file_path() -> Path:
+    return _query_log_dir() / _QUERY_LOG_FILE_NAME
 
 
 def _legacy_query_log_file_path() -> Path:
-    log_dir = settings.storage_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir / _LEGACY_QUERY_LOG_FILE_NAME
+    return _query_log_dir() / _LEGACY_QUERY_LOG_FILE_NAME
 
 
 def _load_query_log_entries(log_file: Path) -> list[dict[str, Any]]:
