@@ -288,7 +288,7 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
 
         full_text_search = _build_full_text_search(source_metadata, chunk.content)
 
-        child_chunks = build_hyq_children(source_metadata, chunk.content)
+        child_chunks = build_hyq_children(source_metadata)
         for child_index, (child_type, child_text) in enumerate(child_chunks):
             child_metadata = dict(metadata)
             child_metadata["child_type"] = child_type

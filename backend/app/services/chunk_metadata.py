@@ -11,6 +11,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from ..core.settings import settings
+from .ollama_service_client import ollama_service_headers, require_ollama_service_url
 
 logger = logging.getLogger(__name__)
 
@@ -360,9 +361,7 @@ class MetadataBundleGenerator:
     def __init__(self) -> None:
         self.summary_words = 50
         self.question_count = 3
-        self.base_url = settings.ollama_base_url
-        self.api_key = settings.ollama_api_key
-        self._llm_disabled = False
+        self.base_url = require_ollama_service_url()
         self._http_client: httpx.Client | None = None
         self._client_lock = threading.Lock()
         atexit.register(self.close)
@@ -387,14 +386,8 @@ class MetadataBundleGenerator:
         chunk_texts: list[str],
         contexts: list[dict[str, str | None]],
     ) -> list[ChunkEnrichmentResult | None]:
-        if self._llm_disabled:
-            return [None] * len(chunk_texts)
-
         results: list[ChunkEnrichmentResult | None] = [None] * len(chunk_texts)
-
-        headers = {}
-        if self.api_key:
-            headers["x-api-key"] = self.api_key
+        headers = ollama_service_headers()
 
         payload = {"texts": chunk_texts}
         try:
@@ -407,20 +400,17 @@ class MetadataBundleGenerator:
             r.raise_for_status()
             data = r.json()
         except Exception as exc:
-            logger.error("[metadata] Error calling /v1/indexing/batch: %s", exc)
-            return results
+            raise RuntimeError(f"Ollama service request failed at /v1/indexing/batch: {exc}") from exc
 
         items = data.get("items") if isinstance(data, dict) else None
         if not isinstance(items, list):
-            logger.error("[metadata] Invalid response from /v1/indexing/batch")
-            return results
+            raise RuntimeError("Ollama service returned an invalid response for /v1/indexing/batch.")
 
         for index, item in enumerate(items):
             if not isinstance(item, dict):
-                continue
+                raise RuntimeError(f"Ollama service returned an invalid batch item at index {index}.")
             if item.get("error"):
-                logger.error("[metadata] Indexing error for chunk %d: %s", index, item.get("error"))
-                continue
+                raise RuntimeError(f"Ollama service indexing failed for chunk {index}: {item.get('error')}")
 
             summary = item.get("summary") or ""
             hyq = item.get("hyq") or []
@@ -587,24 +577,12 @@ def build_structured_chunk_metadata_batch(
         raw_chunk_index = item.get("chunk_index")
         chunk_index = idx if raw_chunk_index is None else int(raw_chunk_index)
         source_page = item.get("source_page")
-        chunk_text = chunk_texts[idx]
-        context = contexts[idx]
-        
         # search_optimization is already combined (LLM entities + Regex fallback)
         search_optimization = search_optimizations[idx]
 
-        hyq_result = HyQResult(summary="", questions=[])
-        # Use LLM result if available, otherwise fallback to Regex-based questions
-        if llm_hyqs[idx] is not None:
-            hyq_result = llm_hyqs[idx] or hyq_result
-        else:
-            hyq_result = _fallback_hyq(
-                chunk_text=chunk_text,
-                context=context,
-                search_optimization=search_optimization,
-                summary_words=50,
-                question_count=3,
-            )
+        hyq_result = llm_hyqs[idx]
+        if hyq_result is None:
+            raise RuntimeError(f"Ollama service did not return HyQ for chunk {chunk_index}.")
 
         structured_metadata: dict[str, Any] = {
             "chunk_id": f"doc_{document_id:02d}_chunk_{chunk_index:04d}",
@@ -630,7 +608,7 @@ def build_structured_chunk_metadata_batch(
     return structured_results
 
 
-def build_hyq_children(metadata: dict[str, Any], fallback_text: str) -> list[tuple[str, str]]:
+def build_hyq_children(metadata: dict[str, Any]) -> list[tuple[str, str]]:
     hyq = metadata.get("hyq")
     if not isinstance(hyq, dict):
         hyq = {}
@@ -649,6 +627,8 @@ def build_hyq_children(metadata: dict[str, Any], fallback_text: str) -> list[tup
 
     if children:
         return children
+
+    raise RuntimeError("Structured metadata is missing HyQ summary/questions from ollama_service.")
 
     fallback = _word_limited_text(fallback_text, max_words=120)
     if not fallback:

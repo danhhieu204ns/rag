@@ -119,7 +119,7 @@ def get_settings() -> Settings:
     uploads_dir.mkdir(parents=True, exist_ok=True)
     qdrant_path.mkdir(parents=True, exist_ok=True)
 
-    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "").strip().rstrip("/")
     ollama_api_key = os.getenv("OLLAMA_API_KEY", "").strip()
 
     return Settings(

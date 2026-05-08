@@ -10,7 +10,7 @@
 	- `context` (h2/h3)
 	- `search_optimization` (entities, organizations, dates, document_codes)
 	- `admin_tags` (security_level, department)
-- HyQ enrichment at indexing time (`summary` + hypothetical `questions`)
+- HyQ enrichment at indexing time (`summary` + hypothetical `questions`) is provided by `ollama_service`
 - HyQ LLM batching for metadata generation
 - Overlapped ingest pipeline: metadata/HyQ batch `N+1` can run while embedding batch `N` is in-flight
 - Metadata cache in SQLite (`chunk_metadata_cache`) keyed by `document_id + file_hash + chunk_fingerprint`
@@ -18,7 +18,7 @@
 - Hybrid retrieval (vector + keyword) with reciprocal-rank-fusion
 - Qdrant as vector store backend (local mode by default, remote mode optional)
 - Chat query endpoint with persistent chat memory
-- Remote Indexing: Offloads metadata, summary, and HyQ generation to a remote Shield API.
+- Remote Indexing: Metadata, summary, and HyQ generation are handled by `ollama_service`.
 - Remote Ingestion: Document parse/split is handled by `ingestion_service`.
 - Ollama Shield: Backend calls `ollama_service` instead of exposing raw Ollama directly.
 
@@ -73,10 +73,10 @@ INGESTION_SERVICE_URL=http://localhost:8100
 ## Environment
 
 ### Required
-- `OLLAMA_BASE_URL`: URL to the remote Ollama Shield API, example `http://localhost:8200`.
-- `OLLAMA_API_KEY`: API key for X-API-KEY authentication.
-- `OLLAMA_CHAT_MODEL`: Can be `default` when using `ollama_service`; service overrides the real model via `CHAT_MODEL`.
-- `OLLAMA_EMBEDDING_MODEL`: Can be `default` when using `ollama_service`; service overrides the real model via `EMBEDDING_MODEL`.
+- `OLLAMA_BASE_URL`: Required URL to the `ollama_service`, example `http://localhost:8200`.
+- `OLLAMA_API_KEY`: Required API key for X-API-KEY authentication against `ollama_service`.
+- `OLLAMA_CHAT_MODEL`: Can be `default`; `ollama_service` overrides the real model via `CHAT_MODEL`.
+- `OLLAMA_EMBEDDING_MODEL`: Can be `default`; `ollama_service` overrides the real model via `EMBEDDING_MODEL`.
 
 ### Ollama Shield Service (`ollama_service/.env`)
 - `SHIELD_API_KEY`: Must match backend `OLLAMA_API_KEY`.
@@ -85,6 +85,8 @@ INGESTION_SERVICE_URL=http://localhost:8100
 - `INDEXING_MODEL`: Real model for metadata/HyQ indexing endpoints.
 - `EMBEDDING_MODEL`: Real embedding model served by Ollama.
 - `RATE_LIMIT_PER_MINUTE`: Per-key, per-route rate limit.
+
+If `OLLAMA_BASE_URL` or `OLLAMA_API_KEY` is missing, or `ollama_service` is unavailable, backend LLM/chat/embedding/indexing requests fail and return an error.
 
 ### Core Settings
 - `APP_NAME`: Backend application name.

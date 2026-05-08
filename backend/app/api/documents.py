@@ -579,8 +579,7 @@ def _build_document_chunks_for_indexing(
             texts: list[str] = []
 
             for candidate_item, structured_metadata in prepared_batch:
-                chunk_text = str(candidate_item["chunk_text"])
-                child_chunks = build_hyq_children(structured_metadata, chunk_text)
+                child_chunks = build_hyq_children(structured_metadata)
                 for child_index, (child_type, child_text) in enumerate(child_chunks):
                     row = {
                         "document_id": document_id,
