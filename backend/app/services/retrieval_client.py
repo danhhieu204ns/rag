@@ -13,6 +13,15 @@ def enabled() -> bool:
     return bool(settings.retrieval_service_url)
 
 
+def _require_base_url() -> str:
+    service_url = settings.retrieval_service_url.strip()
+    if not service_url:
+        raise RuntimeError(
+            "RETRIEVAL_SERVICE_URL is not configured. Backend requires retrieval_service for search/index/delete."
+        )
+    return service_url
+
+
 def _headers() -> dict[str, str]:
     if not settings.ollama_api_key:
         return {}
@@ -30,9 +39,10 @@ def _json_safe(value: Any) -> Any:
 
 
 def _request(method: str, path: str, **kwargs: Any) -> httpx.Response:
+    base_url = _require_base_url()
     timeout = httpx.Timeout(settings.retrieval_timeout_seconds, connect=10.0)
     with httpx.Client(timeout=timeout, headers=_headers()) as client:
-        response = client.request(method, f"{settings.retrieval_service_url}{path}", **kwargs)
+        response = client.request(method, f"{base_url}{path}", **kwargs)
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -96,6 +106,7 @@ def similarity_search(
     *,
     top_k: int,
     document_ids: list[int] | None = None,
+    plan: Any | None = None,
 ) -> list[Document]:
     response = _request(
         "POST",

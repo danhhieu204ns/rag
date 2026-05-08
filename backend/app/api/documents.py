@@ -37,8 +37,6 @@ from .auth import require_admin
 from ..models import User as AdminUser
 from ..services.rag_runtime import (
     delete_vectors_by_document_id,
-    get_embeddings,
-    retrieval_service_enabled,
     upsert_child_documents,
 )
 
@@ -244,7 +242,6 @@ def _build_document_chunks_for_indexing(
     original_filename: str,
     file_path: Path,
     file_hash: str,
-    precompute_child_vectors: bool,
 ) -> tuple[list[DocumentChunk], list[tuple[str, str]], list[dict[str, Any]]]:
     from langchain_core.documents import Document as LCDocument
 
@@ -334,19 +331,14 @@ def _build_document_chunks_for_indexing(
             return
 
         llm_batch_size = max(1, settings.metadata_llm_batch_size)
-        embedding_batch_size = max(1, settings.embedding_batch_size)
-        
-        # We group candidates into batches for processing. 
-        # Metadata calls (structured /v1/indexing) are slow and call LLM.
-        # Embedding calls (/api/embed) are faster and process text in batches.
+        # We group candidates into batches for processing.
+        # Metadata calls (/v1/indexing/batch via ollama_service) are the dominant cost.
         batches: list[list[dict[str, Any]]] = [
             candidates[start : start + llm_batch_size]
             for start in range(0, len(candidates), llm_batch_size)
         ]
 
         loop = asyncio.get_running_loop()
-        embeddings_client = get_embeddings() if precompute_child_vectors else None
-
         # Use separate pools so embedding jobs are not queued behind pending metadata jobs.
         # This preserves metadata->embedding overlap across batches.
         from concurrent.futures import ThreadPoolExecutor
@@ -419,24 +411,6 @@ def _build_document_chunks_for_indexing(
 
             if not texts:
                 return []
-            if not precompute_child_vectors:
-                return payload_rows
-
-            # Process in batches of embedding_batch_size to optimize /api/embed calls
-            all_vectors: list[list[float]] = []
-            if embeddings_client is None:
-                raise RuntimeError("Embedding client is unavailable while precomputing child vectors.")
-            for i in range(0, len(texts), embedding_batch_size):
-                batch_texts = texts[i : i + embedding_batch_size]
-                batch_vectors = embeddings_client.embed_documents(batch_texts)
-                all_vectors.extend(batch_vectors)
-
-            if len(all_vectors) != len(payload_rows):
-                raise RuntimeError("Child embedding count mismatch while building index payload.")
-
-            for idx, vector in enumerate(all_vectors):
-                payload_rows[idx]["vector"] = vector
-
             return payload_rows
 
         if not batches:
@@ -649,7 +623,6 @@ def _do_full_indexing_job(
             original_filename=original_filename,
             file_path=file_path,
             file_hash=file_hash,
-            precompute_child_vectors=not retrieval_service_enabled(),
         )
         chunk_rows, metadata_cache_payloads, precomputed_child_rows = new_chunks_data
         log.step_done(
@@ -688,7 +661,6 @@ def _do_full_indexing_job(
         if document_chunks:
             chunk_by_index = {int(chunk.chunk_index): chunk for chunk in document_chunks}
             child_documents = []
-            child_vectors: list[list[float]] = []
 
             for row in precomputed_child_rows:
                 chunk_index = _to_int(row.get("chunk_index"))
@@ -718,9 +690,6 @@ def _do_full_indexing_job(
                         },
                     }
                 )
-                vector = row.get("vector")
-                if isinstance(vector, list):
-                    child_vectors.append(vector)
             log.step_done("prepare_qdrant_payload", count=len(child_documents))
 
             log.step_start("upsert_to_qdrant", count=len(child_documents))
@@ -735,11 +704,6 @@ def _do_full_indexing_job(
                     for item in child_documents
                 ],
                 purge_document_ids=[document_id],
-                precomputed_vectors=(
-                    child_vectors
-                    if len(child_vectors) == len(child_documents)
-                    else None
-                ),
             )
             log.step_done("upsert_to_qdrant", indexed_count=indexed_count)
         else:
