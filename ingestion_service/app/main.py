@@ -4,8 +4,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 import logging
-import re
-import os
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -26,6 +24,8 @@ from .services.document_processing import (
     parse_source_to_markdown,
     split_source_documents,
 )
+from .services.indexing_pipeline import build_section_parent_child_index
+from .services.parent_child_chunker import INDEX_TYPE
 
 
 logger = logging.getLogger(__name__)
@@ -112,8 +112,15 @@ class IndexBuildFromMarkdownRequest(BaseModel):
 
 
 class IndexBuildChunkPayload(BaseModel):
+    parent_id: str
+    section_id: str
     chunk_index: int
     content: str
+    title: str
+    heading_path: list[str] = Field(default_factory=list)
+    token_count: int
+    page_start: int | None = None
+    page_end: int | None = None
     source_page: int | None = None
     source_kind: str
     source_metadata: dict[str, Any] = Field(default_factory=dict)
@@ -121,11 +128,22 @@ class IndexBuildChunkPayload(BaseModel):
 
 class IndexBuildChildPayload(BaseModel):
     chunk_index: int
+    chunk_id: str
+    parent_id: str
+    section_id: str
     child_type: str
     child_index: int
     child_text: str
+    embedding_text: str
+    token_count: int
+    title: str
+    section_title: str
+    heading_path: list[str] = Field(default_factory=list)
+    page_start: int | None = None
+    page_end: int | None = None
     source_page: int | None = None
     source_kind: str
+    index_type: str = INDEX_TYPE
     source_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -137,10 +155,20 @@ class IndexBuildResponse(BaseModel):
 class IndexUpsertChildPayload(BaseModel):
     document_id: int
     parent_chunk_id: int
+    chunk_id: str
+    parent_id: str | None = None
+    section_id: str | None = None
     source_page: int | None = None
-    child_type: str
+    page_start: int | None = None
+    page_end: int | None = None
+    child_type: str = "section_child"
     child_index: int
     child_text: str
+    embedding_text: str
+    token_count: int | None = None
+    section_title: str | None = None
+    heading_path: list[str] = Field(default_factory=list)
+    index_type: str = INDEX_TYPE
     source_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -153,249 +181,8 @@ class IndexUpsertResponse(BaseModel):
     indexed_chunks: int
 
 
-_DATE_PATTERN = re.compile(r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4})\b")
-_DOC_CODE_PATTERN = re.compile(r"\b\d{1,6}[/-][A-Za-z]{1,12}(?:[/-][A-Za-z0-9]{1,16})+\b")
-_FRONT_MATTER_MARKERS = (
-    "chỉ đạo nội dung",
-    "tổ chức thực hiện",
-    "biên soạn",
-)
-_INDEXING_INSTRUCTION = """
-Bạn là hệ thống xử lý tài liệu cho RAG indexing.
-
-Hãy phân tích văn bản và trả về JSON hợp lệ, không giải thích thêm.
-Ràng buộc output:
-- Chỉ trả về đúng 1 JSON object.
-- `summary` tối đa 5 câu.
-- `hyq` đúng 3 câu hỏi, mỗi câu tối đa 160 ký tự.
-- Không lặp lại bảng, HTML, số trang, danh mục dẫn chiếu hoặc nội dung dạng `<br>`.
-
-Schema bắt buộc:
-{
-  "summary": "Tóm tắt ngắn 3-5 câu",
-  "hyq": [
-    "Câu hỏi giả định 1",
-    "Câu hỏi giả định 2",
-    "Câu hỏi giả định 3"
-  ],
-  "metadata": {
-    "title": null,
-    "topic": null,
-    "keywords": [],
-    "document_type": null,
-    "department_or_unit": null,
-    "date": null,
-    "people": [],
-    "risk_level": "low"
-  },
-  "language": "vi"
-}
-""".strip()
-
-
-def _normalize_spaces(text: str) -> str:
-    return " ".join(str(text or "").split())
-
-
-def _extract_context(raw_metadata: dict[str, Any]) -> dict[str, str | None]:
-    headers = raw_metadata.get("markdown_headers")
-    if not isinstance(headers, dict):
-        return {"h2": None, "h3": None}
-    h2 = headers.get("h2") or headers.get("h1")
-    h3 = headers.get("h3") or headers.get("h4")
-    return {
-        "h2": _normalize_spaces(str(h2)) if h2 else None,
-        "h3": _normalize_spaces(str(h3)) if h3 else None,
-    }
-
-
-def _source_kind(metadata: dict[str, Any], suffix: str) -> str:
-    source_parser = str(metadata.get("source_parser") or "legacy").lower()
-    source_type = str(metadata.get("source_type") or "").lower() or ("pdf" if suffix == ".pdf" else "text")
-    if source_type == "pdf" and source_parser == "marker":
-        return "pdf_marker_page"
-    if source_type == "pdf":
-        return "pdf_page"
-    if source_type == "text":
-        return "text_chunk"
-    return source_type
-
-
-def _fallback_search(chunk_text: str) -> dict[str, list[str]]:
-    dates = list(dict.fromkeys(_DATE_PATTERN.findall(chunk_text)))[:15]
-    doc_codes = list(dict.fromkeys(code.upper() for code in _DOC_CODE_PATTERN.findall(chunk_text)))[:15]
-    keywords = [*doc_codes, *dates][:20]
-    return {
-        "keywords": keywords,
-        "entities": [],
-        "organizations": [],
-        "dates": dates,
-        "document_codes": doc_codes,
-    }
-
-
-def _plain_heading_text(value: str | None) -> str:
-    cleaned = re.sub(r"[*_`#]+", " ", str(value or ""))
-    return _normalize_spaces(cleaned).lower()
-
-
-def _looks_like_heading_only(text: str) -> bool:
-    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
-    if not lines or len(lines) > 2:
-        return False
-    return all(re.match(r"^#{1,6}\s+\S+", line) or len(_normalize_spaces(line)) < 90 for line in lines)
-
-
-def _sentence_count(text: str) -> int:
-    return len(re.findall(r"[.!?…](?:\s|$)", str(text or "")))
-
-
-def _bullet_line_count(text: str) -> int:
-    return sum(1 for line in str(text or "").splitlines() if re.match(r"^\s*[-*+]\s+", line))
-
-
-def _llm_skip_reason(text: str, context: dict[str, str | None]) -> str | None:
-    compact = _normalize_spaces(text)
-    if not compact:
-        return "empty"
-    if len(compact) < settings.llm_min_chunk_chars:
-        return "short"
-    if _looks_like_heading_only(text):
-        return "heading_only"
-
-    context_text = " ".join(
-        _plain_heading_text(item)
-        for item in (context.get("h2"), context.get("h3"))
-        if item
-    )
-    if len(compact) < 600 and any(marker in context_text for marker in _FRONT_MATTER_MARKERS):
-        return "front_matter"
-    if len(compact) < 900 and _bullet_line_count(text) >= 3 and _sentence_count(text) <= 1:
-        return "list_like"
-    return None
-
-
-def _fallback_summary(text: str, context: dict[str, str | None]) -> str:
-    compact = _normalize_spaces(text)
-    if not compact:
-        return "Không có tóm tắt."
-    sentences = [item.strip() for item in re.split(r"(?<=[.!?…])\s+", compact) if item.strip()]
-    if sentences:
-        return " ".join(sentences[:2])[:700]
-    heading = context.get("h3") or context.get("h2")
-    if heading and len(compact) < 260:
-        return f"{_normalize_spaces(str(heading))}: {compact}"[:700]
-    return compact[:700]
-
-
-def _fallback_llm_item(text: str, context: dict[str, str | None], reason: str) -> dict[str, Any]:
-    search = _fallback_search(text)
-    keywords = list(dict.fromkeys([
-        *(search.get("document_codes") or []),
-        *(search.get("dates") or []),
-        *[
-            _normalize_spaces(str(item))
-            for item in (context.get("h2"), context.get("h3"))
-            if item
-        ],
-    ]))[:20]
-    return {
-        "summary": _fallback_summary(text, context),
-        "hyq": [],
-        "metadata": {
-            "keywords": keywords,
-            "risk_level": "low",
-            "llm_skipped": True,
-            "skip_reason": reason,
-        },
-        "language": "vi",
-        "skipped": {"reason": reason},
-    }
-
-
-def _build_hyq(summary: str, hyq_questions: list[str], context: dict[str, str | None]) -> dict[str, Any]:
-    normalized_questions = [q if q.endswith("?") else f"{q}?" for q in hyq_questions if str(q).strip()]
-    if not normalized_questions:
-        if context.get("h3"):
-            normalized_questions = [f"{context['h3']} được trình bày như thế nào?"]
-        elif context.get("h2"):
-            normalized_questions = [f"Nội dung trong mục {context['h2']} là gì?"]
-        else:
-            normalized_questions = ["Thông tin chính của đoạn này là gì?"]
-    return {
-        "summary": _normalize_spaces(summary) or "Không có tóm tắt.",
-        "questions": normalized_questions[:3],
-    }
-
-
 def _indexing_headers() -> dict[str, str]:
     return {"x-api-key": settings.api_key} if settings.api_key else {}
-
-
-def _indexing_batch(chunk_texts: list[str]) -> list[dict[str, Any]]:
-    if not chunk_texts:
-        return []
-    ollama_base = str(os.getenv("OLLAMA_BASE_URL", "")).strip().rstrip("/")
-    if not ollama_base:
-        raise RuntimeError("OLLAMA_BASE_URL is required for indexing enrichment in ingestion_service.")
-    endpoint = f"{ollama_base}/v1/indexing/batch"
-
-    results: list[dict[str, Any]] = []
-    batch_size = settings.indexing_batch_size
-    with httpx.Client(timeout=settings.indexing_timeout_seconds, headers=_indexing_headers()) as client:
-        for start in range(0, len(chunk_texts), batch_size):
-            batch = chunk_texts[start : start + batch_size]
-            payload = {
-                "texts": batch,
-                "instruction": _INDEXING_INSTRUCTION,
-                "options": {"num_predict": settings.indexing_num_predict},
-            }
-            batch_started = time.perf_counter()
-            try:
-                response = client.post(endpoint, json=payload)
-            except httpx.TimeoutException as exc:
-                raise RuntimeError(
-                    f"Indexing batch request timed out for chunks {start}-{start + len(batch) - 1} "
-                    f"after {settings.indexing_timeout_seconds:.0f}s. "
-                    f"Increase INDEXING_TIMEOUT_SECONDS or lower INDEXING_BATCH_SIZE."
-                ) from exc
-            except httpx.RequestError as exc:
-                raise RuntimeError(
-                    f"Indexing batch request failed for chunks {start}-{start + len(batch) - 1}: {exc}"
-                ) from exc
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Indexing batch request failed for chunks {start}-{start + len(batch) - 1}: "
-                    f"{response.status_code} {response.text}"
-                )
-            try:
-                upstream = response.json()
-            except ValueError as exc:
-                raise RuntimeError(f"Indexing batch returned non-JSON response for chunks {start}-{start + len(batch) - 1}.") from exc
-            items = upstream.get("items") if isinstance(upstream, dict) else None
-            if not isinstance(items, list):
-                raise RuntimeError(f"Indexing batch response missing items list for chunks {start}-{start + len(batch) - 1}.")
-            if len(items) != len(batch):
-                raise RuntimeError(
-                    f"Indexing batch response item count mismatch for chunks {start}-{start + len(batch) - 1}: "
-                    f"expected {len(batch)}, got {len(items)}."
-                )
-
-            for offset, item in enumerate(items):
-                index = start + offset
-                if not isinstance(item, dict):
-                    raise RuntimeError(f"Indexing batch returned invalid item at index {index}.")
-                if item.get("error"):
-                    raise RuntimeError(f"Index enrichment failed for chunk {index}: {item['error']}")
-                results.append(item)
-            logger.info(
-                "[ingestion][timing] step=enrich_batch.call_indexing_batch_api.sub_batch status=ok elapsed_ms=%.2f batch_start=%d batch_size=%d indexed_total=%d",
-                _ms(batch_started),
-                start,
-                len(batch),
-                len(results),
-            )
-    return results
 
 app = FastAPI(title=settings.app_name)
 _INGESTION_LOG_PATH = _configure_ingestion_file_logging()
@@ -415,172 +202,35 @@ def _build_index_response_from_markdown(
     if not markdown.strip():
         raise HTTPException(status_code=400, detail="Parsed markdown is empty.")
 
-    suffix = source_file_path.suffix.lower()
-    with TemporaryDirectory(prefix="ingestion_index_markdown_") as tmp_dir:
-        markdown_path = Path(tmp_dir) / "parsed.md"
-        with _timed_step(f"{route_name}.write_markdown", markdown_chars=len(markdown)):
-            markdown_path.write_text(markdown.strip(), encoding="utf-8")
-        with _timed_step(f"{route_name}.load_documents"):
-            loaded = load_documents_from_parsed_markdown(
-                markdown_path,
+    if settings.chunking_strategy != INDEX_TYPE or settings.indexing_index_type != INDEX_TYPE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported indexing strategy. Expected {INDEX_TYPE}.",
+        )
+
+    try:
+        with _timed_step(
+            f"{route_name}.section_parent_child_chunking",
+            markdown_chars=len(markdown),
+            parent_max_tokens=settings.parent_max_tokens,
+            child_chunk_size=settings.child_chunk_size,
+            child_chunk_overlap=settings.child_chunk_overlap,
+        ):
+            index_bundle = build_section_parent_child_index(
+                markdown=markdown,
                 source_file_path=source_file_path,
                 source_parser=source_parser,
                 source_type=source_type,
+                parent_max_tokens=settings.parent_max_tokens,
+                child_chunk_size=settings.child_chunk_size,
+                child_chunk_overlap=settings.child_chunk_overlap,
+                prepend_heading_path=settings.prepend_heading_path,
             )
-        with _timed_step(f"{route_name}.chunk_documents", loaded_docs=len(loaded), chunk_size=1000, chunk_overlap=150):
-            chunks = split_source_documents(
-                loaded,
-                chunk_size=1000,
-                chunk_overlap=150,
-            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    parent_chunks: list[IndexBuildChunkPayload] = []
-    child_rows: list[IndexBuildChildPayload] = []
-    raw_rows: list[tuple[int, str, int | None, str, dict[str, Any], dict[str, str | None]]] = []
-    enrich_texts: list[str] = []
-    enrich_raw_indexes: list[int] = []
-    llm_items_by_raw_index: dict[int, dict[str, Any]] = {}
-    skipped_enrichment_count = 0
-
-    prepare_started = time.perf_counter()
-    for item in chunks:
-        text = str(item.page_content or "").strip()
-        if not text:
-            continue
-        metadata = dict(item.metadata or {})
-        chunk_index = len(parent_chunks)
-        source_page = metadata.get("source_page") if isinstance(metadata.get("source_page"), int) else None
-        source_kind = _source_kind(metadata, suffix)
-        context = _extract_context(metadata)
-        parent_chunks.append(
-            IndexBuildChunkPayload(
-                chunk_index=chunk_index,
-                content=text,
-                source_page=source_page,
-                source_kind=source_kind,
-                source_metadata={},
-            )
-        )
-        raw_index = len(raw_rows)
-        raw_rows.append((chunk_index, text, source_page, source_kind, metadata, context))
-        skip_reason = _llm_skip_reason(text, context)
-        if skip_reason is None:
-            enrich_raw_indexes.append(raw_index)
-            enrich_texts.append(text)
-        else:
-            skipped_enrichment_count += 1
-            llm_items_by_raw_index[raw_index] = _fallback_llm_item(text, context, skip_reason)
-    logger.info(
-        "[ingestion][timing] step=enrich_batch.prepare_payload status=ok elapsed_ms=%.2f parent_chunks=%d llm_chunks=%d skipped_llm_chunks=%d input_chars=%d",
-        _ms(prepare_started),
-        len(raw_rows),
-        len(enrich_texts),
-        skipped_enrichment_count,
-        sum(len(t) for t in enrich_texts),
-    )
-
-    if enrich_texts:
-        try:
-            with _timed_step("enrich_batch.call_indexing_batch_api", model_name="ollama_indexing_batch", batch_size=len(enrich_texts)):
-                enriched_items = _indexing_batch(enrich_texts)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        for raw_index, llm_item in zip(enrich_raw_indexes, enriched_items, strict=True):
-            llm_items_by_raw_index[raw_index] = llm_item
-    else:
-        logger.info(
-            "[ingestion][timing] step=enrich_batch.call_indexing_batch_api status=skipped reason=no_llm_eligible_chunks",
-        )
-
-    generate_started = time.perf_counter()
-    total_children_generated = 0
-    total_parent_elapsed_ms = 0.0
-    for idx, raw in enumerate(raw_rows):
-        parent_started = time.perf_counter()
-        chunk_index, text, source_page, source_kind, metadata, context = raw
-        llm_item = llm_items_by_raw_index.get(idx) or _fallback_llm_item(text, context, "missing_llm_result")
-        llm_skipped = bool(isinstance(llm_item.get("skipped"), dict))
-        summary = str(llm_item.get("summary") or "")
-        hyq = llm_item.get("hyq")
-        questions = [str(q) for q in hyq] if isinstance(hyq, list) else []
-        meta = llm_item.get("metadata") if isinstance(llm_item.get("metadata"), dict) else {}
-        keywords = [str(k) for k in (meta.get("keywords") or []) if str(k).strip()]
-        search_opt = _fallback_search(text)
-        if keywords:
-            search_opt["keywords"] = list(dict.fromkeys([*search_opt["keywords"], *keywords]))[:20]
-            search_opt["entities"] = keywords[:15]
-
-        metadata_started = time.perf_counter()
-        structured = {
-            "source_info": {
-                "file_name": filename,
-                "page_number": source_page,
-                "doc_type": "Tài_liệu_nội_bộ",
-            },
-            "context": context,
-            "search_optimization": search_opt,
-            "admin_tags": {
-                "security_level": "Nội_bộ",
-                "department": "Tổng_hợp",
-            },
-            "hyq": _build_hyq(summary, questions, context),
-        }
-        if llm_skipped:
-            structured["hyq"]["questions"] = []
-            structured["indexing"] = {
-                "llm_skipped": True,
-                "skip_reason": str((llm_item.get("skipped") or {}).get("reason") or meta.get("skip_reason") or "unknown"),
-            }
-        logger.info(
-            "[ingestion][timing] step=enrich_batch.build_metadata status=ok elapsed_ms=%.2f chunk_index=%d",
-            _ms(metadata_started),
-            chunk_index,
-        )
-        parent_chunks[idx].source_metadata = structured
-        children_before = len(child_rows)
-        child_rows.append(
-            IndexBuildChildPayload(
-                chunk_index=chunk_index,
-                child_type="summary",
-                child_index=0,
-                child_text=f"Tóm tắt: {structured['hyq']['summary']}",
-                source_page=source_page,
-                source_kind=source_kind,
-                source_metadata=structured,
-            )
-        )
-        for q_idx, q in enumerate(structured["hyq"]["questions"], start=1):
-            child_rows.append(
-                IndexBuildChildPayload(
-                    chunk_index=chunk_index,
-                    child_type="question",
-                    child_index=q_idx,
-                    child_text=str(q),
-                    source_page=source_page,
-                    source_kind=source_kind,
-                    source_metadata=structured,
-                )
-            )
-        generated_for_parent = len(child_rows) - children_before
-        total_children_generated += generated_for_parent
-        parent_elapsed_ms = _ms(parent_started)
-        total_parent_elapsed_ms += parent_elapsed_ms
-        elapsed_per_child_ms = parent_elapsed_ms / generated_for_parent if generated_for_parent > 0 else 0.0
-        logger.info(
-            "[ingestion][timing] step=enrich_batch.generate_child_chunks status=ok chunk_index=%d output_children=%d elapsed_per_parent_ms=%.2f elapsed_per_child_ms=%.2f",
-            chunk_index,
-            generated_for_parent,
-            parent_elapsed_ms,
-            elapsed_per_child_ms,
-        )
-
-    logger.info(
-        "[ingestion][timing] step=enrich_batch.postprocess status=ok elapsed_ms=%.2f parent_chunks=%d output_children=%d avg_elapsed_per_parent_ms=%.2f",
-        _ms(generate_started),
-        len(parent_chunks),
-        total_children_generated,
-        (total_parent_elapsed_ms / len(raw_rows)) if raw_rows else 0.0,
-    )
+    parent_chunks = [IndexBuildChunkPayload(**item) for item in index_bundle.parent_payloads]
+    child_rows = [IndexBuildChildPayload(**item) for item in index_bundle.child_payloads]
     logger.info(
         "[ingestion][timing] route=/%s status=ok total_elapsed_ms=%.2f filename=%s parent_chunks=%d child_rows=%d",
         route_name,
@@ -594,57 +244,76 @@ def _build_index_response_from_markdown(
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {
+    request_start = time.perf_counter()
+    logger.info("[ingestion][health] request received")
+    result = {
         "status": "ok",
         "service": "ingestion-service",
         "version": "1.0.0",
     }
+    logger.info("[ingestion][health] response sent elapsed_ms=%.2f", _ms(request_start))
+    return result
 
 
 @app.get("/ready")
 def ready() -> dict[str, str]:
-    return {
+    request_start = time.perf_counter()
+    logger.info("[ingestion][ready] request received parser_mode=%s", settings.pdf_parser_mode)
+    result = {
         "status": "ok",
         "service": "ingestion-service",
         "parser_mode": settings.pdf_parser_mode,
     }
+    logger.info("[ingestion][ready] response sent elapsed_ms=%.2f", _ms(request_start))
+    return result
 
 
 @app.post("/v1/parse", response_model=ParseResponse)
 async def parse(file: UploadFile = File(...)) -> ParseResponse:
     request_started = time.perf_counter()
     suffix = Path(file.filename or "").suffix.lower()
-    logger.info("[ingestion] /v1/parse filename=%s suffix=%s", file.filename, suffix)
+    logger.info("[ingestion][parse] request received filename=%s suffix=%s", file.filename, suffix)
+    
+    logger.debug("[ingestion][parse] step=validate_file_type suffix=%s", suffix)
     if suffix not in {".pdf", ".txt", ".md"}:
+        logger.warning("[ingestion][parse] unsupported file type suffix=%s", suffix)
         raise HTTPException(status_code=400, detail=f"Unsupported file extension: {suffix}")
+    logger.debug("[ingestion][parse] step=validate_ok suffix=%s", suffix)
 
     with TemporaryDirectory(prefix="ingestion_upload_") as tmp_dir:
         temp_path = Path(tmp_dir) / (file.filename or "uploaded.bin")
         with _timed_step("parse.read_upload", filename=file.filename):
+            logger.debug("[ingestion][parse] step=read_upload filename=%s", file.filename)
             payload = await file.read()
+        
         if not payload:
+            logger.error("[ingestion][parse] uploaded file is empty filename=%s", file.filename)
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        
+        logger.debug("[ingestion][parse] step=write_temp_file temp_path=%s file_size=%d", temp_path, len(payload))
         with _timed_step("parse.write_temp_file", temp_path=temp_path):
             temp_path.write_bytes(payload)
 
         try:
+            logger.debug("[ingestion][parse] step=parse_to_markdown parser_mode=%s suffix=%s", settings.pdf_parser_mode, suffix)
             with _timed_step("parse.to_markdown", parser_mode=settings.pdf_parser_mode, suffix=suffix):
                 markdown, source_parser, source_type = parse_source_to_markdown(temp_path)
-        except Exception as exc:  # pragma: no cover
-            logger.exception("[ingestion] /v1/parse failed filename=%s", file.filename)
+        except Exception as exc:
+            logger.exception("[ingestion][parse] parsing failed filename=%s error=%s", file.filename, exc)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     logger.info(
-        "[ingestion] /v1/parse done filename=%s parser=%s type=%s markdown_chars=%d",
+        "[ingestion][parse] parsing complete filename=%s parser=%s type=%s markdown_chars=%d",
         file.filename,
         source_parser,
         source_type,
         len(markdown),
     )
     logger.info(
-        "[ingestion][timing] route=/v1/parse status=ok total_elapsed_ms=%.2f filename=%s",
+        "[ingestion][timing] route=/v1/parse status=ok total_elapsed_ms=%.2f filename=%s markdown_chars=%d",
         _ms(request_started),
         file.filename,
+        len(markdown),
     )
     return ParseResponse(
         markdown=markdown,
@@ -657,20 +326,27 @@ async def parse(file: UploadFile = File(...)) -> ParseResponse:
 def split(request: SplitRequest) -> SplitResponse:
     request_started = time.perf_counter()
     logger.info(
-        "[ingestion] /v1/split source=%s parser=%s type=%s chars=%d chunk_size=%d overlap=%d",
+        "[ingestion][split] request received source=%s chars=%d chunk_size=%d overlap=%d",
         request.source_file_path,
-        request.source_parser,
-        request.source_type,
         len(request.markdown),
         request.chunk_size,
         request.chunk_overlap,
     )
+    
+    logger.debug("[ingestion][split] step=validate_input parser=%s type=%s", request.source_parser, request.source_type)
+    if not request.markdown.strip():
+        logger.warning("[ingestion][split] empty markdown source=%s", request.source_file_path)
+        raise HTTPException(status_code=400, detail="Markdown content is empty.")
+    logger.debug("[ingestion][split] step=validate_ok chars=%d", len(request.markdown))
+    
     with TemporaryDirectory(prefix="ingestion_markdown_") as tmp_dir:
         markdown_path = Path(tmp_dir) / "parsed.md"
+        logger.debug("[ingestion][split] step=write_markdown temp_path=%s chars=%d", markdown_path, len(request.markdown))
         with _timed_step("split.write_markdown", source=request.source_file_path):
             markdown_path.write_text(request.markdown.strip(), encoding="utf-8")
 
         try:
+            logger.debug("[ingestion][split] step=load_documents source=%s", request.source_file_path)
             with _timed_step("split.load_documents", source=request.source_file_path):
                 loaded = load_documents_from_parsed_markdown(
                     markdown_path,
@@ -678,6 +354,9 @@ def split(request: SplitRequest) -> SplitResponse:
                     source_parser=request.source_parser,
                     source_type=request.source_type,
                 )
+            logger.debug("[ingestion][split] step=load_ok loaded_docs=%d", len(loaded))
+            
+            logger.debug("[ingestion][split] step=chunk_documents chunk_size=%d overlap=%d loaded=%d", request.chunk_size, request.chunk_overlap, len(loaded))
             with _timed_step(
                 "split.chunk_documents",
                 source=request.source_file_path,
@@ -690,15 +369,17 @@ def split(request: SplitRequest) -> SplitResponse:
                     chunk_size=request.chunk_size,
                     chunk_overlap=request.chunk_overlap,
                 )
-        except Exception as exc:  # pragma: no cover
-            logger.exception("[ingestion] /v1/split failed source=%s", request.source_file_path)
+            logger.debug("[ingestion][split] step=chunk_ok chunks=%d", len(chunks))
+        except Exception as exc:
+            logger.exception("[ingestion][split] chunking failed source=%s error=%s", request.source_file_path, exc)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    logger.info("[ingestion] /v1/split done source=%s chunks=%d", request.source_file_path, len(chunks))
+    logger.info("[ingestion][split] splitting complete source=%s chunks=%d", request.source_file_path, len(chunks))
     logger.info(
-        "[ingestion][timing] route=/v1/split status=ok total_elapsed_ms=%.2f source=%s",
+        "[ingestion][timing] route=/v1/split status=ok total_elapsed_ms=%.2f source=%s chunks=%d",
         _ms(request_started),
         request.source_file_path,
+        len(chunks),
     )
     return SplitResponse(
         chunks=[
@@ -713,20 +394,33 @@ def split(request: SplitRequest) -> SplitResponse:
 async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
     request_started = time.perf_counter()
     suffix = Path(file.filename or "").suffix.lower()
+    logger.info("[ingestion][index_build] request received filename=%s suffix=%s", file.filename, suffix)
+    
+    logger.debug("[ingestion][index_build] step=validate_file_type suffix=%s", suffix)
     if suffix not in {".pdf", ".txt", ".md"}:
+        logger.warning("[ingestion][index_build] unsupported file type suffix=%s", suffix)
         raise HTTPException(status_code=400, detail=f"Unsupported file extension: {suffix}")
+    logger.debug("[ingestion][index_build] step=validate_ok suffix=%s", suffix)
 
     with TemporaryDirectory(prefix="ingestion_index_build_") as tmp_dir:
         temp_path = Path(tmp_dir) / (file.filename or "uploaded.bin")
+        logger.debug("[ingestion][index_build] step=read_upload filename=%s", file.filename)
         with _timed_step("index_build.read_upload", filename=file.filename):
             payload = await file.read()
+        
         if not payload:
+            logger.error("[ingestion][index_build] uploaded file is empty filename=%s", file.filename)
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        
+        logger.debug("[ingestion][index_build] step=write_temp_file temp_path=%s file_size=%d", temp_path, len(payload))
         with _timed_step("index_build.write_temp_file", temp_path=temp_path):
             temp_path.write_bytes(payload)
 
+        logger.debug("[ingestion][index_build] step=parse_to_markdown parser_mode=%s suffix=%s", settings.pdf_parser_mode, suffix)
         with _timed_step("index_build.parse_to_markdown", parser_mode=settings.pdf_parser_mode, suffix=suffix):
             markdown, source_parser, source_type = parse_source_to_markdown(temp_path)
+        
+        logger.debug("[ingestion][index_build] step=build_index markdown_chars=%d", len(markdown))
         return _build_index_response_from_markdown(
             markdown=markdown,
             source_file_path=temp_path,
@@ -741,6 +435,14 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
 @app.post("/v1/index/build-from-markdown", response_model=IndexBuildResponse)
 def index_build_from_markdown(request: IndexBuildFromMarkdownRequest) -> IndexBuildResponse:
     request_started = time.perf_counter()
+    logger.info("[ingestion][index_build_from_markdown] request received source=%s markdown_chars=%d", request.source_file_path, len(request.markdown))
+    logger.debug("[ingestion][index_build_from_markdown] step=validate_input parser=%s type=%s", request.source_parser, request.source_type)
+    
+    if not request.markdown.strip():
+        logger.error("[ingestion][index_build_from_markdown] empty markdown source=%s", request.source_file_path)
+        raise HTTPException(status_code=400, detail="Markdown content is empty.")
+    logger.debug("[ingestion][index_build_from_markdown] step=validate_ok markdown_chars=%d", len(request.markdown))
+    
     return _build_index_response_from_markdown(
         markdown=request.markdown,
         source_file_path=Path(request.source_file_path),
@@ -755,30 +457,79 @@ def index_build_from_markdown(request: IndexBuildFromMarkdownRequest) -> IndexBu
 @app.post("/v1/index/upsert", response_model=IndexUpsertResponse)
 def index_upsert(request: IndexUpsertRequest) -> IndexUpsertResponse:
     request_started = time.perf_counter()
+    logger.info("[ingestion][index_upsert] request received document_id=%s child_rows=%d", request.document_id, len(request.child_rows))
+    
+    logger.debug("[ingestion][index_upsert] step=validate_config retrieval_url=%s", bool(settings.retrieval_service_url))
     if not settings.retrieval_service_url:
+        logger.error("[ingestion][index_upsert] retrieval service url not configured")
         raise HTTPException(status_code=500, detail="RETRIEVAL_SERVICE_URL is not configured in ingestion_service.")
+    logger.debug("[ingestion][index_upsert] step=validate_ok retrieval_url=%s", settings.retrieval_service_url)
+    
     if not request.child_rows:
+        logger.info("[ingestion][index_upsert] no child rows to upsert document_id=%s", request.document_id)
         return IndexUpsertResponse(indexed_chunks=0)
 
-    chunks = [
-        {
-            "chunk_id": f"{row.parent_chunk_id}:{row.child_type}:{row.child_index}",
-            "document_id": row.document_id,
-            "content": row.child_text,
-            "page": row.source_page,
-            "metadata": {
+    logger.debug("[ingestion][index_upsert] step=prepare_chunks child_rows=%d", len(request.child_rows))
+    chunks: list[dict[str, Any]] = []
+    for row in request.child_rows:
+        page_start = row.page_start if row.page_start is not None else row.source_page
+        source_metadata = dict(row.source_metadata or {})
+        source_metadata.update(
+            {
                 "document_id": row.document_id,
+                "parent_id": row.parent_chunk_id,
                 "parent_chunk_id": row.parent_chunk_id,
-                "chunk_id": row.parent_chunk_id,
-                "source_page": row.source_page,
-                "source_metadata": row.source_metadata,
-                "child_type": row.child_type,
+                "logical_parent_id": row.parent_id,
+                "chunk_id": row.chunk_id,
+                "child_chunk_id": row.chunk_id,
                 "child_index": row.child_index,
-            },
-        }
-        for row in request.child_rows
-    ]
+                "child_type": row.child_type,
+                "index_type": row.index_type,
+                "page_start": page_start,
+                "page_end": row.page_end,
+                "heading_path": list(row.heading_path),
+                "section_title": row.section_title,
+            }
+        )
+        chunks.append(
+            {
+                "chunk_id": row.chunk_id,
+                "document_id": row.document_id,
+                "content": row.embedding_text,
+                "page": page_start,
+                "metadata": {
+                    "document_id": row.document_id,
+                    "parent_id": row.parent_chunk_id,
+                    "parent_chunk_id": row.parent_chunk_id,
+                    "chunk_id": row.chunk_id,
+                    "child_chunk_id": row.chunk_id,
+                    "logical_parent_id": row.parent_id,
+                    "section_id": row.section_id,
+                    "index_type": row.index_type,
+                    "heading_path": list(row.heading_path),
+                    "section_title": row.section_title,
+                    "page_start": page_start,
+                    "page_end": row.page_end,
+                    "source_page": page_start,
+                    "source_metadata": source_metadata,
+                    "child_type": row.child_type,
+                    "child_index": row.child_index,
+                    "child_text": row.child_text,
+                    "embedding_text": row.embedding_text,
+                    "token_count": row.token_count,
+                },
+            }
+        )
+    logger.debug("[ingestion][index_upsert] step=chunks_prepared total_chunks=%d", len(chunks))
 
+    logger.info(
+        "[ingestion][indexing] upsert_child_chunks document_id=%s embedding_count=%d index_type=%s",
+        request.document_id,
+        len(chunks),
+        INDEX_TYPE,
+    )
+
+    logger.debug("[ingestion][index_upsert] step=connect_retrieval_service url=%s timeout=%s", settings.retrieval_service_url, settings.retrieval_timeout_seconds)
     batch_size = 100
     indexed_total = 0
     with httpx.Client(timeout=settings.retrieval_timeout_seconds, headers=_indexing_headers()) as client:
@@ -789,19 +540,27 @@ def index_upsert(request: IndexUpsertRequest) -> IndexUpsertResponse:
                 "chunks": batch,
             }
             batch_started = time.perf_counter()
-            resp = client.post(f"{settings.retrieval_service_url}/v1/index/chunks", json=payload)
-            if resp.status_code >= 400:
-                raise HTTPException(status_code=502, detail=f"Retrieval indexing failed: {resp.status_code} {resp.text}")
-            result = resp.json()
-            indexed_total += int(result.get("indexed_chunks") or 0) if isinstance(result, dict) else 0
-            logger.info(
-                "[ingestion][timing] step=index_upsert.batch_post status=ok elapsed_ms=%.2f document_id=%s batch_start=%d batch_size=%d indexed_total=%d",
-                _ms(batch_started),
-                request.document_id,
-                start,
-                len(batch),
-                indexed_total,
-            )
+            logger.debug("[ingestion][index_upsert] step=post_batch document_id=%s batch_start=%d batch_size=%d", request.document_id, start, len(batch))
+            
+            try:
+                resp = client.post(f"{settings.retrieval_service_url}/v1/index/chunks", json=payload)
+                if resp.status_code >= 400:
+                    logger.error("[ingestion][index_upsert] retrieval service error status=%d document_id=%s", resp.status_code, request.document_id)
+                    raise HTTPException(status_code=502, detail=f"Retrieval indexing failed: {resp.status_code} {resp.text}")
+                result = resp.json()
+                indexed_total += int(result.get("indexed_chunks") or 0) if isinstance(result, dict) else 0
+                logger.info(
+                    "[ingestion][timing] step=index_upsert.batch_post status=ok elapsed_ms=%.2f document_id=%s batch_start=%d batch_size=%d indexed_total=%d",
+                    _ms(batch_started),
+                    request.document_id,
+                    start,
+                    len(batch),
+                    indexed_total,
+                )
+            except httpx.RequestError as exc:
+                logger.exception("[ingestion][index_upsert] retrieval service request failed document_id=%s batch_start=%d", request.document_id, start)
+                raise HTTPException(status_code=502, detail=f"Failed to connect to retrieval service: {exc}") from exc
+    
     logger.info(
         "[ingestion][timing] route=/v1/index/upsert status=ok total_elapsed_ms=%.2f document_id=%s indexed_chunks=%d",
         _ms(request_started),

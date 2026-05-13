@@ -2,7 +2,7 @@
 
 Service indexing được tách riêng khỏi backend RAG. Nhiệm vụ chính:
 
-- Nhận file `.pdf`, `.txt`, `.md` và parse/split/enrich qua `POST /v1/index/build`.
+- Nhận file `.pdf`, `.txt`, `.md`, render Markdown và tạo section-aware parent-child chunks qua `POST /v1/index/build`.
 - Nhận child rows đã map `parent_chunk_id` để embed + index qua `POST /v1/index/upsert`.
 - Duy trì API parse/split cũ (`/v1/parse`, `/v1/split`) để debug.
 
@@ -47,22 +47,43 @@ Response:
 {
   "parent_chunks": [
     {
+      "parent_id": "sec-0001",
+      "section_id": "sec-0001",
       "chunk_index": 0,
-      "content": "chunk text",
+      "content": "A\n\nchunk text",
+      "title": "A",
+      "heading_path": ["A"],
+      "token_count": 3,
+      "page_start": 1,
+      "page_end": 1,
       "source_page": 1,
-      "source_kind": "pdf_marker_page",
-      "source_metadata": {}
+      "source_kind": "pdf_marker_section",
+      "source_metadata": {
+        "index_type": "section_parent_child"
+      }
     }
   ],
   "child_rows": [
     {
       "chunk_index": 0,
-      "child_type": "summary",
+      "chunk_id": "sec-0001-child-0000",
+      "parent_id": "sec-0001",
+      "section_id": "sec-0001",
+      "child_type": "section_child",
       "child_index": 0,
-      "child_text": "Tóm tắt: ...",
+      "child_text": "chunk text",
+      "embedding_text": "A\n\nchunk text",
+      "token_count": 2,
+      "section_title": "A",
+      "heading_path": ["A"],
+      "page_start": 1,
+      "page_end": 1,
       "source_page": 1,
-      "source_kind": "pdf_marker_page",
-      "source_metadata": {}
+      "source_kind": "pdf_marker_section",
+      "index_type": "section_parent_child",
+      "source_metadata": {
+        "index_type": "section_parent_child"
+      }
     }
   ]
 }
@@ -79,10 +100,19 @@ JSON body:
     {
       "document_id": 1,
       "parent_chunk_id": 101,
+      "chunk_id": "sec-0001-child-0000",
+      "parent_id": "sec-0001",
       "source_page": 2,
-      "child_type": "summary",
+      "page_start": 2,
+      "page_end": 2,
+      "child_type": "section_child",
       "child_index": 0,
-      "child_text": "Tóm tắt: ...",
+      "child_text": "raw child text",
+      "embedding_text": "Heading > Path\n\nraw child text",
+      "token_count": 3,
+      "section_title": "Heading",
+      "heading_path": ["Heading", "Path"],
+      "index_type": "section_parent_child",
       "source_metadata": {}
     }
   ]
