@@ -14,6 +14,8 @@ class Settings:
     retrieval_timeout_seconds: float
     indexing_timeout_seconds: float
     indexing_batch_size: int
+    indexing_num_predict: int
+    llm_min_chunk_chars: int
     api_key: str
 
 
@@ -58,6 +60,8 @@ def get_settings() -> Settings:
         retrieval_timeout_seconds=_float_env("RETRIEVAL_TIMEOUT_SECONDS", 180.0),
         indexing_timeout_seconds=_float_env("INDEXING_TIMEOUT_SECONDS", _float_env("RETRIEVAL_TIMEOUT_SECONDS", 180.0)),
         indexing_batch_size=max(1, min(100, _int_env("INDEXING_BATCH_SIZE", 16))),
+        indexing_num_predict=max(64, min(2048, _int_env("INDEXING_NUM_PREDICT", 384))),
+        llm_min_chunk_chars=max(0, _int_env("LLM_MIN_CHUNK_CHARS", 300)),
         api_key=_string_env("OLLAMA_API_KEY", ""),
     )
 

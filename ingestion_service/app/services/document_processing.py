@@ -28,6 +28,9 @@ _MARKDOWN_HEADERS_TO_SPLIT_ON = [
 _RECURSIVE_SEPARATORS = ["\n\n", "\n", ". ", ", ", " ", ""]
 _HEADER_SPLIT_SPANS_KEY = "_marker_page_spans"
 _HEADER_SPLIT_START_KEY = "_header_split_start_index"
+_MIN_MERGE_CHARS = 300
+_MAX_MERGED_CHARS = 1800
+_TERMINAL_CHARS = set('.!?;:)"”’]')
 _marker_models: dict[str, Any] | None = None
 logger = logging.getLogger(__name__)
 
@@ -666,6 +669,148 @@ def _recursive_split(
     return splitter.split_documents(documents)
 
 
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _is_heading_only(text: str) -> bool:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return True
+    if len(lines) > 2:
+        return False
+    return all(re.match(r"^#{1,6}\s+\S+", line) or len(line) < 80 for line in lines)
+
+
+def _starts_like_continuation(text: str) -> bool:
+    stripped = str(text or "").lstrip()
+    if not stripped:
+        return False
+    first = stripped[0]
+    if first in ".,;:)”]":
+        return True
+    if first.islower():
+        return True
+    if stripped.startswith("*") and len(stripped) > 1 and stripped[1].islower():
+        return True
+    return False
+
+
+def _ends_like_continuation(text: str) -> bool:
+    stripped = str(text or "").rstrip()
+    if not stripped:
+        return False
+    return stripped[-1] not in _TERMINAL_CHARS
+
+
+def _metadata_merge_key(metadata: dict[str, Any]) -> tuple[Any, Any]:
+    headers = metadata.get("markdown_headers")
+    header_key = json.dumps(headers, ensure_ascii=False, sort_keys=True) if isinstance(headers, dict) else ""
+    return metadata.get("source_page"), header_key
+
+
+def _can_merge_chunks(left: Document, right: Document, *, max_chars: int) -> bool:
+    left_text = str(left.page_content or "").strip()
+    right_text = str(right.page_content or "").strip()
+    if not left_text or not right_text:
+        return True
+    if len(left_text) + len(right_text) + 2 > max_chars:
+        return False
+
+    left_metadata = dict(left.metadata or {})
+    right_metadata = dict(right.metadata or {})
+    same_context = _metadata_merge_key(left_metadata) == _metadata_merge_key(right_metadata)
+    if same_context:
+        return True
+
+    same_page = left_metadata.get("source_page") == right_metadata.get("source_page")
+    return bool(same_page and (_ends_like_continuation(left_text) or _starts_like_continuation(right_text)))
+
+
+def _join_chunk_text(left: str, right: str) -> str:
+    left_text = str(left or "").rstrip()
+    right_text = str(right or "").lstrip()
+    if not left_text:
+        return right_text
+    if not right_text:
+        return left_text
+    if left_text.endswith("-"):
+        return left_text[:-1] + right_text
+    if _starts_like_continuation(right_text) or _ends_like_continuation(left_text):
+        return f"{left_text} {right_text}"
+    return f"{left_text}\n\n{right_text}"
+
+
+def _merge_low_signal_chunks(
+    documents: list[Document],
+    *,
+    min_chars: int = _MIN_MERGE_CHARS,
+    max_chars: int = _MAX_MERGED_CHARS,
+) -> list[Document]:
+    if not documents:
+        return []
+
+    merged: list[Document] = []
+    merge_count = 0
+    for item in documents:
+        text = str(item.page_content or "").strip()
+        if not text:
+            continue
+        current = Document(page_content=text, metadata=dict(item.metadata or {}))
+
+        if merged:
+            previous = merged[-1]
+            previous_text = str(previous.page_content or "").strip()
+            should_merge_previous = (
+                len(_compact_text(previous_text)) < min_chars
+                or len(_compact_text(text)) < min_chars
+                or _ends_like_continuation(previous_text)
+                or _starts_like_continuation(text)
+                or _is_heading_only(previous_text)
+            )
+            if should_merge_previous and _can_merge_chunks(previous, current, max_chars=max_chars):
+                previous.page_content = _join_chunk_text(previous_text, text)
+                previous_metadata = dict(previous.metadata or {})
+                current_metadata = dict(current.metadata or {})
+                if current_metadata.get("source_page") is not None and previous_metadata.get("source_page") is None:
+                    previous_metadata["source_page"] = current_metadata.get("source_page")
+                previous_metadata["merged_chunk_count"] = int(previous_metadata.get("merged_chunk_count") or 1) + 1
+                previous.metadata = previous_metadata
+                merge_count += 1
+                continue
+
+        merged.append(current)
+
+    if len(merged) > 1:
+        second_pass: list[Document] = []
+        for item in merged:
+            text = str(item.page_content or "").strip()
+            if (
+                second_pass
+                and len(_compact_text(text)) < min_chars
+                and _can_merge_chunks(second_pass[-1], item, max_chars=max_chars)
+            ):
+                previous = second_pass[-1]
+                previous.page_content = _join_chunk_text(str(previous.page_content or ""), text)
+                previous_metadata = dict(previous.metadata or {})
+                previous_metadata["merged_chunk_count"] = int(previous_metadata.get("merged_chunk_count") or 1) + 1
+                previous.metadata = previous_metadata
+                merge_count += 1
+            else:
+                second_pass.append(item)
+        merged = second_pass
+
+    logger.info(
+        "[ingestion][timing] module=document_processing step=merge_low_signal_chunks status=ok input_chunks=%d output_chunks=%d merged=%d min_chars=%d max_chars=%d",
+        len(documents),
+        len(merged),
+        merge_count,
+        min_chars,
+        max_chars,
+    )
+    return merged
+
+
 def _markdown_header_split(documents: list[Document]) -> list[Document]:
     splitter = MarkdownHeaderTextSplitter(
         headers_to_split_on=_MARKDOWN_HEADERS_TO_SPLIT_ON,
@@ -808,10 +953,12 @@ def split_source_documents(
         metadata.pop(_HEADER_SPLIT_START_KEY, None)
         item.metadata = metadata
 
+    merged_documents = _merge_low_signal_chunks(recursive_documents)
+
     logger.info(
         "[ingestion][timing] module=document_processing step=split_source_documents elapsed_ms=%.2f input_docs=%d output_chunks=%d",
         _ms(started),
         len(documents),
-        len(recursive_documents),
+        len(merged_documents),
     )
-    return recursive_documents
+    return merged_documents

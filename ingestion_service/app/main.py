@@ -148,6 +148,11 @@ class IndexUpsertResponse(BaseModel):
 
 _DATE_PATTERN = re.compile(r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4})\b")
 _DOC_CODE_PATTERN = re.compile(r"\b\d{1,6}[/-][A-Za-z]{1,12}(?:[/-][A-Za-z0-9]{1,16})+\b")
+_FRONT_MATTER_MARKERS = (
+    "chỉ đạo nội dung",
+    "tổ chức thực hiện",
+    "biên soạn",
+)
 _INDEXING_INSTRUCTION = """
 Bạn là hệ thống xử lý tài liệu cho RAG indexing.
 
@@ -222,6 +227,85 @@ def _fallback_search(chunk_text: str) -> dict[str, list[str]]:
     }
 
 
+def _plain_heading_text(value: str | None) -> str:
+    cleaned = re.sub(r"[*_`#]+", " ", str(value or ""))
+    return _normalize_spaces(cleaned).lower()
+
+
+def _looks_like_heading_only(text: str) -> bool:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines or len(lines) > 2:
+        return False
+    return all(re.match(r"^#{1,6}\s+\S+", line) or len(_normalize_spaces(line)) < 90 for line in lines)
+
+
+def _sentence_count(text: str) -> int:
+    return len(re.findall(r"[.!?…](?:\s|$)", str(text or "")))
+
+
+def _bullet_line_count(text: str) -> int:
+    return sum(1 for line in str(text or "").splitlines() if re.match(r"^\s*[-*+]\s+", line))
+
+
+def _llm_skip_reason(text: str, context: dict[str, str | None]) -> str | None:
+    compact = _normalize_spaces(text)
+    if not compact:
+        return "empty"
+    if len(compact) < settings.llm_min_chunk_chars:
+        return "short"
+    if _looks_like_heading_only(text):
+        return "heading_only"
+
+    context_text = " ".join(
+        _plain_heading_text(item)
+        for item in (context.get("h2"), context.get("h3"))
+        if item
+    )
+    if len(compact) < 600 and any(marker in context_text for marker in _FRONT_MATTER_MARKERS):
+        return "front_matter"
+    if len(compact) < 900 and _bullet_line_count(text) >= 3 and _sentence_count(text) <= 1:
+        return "list_like"
+    return None
+
+
+def _fallback_summary(text: str, context: dict[str, str | None]) -> str:
+    compact = _normalize_spaces(text)
+    if not compact:
+        return "Không có tóm tắt."
+    sentences = [item.strip() for item in re.split(r"(?<=[.!?…])\s+", compact) if item.strip()]
+    if sentences:
+        return " ".join(sentences[:2])[:700]
+    heading = context.get("h3") or context.get("h2")
+    if heading and len(compact) < 260:
+        return f"{_normalize_spaces(str(heading))}: {compact}"[:700]
+    return compact[:700]
+
+
+def _fallback_llm_item(text: str, context: dict[str, str | None], reason: str) -> dict[str, Any]:
+    search = _fallback_search(text)
+    keywords = list(dict.fromkeys([
+        *(search.get("document_codes") or []),
+        *(search.get("dates") or []),
+        *[
+            _normalize_spaces(str(item))
+            for item in (context.get("h2"), context.get("h3"))
+            if item
+        ],
+    ]))[:20]
+    return {
+        "summary": _fallback_summary(text, context),
+        "hyq": [],
+        "metadata": {
+            "keywords": keywords,
+            "risk_level": "low",
+            "llm_skipped": True,
+            "skip_reason": reason,
+        },
+        "language": "vi",
+        "skipped": {"reason": reason},
+    }
+
+
 def _build_hyq(summary: str, hyq_questions: list[str], context: dict[str, str | None]) -> dict[str, Any]:
     normalized_questions = [q if q.endswith("?") else f"{q}?" for q in hyq_questions if str(q).strip()]
     if not normalized_questions:
@@ -257,7 +341,7 @@ def _indexing_batch(chunk_texts: list[str]) -> list[dict[str, Any]]:
             payload = {
                 "texts": batch,
                 "instruction": _INDEXING_INSTRUCTION,
-                "options": {"num_predict": 768},
+                "options": {"num_predict": settings.indexing_num_predict},
             }
             batch_started = time.perf_counter()
             try:
@@ -465,8 +549,11 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
 
     parent_chunks: list[IndexBuildChunkPayload] = []
     child_rows: list[IndexBuildChildPayload] = []
-    texts: list[str] = []
     raw_rows: list[tuple[int, str, int | None, str, dict[str, Any], dict[str, str | None]]] = []
+    enrich_texts: list[str] = []
+    enrich_raw_indexes: list[int] = []
+    llm_items_by_raw_index: dict[int, dict[str, Any]] = {}
+    skipped_enrichment_count = 0
 
     prepare_started = time.perf_counter()
     for item in chunks:
@@ -487,27 +574,45 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
                 source_metadata={},
             )
         )
-        texts.append(text)
+        raw_index = len(raw_rows)
         raw_rows.append((chunk_index, text, source_page, source_kind, metadata, context))
+        skip_reason = _llm_skip_reason(text, context)
+        if skip_reason is None:
+            enrich_raw_indexes.append(raw_index)
+            enrich_texts.append(text)
+        else:
+            skipped_enrichment_count += 1
+            llm_items_by_raw_index[raw_index] = _fallback_llm_item(text, context, skip_reason)
     logger.info(
-        "[ingestion][timing] step=enrich_batch.prepare_payload status=ok elapsed_ms=%.2f batch_size=%d input_chars=%d",
+        "[ingestion][timing] step=enrich_batch.prepare_payload status=ok elapsed_ms=%.2f parent_chunks=%d llm_chunks=%d skipped_llm_chunks=%d input_chars=%d",
         _ms(prepare_started),
-        len(texts),
-        sum(len(t) for t in texts),
+        len(raw_rows),
+        len(enrich_texts),
+        skipped_enrichment_count,
+        sum(len(t) for t in enrich_texts),
     )
 
-    try:
-        with _timed_step("enrich_batch.call_indexing_batch_api", model_name="ollama_indexing_batch", batch_size=len(texts)):
-            llm_items = _indexing_batch(texts)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if enrich_texts:
+        try:
+            with _timed_step("enrich_batch.call_indexing_batch_api", model_name="ollama_indexing_batch", batch_size=len(enrich_texts)):
+                enriched_items = _indexing_batch(enrich_texts)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        for raw_index, llm_item in zip(enrich_raw_indexes, enriched_items, strict=True):
+            llm_items_by_raw_index[raw_index] = llm_item
+    else:
+        logger.info(
+            "[ingestion][timing] step=enrich_batch.call_indexing_batch_api status=skipped reason=no_llm_eligible_chunks",
+        )
+
     generate_started = time.perf_counter()
     total_children_generated = 0
     total_parent_elapsed_ms = 0.0
     for idx, raw in enumerate(raw_rows):
         parent_started = time.perf_counter()
         chunk_index, text, source_page, source_kind, metadata, context = raw
-        llm_item = llm_items[idx] if idx < len(llm_items) else {}
+        llm_item = llm_items_by_raw_index.get(idx) or _fallback_llm_item(text, context, "missing_llm_result")
+        llm_skipped = bool(isinstance(llm_item.get("skipped"), dict))
         summary = str(llm_item.get("summary") or "")
         hyq = llm_item.get("hyq")
         questions = [str(q) for q in hyq] if isinstance(hyq, list) else []
@@ -533,6 +638,12 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
             },
             "hyq": _build_hyq(summary, questions, context),
         }
+        if llm_skipped:
+            structured["hyq"]["questions"] = []
+            structured["indexing"] = {
+                "llm_skipped": True,
+                "skip_reason": str((llm_item.get("skipped") or {}).get("reason") or meta.get("skip_reason") or "unknown"),
+            }
         logger.info(
             "[ingestion][timing] step=enrich_batch.build_metadata status=ok elapsed_ms=%.2f chunk_index=%d",
             _ms(metadata_started),
