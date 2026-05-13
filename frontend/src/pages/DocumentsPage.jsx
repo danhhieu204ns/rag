@@ -23,6 +23,7 @@ function DocumentsPage() {
   const [chunkOffset, setChunkOffset] = useState(0);
   const [isChunksBusy, setIsChunksBusy] = useState(false);
   const [chunksError, setChunksError] = useState("");
+  const [showReindexConfirm, setShowReindexConfirm] = useState(false);
   const isPollingRef = useRef(false);
 
   const totalChunks = useMemo(
@@ -154,12 +155,18 @@ function DocumentsPage() {
     }
   }
 
-  async function rebuildIndex() {
+  function openReindexConfirm() {
+    setShowReindexConfirm(true);
+  }
+
+  async function handleConfirmReindex() {
+    setShowReindexConfirm(false);
     setIsBusy(true);
     setBusyMessage("Đang đưa các tài liệu cần index vào hàng đợi...");
     setError("");
     try {
       await api.post("/documents/reindex");
+      await fetchDocuments();
     } catch (err) {
       const detail = err?.response?.data?.detail;
       setError(typeof detail === "string" ? detail : "Không thể index lại tài liệu.");
@@ -167,6 +174,10 @@ function DocumentsPage() {
       setIsBusy(false);
       setBusyMessage("");
     }
+  }
+
+  function handleCancelReindex() {
+    setShowReindexConfirm(false);
   }
 
   function handleChunkToggle(doc) {
@@ -244,7 +255,7 @@ function DocumentsPage() {
           <span className="metric-pill">Tài liệu: {documents.length}</span>
           <span className="metric-pill">Tổng chunks: {totalChunks}</span>
           {hasIndexingDocuments ? <span className="status-pill progress">Đang cập nhật tiến độ</span> : null}
-          <button className="soft-button" onClick={rebuildIndex} disabled={isBusy}>
+          <button className="soft-button" onClick={openReindexConfirm} disabled={isBusy}>
             Index tài liệu còn thiếu
           </button>
         </div>
@@ -404,6 +415,30 @@ function DocumentsPage() {
 
       {error ? <p className="error-text">{error}</p> : null}
       {isBusy && busyMessage ? <p className="muted busy-text">{busyMessage}</p> : null}
+
+      {showReindexConfirm ? (
+        <div className="modal-overlay" onClick={handleCancelReindex}>
+          <div className="modal-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Xác nhận index lại tài liệu</h3>
+            </div>
+            <div className="modal-body">
+              <p>Bạn có chắc muốn index lại các tài liệu còn thiếu không?</p>
+              <p className="muted" style={{ fontSize: "0.9em", marginTop: "8px" }}>
+                Các tài liệu sẽ được đưa vào hàng đợi xử lý.
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button className="soft-button" onClick={handleCancelReindex}>
+                Hủy
+              </button>
+              <button className="primary" onClick={handleConfirmReindex}>
+                Xác nhận
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
