@@ -134,6 +134,37 @@ def build_index_bundle(file_path: Path) -> dict[str, Any]:
     return payload
 
 
+def build_index_bundle_from_markdown(
+    *,
+    markdown: str,
+    source_file_path: Path,
+    source_parser: str,
+    source_type: str,
+) -> dict[str, Any]:
+    _require_service_url()
+    payload = {
+        "markdown": markdown,
+        "source_file_path": str(source_file_path),
+        "source_parser": source_parser,
+        "source_type": source_type,
+    }
+    try:
+        url = _service_url("/v1/index/build-from-markdown")
+        with httpx.Client(timeout=settings.ingestion_timeout_seconds) as client:
+            response = client.post(url, json=payload)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError("Ingestion service request timed out while building index bundle from markdown.") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"Failed to connect to ingestion service: {exc}") from exc
+
+    if response.status_code >= 400:
+        _raise_service_error(response)
+    result = response.json()
+    if not isinstance(result, dict):
+        raise RuntimeError("Ingestion service returned invalid index bundle payload.")
+    return result
+
+
 def upsert_index_bundle(*, document_id: int, child_rows: list[dict[str, Any]]) -> int:
     _require_service_url()
     payload = {

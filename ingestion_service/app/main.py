@@ -104,6 +104,13 @@ class ParseResponse(BaseModel):
     source_type: str
 
 
+class IndexBuildFromMarkdownRequest(BaseModel):
+    markdown: str = Field(default="")
+    source_file_path: str
+    source_parser: str = "legacy"
+    source_type: str = "text"
+
+
 class IndexBuildChunkPayload(BaseModel):
     chunk_index: int
     content: str
@@ -395,6 +402,196 @@ _INGESTION_LOG_PATH = _configure_ingestion_file_logging()
 logger.info("[ingestion] file logging enabled path=%s", _INGESTION_LOG_PATH)
 
 
+def _build_index_response_from_markdown(
+    *,
+    markdown: str,
+    source_file_path: Path,
+    source_parser: str,
+    source_type: str,
+    filename: str,
+    route_name: str,
+    request_started: float,
+) -> IndexBuildResponse:
+    if not markdown.strip():
+        raise HTTPException(status_code=400, detail="Parsed markdown is empty.")
+
+    suffix = source_file_path.suffix.lower()
+    with TemporaryDirectory(prefix="ingestion_index_markdown_") as tmp_dir:
+        markdown_path = Path(tmp_dir) / "parsed.md"
+        with _timed_step(f"{route_name}.write_markdown", markdown_chars=len(markdown)):
+            markdown_path.write_text(markdown.strip(), encoding="utf-8")
+        with _timed_step(f"{route_name}.load_documents"):
+            loaded = load_documents_from_parsed_markdown(
+                markdown_path,
+                source_file_path=source_file_path,
+                source_parser=source_parser,
+                source_type=source_type,
+            )
+        with _timed_step(f"{route_name}.chunk_documents", loaded_docs=len(loaded), chunk_size=1000, chunk_overlap=150):
+            chunks = split_source_documents(
+                loaded,
+                chunk_size=1000,
+                chunk_overlap=150,
+            )
+
+    parent_chunks: list[IndexBuildChunkPayload] = []
+    child_rows: list[IndexBuildChildPayload] = []
+    raw_rows: list[tuple[int, str, int | None, str, dict[str, Any], dict[str, str | None]]] = []
+    enrich_texts: list[str] = []
+    enrich_raw_indexes: list[int] = []
+    llm_items_by_raw_index: dict[int, dict[str, Any]] = {}
+    skipped_enrichment_count = 0
+
+    prepare_started = time.perf_counter()
+    for item in chunks:
+        text = str(item.page_content or "").strip()
+        if not text:
+            continue
+        metadata = dict(item.metadata or {})
+        chunk_index = len(parent_chunks)
+        source_page = metadata.get("source_page") if isinstance(metadata.get("source_page"), int) else None
+        source_kind = _source_kind(metadata, suffix)
+        context = _extract_context(metadata)
+        parent_chunks.append(
+            IndexBuildChunkPayload(
+                chunk_index=chunk_index,
+                content=text,
+                source_page=source_page,
+                source_kind=source_kind,
+                source_metadata={},
+            )
+        )
+        raw_index = len(raw_rows)
+        raw_rows.append((chunk_index, text, source_page, source_kind, metadata, context))
+        skip_reason = _llm_skip_reason(text, context)
+        if skip_reason is None:
+            enrich_raw_indexes.append(raw_index)
+            enrich_texts.append(text)
+        else:
+            skipped_enrichment_count += 1
+            llm_items_by_raw_index[raw_index] = _fallback_llm_item(text, context, skip_reason)
+    logger.info(
+        "[ingestion][timing] step=enrich_batch.prepare_payload status=ok elapsed_ms=%.2f parent_chunks=%d llm_chunks=%d skipped_llm_chunks=%d input_chars=%d",
+        _ms(prepare_started),
+        len(raw_rows),
+        len(enrich_texts),
+        skipped_enrichment_count,
+        sum(len(t) for t in enrich_texts),
+    )
+
+    if enrich_texts:
+        try:
+            with _timed_step("enrich_batch.call_indexing_batch_api", model_name="ollama_indexing_batch", batch_size=len(enrich_texts)):
+                enriched_items = _indexing_batch(enrich_texts)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        for raw_index, llm_item in zip(enrich_raw_indexes, enriched_items, strict=True):
+            llm_items_by_raw_index[raw_index] = llm_item
+    else:
+        logger.info(
+            "[ingestion][timing] step=enrich_batch.call_indexing_batch_api status=skipped reason=no_llm_eligible_chunks",
+        )
+
+    generate_started = time.perf_counter()
+    total_children_generated = 0
+    total_parent_elapsed_ms = 0.0
+    for idx, raw in enumerate(raw_rows):
+        parent_started = time.perf_counter()
+        chunk_index, text, source_page, source_kind, metadata, context = raw
+        llm_item = llm_items_by_raw_index.get(idx) or _fallback_llm_item(text, context, "missing_llm_result")
+        llm_skipped = bool(isinstance(llm_item.get("skipped"), dict))
+        summary = str(llm_item.get("summary") or "")
+        hyq = llm_item.get("hyq")
+        questions = [str(q) for q in hyq] if isinstance(hyq, list) else []
+        meta = llm_item.get("metadata") if isinstance(llm_item.get("metadata"), dict) else {}
+        keywords = [str(k) for k in (meta.get("keywords") or []) if str(k).strip()]
+        search_opt = _fallback_search(text)
+        if keywords:
+            search_opt["keywords"] = list(dict.fromkeys([*search_opt["keywords"], *keywords]))[:20]
+            search_opt["entities"] = keywords[:15]
+
+        metadata_started = time.perf_counter()
+        structured = {
+            "source_info": {
+                "file_name": filename,
+                "page_number": source_page,
+                "doc_type": "Tài_liệu_nội_bộ",
+            },
+            "context": context,
+            "search_optimization": search_opt,
+            "admin_tags": {
+                "security_level": "Nội_bộ",
+                "department": "Tổng_hợp",
+            },
+            "hyq": _build_hyq(summary, questions, context),
+        }
+        if llm_skipped:
+            structured["hyq"]["questions"] = []
+            structured["indexing"] = {
+                "llm_skipped": True,
+                "skip_reason": str((llm_item.get("skipped") or {}).get("reason") or meta.get("skip_reason") or "unknown"),
+            }
+        logger.info(
+            "[ingestion][timing] step=enrich_batch.build_metadata status=ok elapsed_ms=%.2f chunk_index=%d",
+            _ms(metadata_started),
+            chunk_index,
+        )
+        parent_chunks[idx].source_metadata = structured
+        children_before = len(child_rows)
+        child_rows.append(
+            IndexBuildChildPayload(
+                chunk_index=chunk_index,
+                child_type="summary",
+                child_index=0,
+                child_text=f"Tóm tắt: {structured['hyq']['summary']}",
+                source_page=source_page,
+                source_kind=source_kind,
+                source_metadata=structured,
+            )
+        )
+        for q_idx, q in enumerate(structured["hyq"]["questions"], start=1):
+            child_rows.append(
+                IndexBuildChildPayload(
+                    chunk_index=chunk_index,
+                    child_type="question",
+                    child_index=q_idx,
+                    child_text=str(q),
+                    source_page=source_page,
+                    source_kind=source_kind,
+                    source_metadata=structured,
+                )
+            )
+        generated_for_parent = len(child_rows) - children_before
+        total_children_generated += generated_for_parent
+        parent_elapsed_ms = _ms(parent_started)
+        total_parent_elapsed_ms += parent_elapsed_ms
+        elapsed_per_child_ms = parent_elapsed_ms / generated_for_parent if generated_for_parent > 0 else 0.0
+        logger.info(
+            "[ingestion][timing] step=enrich_batch.generate_child_chunks status=ok chunk_index=%d output_children=%d elapsed_per_parent_ms=%.2f elapsed_per_child_ms=%.2f",
+            chunk_index,
+            generated_for_parent,
+            parent_elapsed_ms,
+            elapsed_per_child_ms,
+        )
+
+    logger.info(
+        "[ingestion][timing] step=enrich_batch.postprocess status=ok elapsed_ms=%.2f parent_chunks=%d output_children=%d avg_elapsed_per_parent_ms=%.2f",
+        _ms(generate_started),
+        len(parent_chunks),
+        total_children_generated,
+        (total_parent_elapsed_ms / len(raw_rows)) if raw_rows else 0.0,
+    )
+    logger.info(
+        "[ingestion][timing] route=/%s status=ok total_elapsed_ms=%.2f filename=%s parent_chunks=%d child_rows=%d",
+        route_name,
+        _ms(request_started),
+        filename,
+        len(parent_chunks),
+        len(child_rows),
+    )
+    return IndexBuildResponse(parent_chunks=parent_chunks, child_rows=child_rows)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {
@@ -530,178 +727,29 @@ async def index_build(file: UploadFile = File(...)) -> IndexBuildResponse:
 
         with _timed_step("index_build.parse_to_markdown", parser_mode=settings.pdf_parser_mode, suffix=suffix):
             markdown, source_parser, source_type = parse_source_to_markdown(temp_path)
-        markdown_path = Path(tmp_dir) / "parsed.md"
-        with _timed_step("index_build.write_markdown", markdown_chars=len(markdown)):
-            markdown_path.write_text(markdown.strip(), encoding="utf-8")
-        with _timed_step("index_build.load_documents"):
-            loaded = load_documents_from_parsed_markdown(
-                markdown_path,
-                source_file_path=temp_path,
-                source_parser=source_parser,
-                source_type=source_type,
-            )
-        with _timed_step("index_build.chunk_documents", loaded_docs=len(loaded), chunk_size=1000, chunk_overlap=150):
-            chunks = split_source_documents(
-                loaded,
-                chunk_size=1000,
-                chunk_overlap=150,
-            )
-
-    parent_chunks: list[IndexBuildChunkPayload] = []
-    child_rows: list[IndexBuildChildPayload] = []
-    raw_rows: list[tuple[int, str, int | None, str, dict[str, Any], dict[str, str | None]]] = []
-    enrich_texts: list[str] = []
-    enrich_raw_indexes: list[int] = []
-    llm_items_by_raw_index: dict[int, dict[str, Any]] = {}
-    skipped_enrichment_count = 0
-
-    prepare_started = time.perf_counter()
-    for item in chunks:
-        text = str(item.page_content or "").strip()
-        if not text:
-            continue
-        metadata = dict(item.metadata or {})
-        chunk_index = len(parent_chunks)
-        source_page = metadata.get("source_page") if isinstance(metadata.get("source_page"), int) else None
-        source_kind = _source_kind(metadata, suffix)
-        context = _extract_context(metadata)
-        parent_chunks.append(
-            IndexBuildChunkPayload(
-                chunk_index=chunk_index,
-                content=text,
-                source_page=source_page,
-                source_kind=source_kind,
-                source_metadata={},
-            )
+        return _build_index_response_from_markdown(
+            markdown=markdown,
+            source_file_path=temp_path,
+            source_parser=source_parser,
+            source_type=source_type,
+            filename=str(file.filename or ""),
+            route_name="v1/index/build",
+            request_started=request_started,
         )
-        raw_index = len(raw_rows)
-        raw_rows.append((chunk_index, text, source_page, source_kind, metadata, context))
-        skip_reason = _llm_skip_reason(text, context)
-        if skip_reason is None:
-            enrich_raw_indexes.append(raw_index)
-            enrich_texts.append(text)
-        else:
-            skipped_enrichment_count += 1
-            llm_items_by_raw_index[raw_index] = _fallback_llm_item(text, context, skip_reason)
-    logger.info(
-        "[ingestion][timing] step=enrich_batch.prepare_payload status=ok elapsed_ms=%.2f parent_chunks=%d llm_chunks=%d skipped_llm_chunks=%d input_chars=%d",
-        _ms(prepare_started),
-        len(raw_rows),
-        len(enrich_texts),
-        skipped_enrichment_count,
-        sum(len(t) for t in enrich_texts),
+
+
+@app.post("/v1/index/build-from-markdown", response_model=IndexBuildResponse)
+def index_build_from_markdown(request: IndexBuildFromMarkdownRequest) -> IndexBuildResponse:
+    request_started = time.perf_counter()
+    return _build_index_response_from_markdown(
+        markdown=request.markdown,
+        source_file_path=Path(request.source_file_path),
+        source_parser=request.source_parser,
+        source_type=request.source_type,
+        filename=Path(request.source_file_path).name,
+        route_name="v1/index/build-from-markdown",
+        request_started=request_started,
     )
-
-    if enrich_texts:
-        try:
-            with _timed_step("enrich_batch.call_indexing_batch_api", model_name="ollama_indexing_batch", batch_size=len(enrich_texts)):
-                enriched_items = _indexing_batch(enrich_texts)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        for raw_index, llm_item in zip(enrich_raw_indexes, enriched_items, strict=True):
-            llm_items_by_raw_index[raw_index] = llm_item
-    else:
-        logger.info(
-            "[ingestion][timing] step=enrich_batch.call_indexing_batch_api status=skipped reason=no_llm_eligible_chunks",
-        )
-
-    generate_started = time.perf_counter()
-    total_children_generated = 0
-    total_parent_elapsed_ms = 0.0
-    for idx, raw in enumerate(raw_rows):
-        parent_started = time.perf_counter()
-        chunk_index, text, source_page, source_kind, metadata, context = raw
-        llm_item = llm_items_by_raw_index.get(idx) or _fallback_llm_item(text, context, "missing_llm_result")
-        llm_skipped = bool(isinstance(llm_item.get("skipped"), dict))
-        summary = str(llm_item.get("summary") or "")
-        hyq = llm_item.get("hyq")
-        questions = [str(q) for q in hyq] if isinstance(hyq, list) else []
-        meta = llm_item.get("metadata") if isinstance(llm_item.get("metadata"), dict) else {}
-        keywords = [str(k) for k in (meta.get("keywords") or []) if str(k).strip()]
-        search_opt = _fallback_search(text)
-        if keywords:
-            search_opt["keywords"] = list(dict.fromkeys([*search_opt["keywords"], *keywords]))[:20]
-            search_opt["entities"] = keywords[:15]
-
-        metadata_started = time.perf_counter()
-        structured = {
-            "source_info": {
-                "file_name": str(file.filename or ""),
-                "page_number": source_page,
-                "doc_type": "Tài_liệu_nội_bộ",
-            },
-            "context": context,
-            "search_optimization": search_opt,
-            "admin_tags": {
-                "security_level": "Nội_bộ",
-                "department": "Tổng_hợp",
-            },
-            "hyq": _build_hyq(summary, questions, context),
-        }
-        if llm_skipped:
-            structured["hyq"]["questions"] = []
-            structured["indexing"] = {
-                "llm_skipped": True,
-                "skip_reason": str((llm_item.get("skipped") or {}).get("reason") or meta.get("skip_reason") or "unknown"),
-            }
-        logger.info(
-            "[ingestion][timing] step=enrich_batch.build_metadata status=ok elapsed_ms=%.2f chunk_index=%d",
-            _ms(metadata_started),
-            chunk_index,
-        )
-        parent_chunks[idx].source_metadata = structured
-        children_before = len(child_rows)
-        child_rows.append(
-            IndexBuildChildPayload(
-                chunk_index=chunk_index,
-                child_type="summary",
-                child_index=0,
-                child_text=f"Tóm tắt: {structured['hyq']['summary']}",
-                source_page=source_page,
-                source_kind=source_kind,
-                source_metadata=structured,
-            )
-        )
-        for q_idx, q in enumerate(structured["hyq"]["questions"], start=1):
-            child_rows.append(
-                IndexBuildChildPayload(
-                    chunk_index=chunk_index,
-                    child_type="question",
-                    child_index=q_idx,
-                    child_text=str(q),
-                    source_page=source_page,
-                    source_kind=source_kind,
-                    source_metadata=structured,
-                )
-            )
-        generated_for_parent = len(child_rows) - children_before
-        total_children_generated += generated_for_parent
-        parent_elapsed_ms = _ms(parent_started)
-        total_parent_elapsed_ms += parent_elapsed_ms
-        elapsed_per_child_ms = parent_elapsed_ms / generated_for_parent if generated_for_parent > 0 else 0.0
-        logger.info(
-            "[ingestion][timing] step=enrich_batch.generate_child_chunks status=ok chunk_index=%d output_children=%d elapsed_per_parent_ms=%.2f elapsed_per_child_ms=%.2f",
-            chunk_index,
-            generated_for_parent,
-            parent_elapsed_ms,
-            elapsed_per_child_ms,
-        )
-
-    logger.info(
-        "[ingestion][timing] step=enrich_batch.postprocess status=ok elapsed_ms=%.2f parent_chunks=%d output_children=%d avg_elapsed_per_parent_ms=%.2f",
-        _ms(generate_started),
-        len(parent_chunks),
-        total_children_generated,
-        (total_parent_elapsed_ms / len(raw_rows)) if raw_rows else 0.0,
-    )
-    logger.info(
-        "[ingestion][timing] route=/v1/index/build status=ok total_elapsed_ms=%.2f filename=%s parent_chunks=%d child_rows=%d",
-        _ms(request_started),
-        file.filename,
-        len(parent_chunks),
-        len(child_rows),
-    )
-    return IndexBuildResponse(parent_chunks=parent_chunks, child_rows=child_rows)
 
 
 @app.post("/v1/index/upsert", response_model=IndexUpsertResponse)

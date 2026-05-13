@@ -28,7 +28,7 @@ from ..schemas import (
     ParseDocumentResponse,
 )
 from ..services.ingestion_client import (
-    build_index_bundle,
+    build_index_bundle_from_markdown,
     parse_source_to_markdown,
     upsert_index_bundle,
 )
@@ -39,6 +39,128 @@ from ..services.rag.utils import _json_safe_value, _to_int
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
+_MARKDOWN_CACHE_VERSION = 1
+
+
+def _parsed_markdown_cache_dir() -> Path:
+    cache_dir = settings.storage_dir / "parsed_markdown_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _parsed_markdown_cache_paths(document_id: int, file_hash: str, parser_mode: str) -> tuple[Path, Path]:
+    cache_key = f"doc-{document_id}-{file_hash}-{parser_mode}"
+    cache_dir = _parsed_markdown_cache_dir()
+    return cache_dir / f"{cache_key}.md", cache_dir / f"{cache_key}.json"
+
+
+def _load_cached_markdown(
+    *,
+    document_id: int,
+    file_hash: str,
+    parser_mode: str,
+) -> tuple[str, str, str] | None:
+    markdown_path, metadata_path = _parsed_markdown_cache_paths(document_id, file_hash, parser_mode)
+    if not markdown_path.exists() or not metadata_path.exists():
+        return None
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict):
+            return None
+        if metadata.get("cache_version") != _MARKDOWN_CACHE_VERSION:
+            return None
+        if metadata.get("document_id") != document_id:
+            return None
+        if metadata.get("file_hash") != file_hash:
+            return None
+        if metadata.get("parser_mode") != parser_mode:
+            return None
+        markdown = markdown_path.read_text(encoding="utf-8").strip()
+    except (OSError, json.JSONDecodeError):
+        logger.exception("[markdown_cache] failed to read cache document_id=%s", document_id)
+        return None
+
+    if not markdown:
+        return None
+
+    source_parser = str(metadata.get("source_parser") or "legacy").strip().lower()
+    source_type = str(metadata.get("source_type") or "text").strip().lower()
+    logger.info(
+        "[markdown_cache] hit document_id=%s parser=%s type=%s chars=%d",
+        document_id,
+        source_parser,
+        source_type,
+        len(markdown),
+    )
+    return markdown, source_parser, source_type
+
+
+def _save_cached_markdown(
+    *,
+    document_id: int,
+    file_hash: str,
+    parser_mode: str,
+    markdown: str,
+    source_parser: str,
+    source_type: str,
+) -> None:
+    cleaned_markdown = markdown.strip()
+    if not cleaned_markdown:
+        return
+
+    markdown_path, metadata_path = _parsed_markdown_cache_paths(document_id, file_hash, parser_mode)
+    metadata = {
+        "cache_version": _MARKDOWN_CACHE_VERSION,
+        "document_id": document_id,
+        "file_hash": file_hash,
+        "parser_mode": parser_mode,
+        "source_parser": source_parser,
+        "source_type": source_type,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    try:
+        markdown_path.write_text(cleaned_markdown + "\n", encoding="utf-8")
+        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        logger.exception("[markdown_cache] failed to save cache document_id=%s", document_id)
+        return
+    logger.info(
+        "[markdown_cache] saved document_id=%s parser=%s type=%s path=%s chars=%d",
+        document_id,
+        source_parser,
+        source_type,
+        markdown_path,
+        len(cleaned_markdown),
+    )
+
+
+def _get_or_parse_markdown(
+    *,
+    document_id: int,
+    file_path: Path,
+    file_hash: str,
+) -> tuple[str, str, str, bool]:
+    parser_mode = settings.pdf_parser_mode
+    cached = _load_cached_markdown(
+        document_id=document_id,
+        file_hash=file_hash,
+        parser_mode=parser_mode,
+    )
+    if cached is not None:
+        markdown, source_parser, source_type = cached
+        return markdown, source_parser, source_type, True
+
+    markdown, source_parser, source_type = parse_source_to_markdown(file_path)
+    _save_cached_markdown(
+        document_id=document_id,
+        file_hash=file_hash,
+        parser_mode=parser_mode,
+        markdown=markdown,
+        source_parser=source_parser,
+        source_type=source_type,
+    )
+    return markdown, source_parser, source_type, False
 
 
 def _extract_source_page(metadata: dict[str, Any]) -> int | None:
@@ -93,15 +215,51 @@ def _parse_source_metadata(raw_json: str | None) -> dict[str, Any] | None:
     return payload
 
 
+def _repair_completed_indexing_status(db: Session, document: Document) -> bool:
+    if document.status != "indexing":
+        return False
+
+    index_state = db.get(DocumentIndexState, document.id)
+    if index_state is None or index_state.indexed_parent_chunks <= 0:
+        return False
+
+    file_path = settings.uploads_dir / document.stored_filename
+    if not file_path.exists():
+        return False
+
+    try:
+        current_hash = _compute_file_hash(file_path)
+    except OSError:
+        return False
+
+    if index_state.file_hash != current_hash:
+        return False
+
+    document.status = "embedded"
+    db.add(document)
+    logger.warning(
+        "[index_status] repaired stale indexing status document_id=%s indexed_parent_chunks=%s indexed_child_chunks=%s",
+        document.id,
+        index_state.indexed_parent_chunks,
+        index_state.indexed_child_chunks,
+    )
+    return True
+
+
 def _queue_full_indexing_job(
     *,
+    db: Session,
     document: Document,
     document_id: int,
     background_tasks: BackgroundTasks,
     log_prefix: str,
 ) -> EmbedDocumentResponse:
+    repaired_status = _repair_completed_indexing_status(db, document)
     if document.status == "indexing":
         raise HTTPException(status_code=409, detail="Document is already indexing.")
+
+    if repaired_status:
+        db.commit()
 
     logger.info("[%s] Queueing background indexing for document_id=%s status=%s", log_prefix, document_id, document.status)
     background_tasks.add_task(_run_full_indexing_job, document_id)
@@ -241,8 +399,26 @@ def _build_document_chunks_for_indexing(
     file_path: Path,
     file_hash: str,
 ) -> tuple[list[DocumentChunk], list[tuple[str, str]], list[dict[str, Any]]]:
-    del db, original_filename, file_hash
-    payload = build_index_bundle(file_path)
+    del db, original_filename
+    markdown, source_parser, source_type, reused_cache = _get_or_parse_markdown(
+        document_id=document_id,
+        file_path=file_path,
+        file_hash=file_hash,
+    )
+    logger.info(
+        "[index] build bundle from markdown document_id=%s reused_cache=%s parser=%s type=%s chars=%d",
+        document_id,
+        reused_cache,
+        source_parser,
+        source_type,
+        len(markdown),
+    )
+    payload = build_index_bundle_from_markdown(
+        markdown=markdown,
+        source_file_path=file_path,
+        source_parser=source_parser,
+        source_type=source_type,
+    )
     parent_chunks = payload.get("parent_chunks")
     child_rows = payload.get("child_rows")
     if not isinstance(parent_chunks, list) or not isinstance(child_rows, list):
@@ -518,6 +694,7 @@ def process_document(
         raise HTTPException(status_code=404, detail="Document not found.")
 
     return _queue_full_indexing_job(
+        db=db,
         document=document,
         document_id=document_id,
         background_tasks=background_tasks,
@@ -539,6 +716,12 @@ def list_documents(
         .order_by(Document.created_at.desc())
         .all()
     )
+    repaired_any = False
+    for doc, _ in rows:
+        repaired_any = _repair_completed_indexing_status(db, doc) or repaired_any
+    if repaired_any:
+        db.commit()
+
     return [_to_document_read(doc, int(count)) for doc, count in rows]
 
 
@@ -596,6 +779,9 @@ def get_document(
         raise HTTPException(status_code=404, detail="Document not found.")
 
     document, chunk_count = row
+    if _repair_completed_indexing_status(db, document):
+        db.commit()
+
     return _to_document_read(document, int(chunk_count))
 
 
@@ -721,7 +907,12 @@ def parse_document(
         raise HTTPException(status_code=404, detail="Stored file does not exist.")
 
     try:
-        markdown, source_parser, source_type = parse_source_to_markdown(file_path)
+        file_hash = _compute_file_hash(file_path)
+        markdown, source_parser, source_type, reused_cache = _get_or_parse_markdown(
+            document_id=document_id,
+            file_path=file_path,
+            file_hash=file_hash,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -748,7 +939,7 @@ def parse_document(
         parsed_markdown_path=f"ingestion://v1/parse/{document_id}",
         parser=source_parser,
         source_type=source_type,
-        reused=False,
+        reused=reused_cache,
     )
 
 
@@ -802,6 +993,7 @@ def embed_document(
     db.commit()
 
     return _queue_full_indexing_job(
+        db=db,
         document=document,
         document_id=document_id,
         background_tasks=background_tasks,
