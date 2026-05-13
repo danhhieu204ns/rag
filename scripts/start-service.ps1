@@ -25,6 +25,10 @@ switch ($Service) {
     ollama serve
   }
   "qdrant" {
+    if (-not (Get-Command qdrant -ErrorAction SilentlyContinue)) {
+      Write-Error "qdrant command not found. Default local mode does not require this command: keep QDRANT_URL empty to use embedded Qdrant."
+      exit 1
+    }
     $QdrantPath = Join-Path $Root ".qdrant"
     New-Item -ItemType Directory -Force $QdrantPath | Out-Null
     $env:QDRANT__SERVICE__HTTP_PORT = "6333"

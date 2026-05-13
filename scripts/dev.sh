@@ -95,13 +95,6 @@ if ! curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
   wait_url "ollama" "http://127.0.0.1:11434/api/tags" 120
 fi
 
-if ! curl -fsS http://127.0.0.1:6333/readyz >/dev/null 2>&1; then
-  command -v qdrant >/dev/null 2>&1 || { echo "qdrant command not found" >&2; exit 1; }
-  mkdir -p "$ROOT_DIR/.qdrant"
-  run_bg "qdrant" "$ROOT_DIR" env QDRANT__SERVICE__HTTP_PORT=6333 QDRANT__STORAGE__STORAGE_PATH="$ROOT_DIR/.qdrant" qdrant
-  wait_url "qdrant" "http://127.0.0.1:6333/readyz" 120
-fi
-
 run_python_service "ollama_service" "$ROOT_DIR/ollama_service" 8200
 wait_url "ollama_service" "http://127.0.0.1:8200/ready"
 

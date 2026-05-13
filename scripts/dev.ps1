@@ -27,12 +27,6 @@ if (-not (Test-Url "http://127.0.0.1:11434/api/tags")) {
   Start-TerminalCommand "ollama" "ollama serve"
 }
 
-if (-not (Test-Url "http://127.0.0.1:6333/readyz")) {
-  $QdrantPath = Join-Path $Root ".qdrant"
-  New-Item -ItemType Directory -Force $QdrantPath | Out-Null
-  Start-TerminalCommand "qdrant" "cd '$Root'; `$env:QDRANT__SERVICE__HTTP_PORT='6333'; `$env:QDRANT__STORAGE__STORAGE_PATH='$QdrantPath'; qdrant"
-}
-
 foreach ($Svc in $PythonServices) {
   $Dir = Join-Path $Root $Svc.Dir
   $Cmd = "cd '$Dir'; if (!(Test-Path .venv)) { python -m venv .venv }; . .\.venv\Scripts\Activate.ps1; python -m pip install -q -U pip wheel setuptools; python -m pip install -q -r requirements.txt; python -m uvicorn app.main:app --host 0.0.0.0 --port $($Svc.Port)"

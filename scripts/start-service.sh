@@ -45,6 +45,11 @@ case "$SERVICE" in
     ollama serve
     ;;
   qdrant)
+    command -v qdrant >/dev/null 2>&1 || {
+      echo "qdrant command not found." >&2
+      echo "Default local mode does not require this command: keep QDRANT_URL empty to use embedded Qdrant." >&2
+      exit 1
+    }
     mkdir -p "$ROOT_DIR/.qdrant"
     QDRANT__SERVICE__HTTP_PORT=6333 QDRANT__STORAGE__STORAGE_PATH="$ROOT_DIR/.qdrant" qdrant
     ;;
@@ -67,6 +72,7 @@ case "$SERVICE" in
     ;;
   *)
     echo "Usage: $0 {ollama|qdrant|ollama-service|ingestion-service|retrieval-service|backend|frontend}" >&2
+    echo "Note: qdrant is optional; keep QDRANT_URL empty to use embedded Qdrant." >&2
     exit 1
     ;;
 esac
