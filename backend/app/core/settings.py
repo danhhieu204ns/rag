@@ -10,6 +10,8 @@ class Settings:
     """Application settings resolved from environment variables."""
 
     app_name: str
+    cors_allow_origins: list[str]
+    cors_allow_origin_regex: str
     storage_dir: Path
     uploads_dir: Path
     qdrant_path: Path
@@ -99,6 +101,18 @@ def _string_env(name: str, default: str) -> str:
     return cleaned or default
 
 
+def _list_env(name: str, default: list[str]) -> list[str]:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    values = [
+        item.strip().strip('"').strip("'")
+        for item in raw_value.split(",")
+    ]
+    return [item for item in values if item] or default
+
+
 def _pdf_parser_mode_env(default: str = "legacy") -> str:
     raw_value = _string_env("PDF_PARSER_MODE", default).lower()
     allowed = {"legacy", "marker"}
@@ -125,6 +139,14 @@ def get_settings() -> Settings:
 
     return Settings(
         app_name=_string_env("APP_NAME", "RAG App Backend"),
+        cors_allow_origins=_list_env(
+            "CORS_ALLOW_ORIGINS",
+            [
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+            ],
+        ),
+        cors_allow_origin_regex=_string_env("CORS_ALLOW_ORIGIN_REGEX", ""),
         storage_dir=storage_dir,
         uploads_dir=uploads_dir,
         qdrant_path=qdrant_path,
