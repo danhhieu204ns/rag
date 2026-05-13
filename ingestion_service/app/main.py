@@ -250,8 +250,8 @@ def _indexing_batch(chunk_texts: list[str]) -> list[dict[str, Any]]:
     endpoint = f"{ollama_base}/v1/indexing/batch"
 
     results: list[dict[str, Any]] = []
-    batch_size = 100
-    with httpx.Client(timeout=settings.retrieval_timeout_seconds, headers=_indexing_headers()) as client:
+    batch_size = settings.indexing_batch_size
+    with httpx.Client(timeout=settings.indexing_timeout_seconds, headers=_indexing_headers()) as client:
         for start in range(0, len(chunk_texts), batch_size):
             batch = chunk_texts[start : start + batch_size]
             payload = {
@@ -260,7 +260,18 @@ def _indexing_batch(chunk_texts: list[str]) -> list[dict[str, Any]]:
                 "options": {"num_predict": 768},
             }
             batch_started = time.perf_counter()
-            response = client.post(endpoint, json=payload)
+            try:
+                response = client.post(endpoint, json=payload)
+            except httpx.TimeoutException as exc:
+                raise RuntimeError(
+                    f"Indexing batch request timed out for chunks {start}-{start + len(batch) - 1} "
+                    f"after {settings.indexing_timeout_seconds:.0f}s. "
+                    f"Increase INDEXING_TIMEOUT_SECONDS or lower INDEXING_BATCH_SIZE."
+                ) from exc
+            except httpx.RequestError as exc:
+                raise RuntimeError(
+                    f"Indexing batch request failed for chunks {start}-{start + len(batch) - 1}: {exc}"
+                ) from exc
             if response.status_code >= 400:
                 raise RuntimeError(
                     f"Indexing batch request failed for chunks {start}-{start + len(batch) - 1}: "

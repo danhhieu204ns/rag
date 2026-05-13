@@ -8,5 +8,5 @@ langchain-core
 langchain-community
 langchain-text-splitters
 pypdf
-marker
+marker-pdf
 pillow<11.0.0
