@@ -29,15 +29,12 @@ UPSTREAM_OLLAMA_BASE_URL=http://127.0.0.1:11434
 SHIELD_API_KEY=change-this-key
 
 CHAT_MODEL=qwen3:30b-a3b-instruct-2507-q4_K_M
-INDEXING_MODEL=qwen3:4b-instruct-2507-q4_K_M
 EMBEDDING_MODEL=qwen3-embedding:0.6b
 
 MAX_CHAT_CHARS=24000
-MAX_INDEXING_CHARS=12000
+MAX_EMBEDDING_CHARS=12000
 MAX_MESSAGES=20
 MAX_CHAT_NUM_PREDICT=2048
-MAX_INDEXING_NUM_PREDICT=768
-INDEXING_CONCURRENCY=8
 RATE_LIMIT_PER_MINUTE=30
 ```
 
@@ -66,7 +63,7 @@ Protected bằng `x-api-key`:
 - `GET /api/tags`
 - `POST /v1/chat`
 - `POST /v1/generate`
-- `POST /v1/indexing/batch`
+- `POST /v1/indexing/batch` returns `410 Gone`; LLM metadata indexing is disabled.
 - `POST /v1/embed`
 - `POST /api/chat`
 - `POST /api/generate`
@@ -79,6 +76,6 @@ Backend hiện dùng:
 
 - Chat/RAG: `POST /api/chat` qua `ChatOllama`.
 - Embedding: `POST /api/embed` qua `OllamaEmbeddings`.
-- Metadata indexing: ingestion service gọi `POST /v1/indexing/batch`; shield tự build prompt/schema và fan-out sang Ollama.
+- Indexing only uses embeddings. Ingestion no longer calls LLM metadata indexing.
 
 Service này giữ cả `/api/embed` và `/api/embeddings` để tương thích với các phiên bản Ollama client mới/cũ.
