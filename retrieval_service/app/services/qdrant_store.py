@@ -12,6 +12,7 @@ from qdrant_client.http.models import Distance, PointStruct, VectorParams
 from ..core.settings import settings
 from ..schemas import ChunkIndexItem, ContextItem, RetrievalFilters
 from .chunk_store import StoredChunk, load_chunks_by_ids, search_keyword_candidates
+from .parent_retrieval import ChildHit, ParentRecord, expand_child_hits_to_parent_contexts
 
 _client: QdrantClient | None = None
 
@@ -168,17 +169,32 @@ def upsert_chunks(chunks: list[ChunkIndexItem], vectors: list[list[float]], name
             if not isinstance(source_metadata, dict):
                 source_metadata = {}
 
+            parent_id = (
+                chunk.metadata.get("parent_chunk_id")
+                or chunk.metadata.get("parent_id")
+                or source_metadata.get("parent_chunk_id")
+                or source_metadata.get("parent_id")
+            )
+            child_text = str(chunk.metadata.get("child_text") or chunk.content)
+            embedding_text = str(chunk.metadata.get("embedding_text") or chunk.content)
+            page_start = chunk.metadata.get("page_start") or chunk.metadata.get("source_page") or chunk.page
+            page_end = chunk.metadata.get("page_end")
             payload = {
                 **chunk.metadata,
                 "chunk_id": chunk.chunk_id,
-                "parent_chunk_id": chunk.chunk_id,
+                "child_chunk_id": chunk.chunk_id,
+                "parent_id": parent_id,
+                "parent_chunk_id": parent_id,
                 "document_id": chunk.document_id,
-                "child_text": chunk.content,
+                "child_text": child_text,
+                "embedding_text": embedding_text,
                 "source": chunk.source,
-                "source_page": chunk.page,
+                "source_page": page_start,
+                "page_start": page_start,
+                "page_end": page_end,
                 "source_metadata": source_metadata,
             }
-            child_type = payload.get("child_type") or "summary"
+            child_type = payload.get("child_type") or "section_child"
             child_index = _to_int(payload.get("child_index")) or 0
             points.append(
                 PointStruct(
@@ -206,13 +222,14 @@ def search_contexts(
 
     client = get_qdrant_client()
     query_filter = _payload_filter(filters)
+    child_limit = max(top_k, settings.top_k_children) if settings.search_child_chunks else top_k
 
     if hasattr(client, "query_points"):
         response = client.query_points(
             collection_name=name,
             query=vector,
             query_filter=query_filter,
-            limit=top_k,
+            limit=child_limit,
             with_payload=True,
         )
         points = list(getattr(response, "points", []) or [])
@@ -222,62 +239,87 @@ def search_contexts(
                 collection_name=name,
                 query_vector=vector,
                 query_filter=query_filter,
-                limit=top_k,
+                limit=child_limit,
                 with_payload=True,
             )
         )
 
-    parent_ids: list[int] = []
+    child_hits: list[ChildHit] = []
     for point in points:
         payload = point.payload if isinstance(point.payload, dict) else {}
-        parent_id = _to_int(payload.get("parent_chunk_id")) or _to_int(payload.get("chunk_id"))
-        if parent_id is not None and parent_id not in parent_ids:
-            parent_ids.append(parent_id)
+        parent_id = _to_int(payload.get("parent_chunk_id")) or _to_int(payload.get("parent_id"))
+        child_chunk_id = str(payload.get("child_chunk_id") or payload.get("chunk_id") or "")
+        metadata = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"child_text", "embedding_text"}
+        }
+        child_hits.append(
+            ChildHit(
+                child_chunk_id=child_chunk_id,
+                parent_id=parent_id,
+                document_id=_to_int(payload.get("document_id")),
+                child_text=str(payload.get("child_text") or ""),
+                score=_to_float(getattr(point, "score", None)),
+                metadata=metadata,
+            )
+        )
 
+    if not settings.expand_to_parent:
+        return [
+            ContextItem(
+                chunk_id=hit.parent_id,
+                document_id=hit.document_id,
+                content=hit.child_text,
+                source=str(hit.metadata.get("source") or "") or None,
+                page=_to_int(hit.metadata.get("page_start") or hit.metadata.get("source_page")),
+                score=hit.score,
+                metadata=hit.metadata,
+            )
+            for hit in child_hits[:top_k]
+        ]
+
+    parent_ids = [hit.parent_id for hit in child_hits if hit.parent_id is not None]
     stored_chunks = load_chunks_by_ids(parent_ids)
+    parent_records = {
+        parent_id: ParentRecord(
+            parent_id=stored.chunk_id,
+            document_id=stored.document_id,
+            text=stored.content,
+            page=stored.source_page,
+            metadata=stored.source_metadata,
+        )
+        for parent_id, stored in stored_chunks.items()
+    }
+
+    parent_contexts = expand_child_hits_to_parent_contexts(
+        child_hits,
+        parent_records,
+        final_top_k=top_k,
+        deduplicate=settings.deduplicate_parents,
+    )
 
     contexts: list[ContextItem] = []
-    seen_parent_ids: set[int] = set()
-    for point in points:
-        payload = point.payload if isinstance(point.payload, dict) else {}
-        parent_id = _to_int(payload.get("parent_chunk_id")) or _to_int(payload.get("chunk_id"))
-        if parent_id is not None and parent_id in seen_parent_ids:
-            continue
-        if parent_id is not None:
-            seen_parent_ids.add(parent_id)
-
-        stored = stored_chunks.get(parent_id or -1)
-        source_metadata = payload.get("source_metadata")
+    for item in parent_contexts:
+        source_metadata = item.metadata.get("source_metadata")
         if not isinstance(source_metadata, dict):
             source_metadata = {}
-
-        content = str(payload.get("child_text") or "")
-        document_id = _to_int(payload.get("document_id"))
-        source_page = _to_int(payload.get("source_page"))
-        if stored is not None:
-            content = stored.content
-            document_id = stored.document_id
-            source_page = stored.source_page
-            if stored.source_metadata:
+        if not source_metadata and item.parent_id is not None:
+            stored = stored_chunks.get(item.parent_id)
+            if stored is not None:
                 source_metadata = stored.source_metadata
 
         contexts.append(
             ContextItem(
-                chunk_id=parent_id,
-                document_id=document_id,
-                content=content,
-                source=str(payload.get("source") or source_metadata.get("source") or "") or None,
-                page=source_page,
-                score=_to_float(getattr(point, "score", None)),
-                metadata={
-                    key: value
-                    for key, value in payload.items()
-                    if key != "child_text"
-                },
+                chunk_id=item.parent_id,
+                document_id=item.document_id,
+                content=item.text,
+                source=str(item.metadata.get("source") or source_metadata.get("source") or "") or None,
+                page=item.page or _to_int(item.metadata.get("page_start") or item.metadata.get("source_page")),
+                score=item.score,
+                metadata=item.metadata,
             )
         )
-        if len(contexts) >= top_k:
-            break
 
     return contexts
 

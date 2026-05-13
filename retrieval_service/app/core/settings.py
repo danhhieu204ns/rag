@@ -18,6 +18,11 @@ class Settings:
     ollama_api_key: str
     vector_batch_size: int
     default_top_k: int
+    search_child_chunks: bool
+    expand_to_parent: bool
+    deduplicate_parents: bool
+    top_k_children: int
+    final_top_k_parents: int
     request_timeout_seconds: float
 
 
@@ -47,6 +52,18 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _path_env(name: str, default: Path, *, base_dir: Path) -> Path:
@@ -91,6 +108,11 @@ def get_settings() -> Settings:
         ollama_api_key=_string_env("OLLAMA_API_KEY", ""),
         vector_batch_size=max(1, _int_env("VECTOR_BATCH_SIZE", 64)),
         default_top_k=max(1, _int_env("RETRIEVAL_TOP_K", 5)),
+        search_child_chunks=_bool_env("RETRIEVAL_SEARCH_CHILD_CHUNKS", True),
+        expand_to_parent=_bool_env("RETRIEVAL_EXPAND_TO_PARENT", True),
+        deduplicate_parents=_bool_env("RETRIEVAL_DEDUPLICATE_PARENTS", True),
+        top_k_children=max(1, _int_env("RETRIEVAL_TOP_K_CHILDREN", 20)),
+        final_top_k_parents=max(1, _int_env("RETRIEVAL_FINAL_TOP_K_PARENTS", 5)),
         request_timeout_seconds=_float_env("RETRIEVAL_TIMEOUT_SECONDS", 180.0),
     )
 
