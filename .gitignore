@@ -1,8 +1,8 @@
-.venv
+node_modules
+dist
 .env
-.env.*
-!.env.example
-__pycache__/
+.ipynb_checkpoints
+*.log
+*pyc
+runctl
 storage
-Documents
-.qdrant
