@@ -84,11 +84,20 @@ def _compact_source_metadata(raw_json: str | None) -> dict[str, object]:
 
     wanted_keys = {
         "chunk_id",
+        "child_chunk_id",
+        "parent_id",
+        "parent_chunk_id",
+        "section_id",
+        "section_title",
+        "title",
+        "heading_path",
+        "page_start",
+        "page_end",
+        "index_type",
         "source_info",
         "context",
         "search_optimization",
         "admin_tags",
-        "hyq",
     }
     compact = {
         key: value
@@ -110,29 +119,27 @@ def _segment_vietnamese(text: str) -> str:
 
 
 def _build_full_text_search(source_metadata: dict[str, object], content: str) -> str:
-    """Build augmented search text: headers + content + HYQ questions/summary + keywords."""
+    """Build augmented search text from section headings, metadata, and content."""
     parts: list[str] = []
+
+    heading_path = source_metadata.get("heading_path")
+    if isinstance(heading_path, list):
+        parts.extend(str(item).strip() for item in heading_path if str(item).strip())
+
+    section_title = source_metadata.get("section_title") or source_metadata.get("title")
+    if isinstance(section_title, str) and section_title.strip():
+        parts.append(section_title.strip())
 
     context = source_metadata.get("context") or {}
     if isinstance(context, dict):
-        for key in ("h2", "h3"):
-            val = context.get(key)
-            if val and isinstance(val, str):
-                parts.append(val.strip())
+        for value in context.values():
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+            elif isinstance(value, list):
+                parts.extend(str(item).strip() for item in value if str(item).strip())
 
     if content:
         parts.append(content.strip())
-
-    hyq = source_metadata.get("hyq") or {}
-    if isinstance(hyq, dict):
-        summary = hyq.get("summary")
-        if summary and isinstance(summary, str):
-            parts.append(summary.strip())
-        questions = hyq.get("questions") or []
-        if isinstance(questions, list):
-            for q in questions:
-                if q and isinstance(q, str):
-                    parts.append(q.strip())
 
     search_opt = source_metadata.get("search_optimization") or {}
     if isinstance(search_opt, dict):

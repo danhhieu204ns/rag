@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from uuid import NAMESPACE_URL, uuid5
 
@@ -11,7 +12,6 @@ from qdrant_client.http.models import Distance, PointStruct, VectorParams
 
 from ...core.settings import settings
 from ...models import DocumentChunk
-from ..chunk_metadata import build_hyq_children
 from .logging import _emit_reindex_progress
 from .models import get_embeddings
 from .utils import _to_int, _compact_source_metadata
@@ -85,7 +85,8 @@ def delete_vectors_by_document_id(document_id: int) -> None:
 
 def _serialize_qdrant_payload(metadata: dict[str, object], child_text: str) -> dict[str, object]:
     payload = dict(metadata)
-    payload["child_text"] = child_text
+    payload["embedding_text"] = child_text
+    payload["child_text"] = str(metadata.get("child_text") or child_text)
     return json.loads(json.dumps(payload, ensure_ascii=False))
 
 
@@ -93,7 +94,7 @@ def _stable_child_point_id(metadata: dict[str, object]) -> str:
     """Build deterministic UUID so upsert overwrites previous child vectors."""
 
     parent_chunk_id = _to_int(metadata.get("parent_chunk_id")) or 0
-    child_type = str(metadata.get("child_type") or "summary")
+    child_type = str(metadata.get("child_type") or "section_child")
     child_index = _to_int(metadata.get("child_index")) or 0
 
     raw = (
@@ -258,6 +259,42 @@ def load_index_if_available() -> bool:
     return _qdrant_collection_exists(client)
 
 
+def _count_tokens(text: str) -> int:
+    return len(re.findall(r"\S+", str(text or "")))
+
+
+def _split_parent_text_for_direct_index(text: str) -> list[str]:
+    tokens = re.findall(r"\S+", str(text or ""))
+    if not tokens:
+        return []
+    chunk_size = max(1, settings.chunk_size)
+    overlap = max(0, min(settings.chunk_overlap, chunk_size - 1))
+    if len(tokens) <= chunk_size:
+        return [" ".join(tokens)]
+
+    stride = max(1, chunk_size - overlap)
+    chunks: list[str] = []
+    for start in range(0, len(tokens), stride):
+        window = tokens[start : start + chunk_size]
+        if not window:
+            break
+        chunks.append(" ".join(window))
+        if start + chunk_size >= len(tokens):
+            break
+    return chunks
+
+
+def _heading_prefix(source_metadata: dict[str, object]) -> str:
+    heading_path = source_metadata.get("heading_path")
+    if not isinstance(heading_path, list):
+        context = source_metadata.get("context")
+        if isinstance(context, dict):
+            heading_path = context.get("heading_path")
+    if not isinstance(heading_path, list):
+        return ""
+    return " > ".join(str(item).strip() for item in heading_path if str(item).strip())
+
+
 def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
     """Incrementally upsert Qdrant vectors from the provided parent chunks."""
 
@@ -286,18 +323,30 @@ def rebuild_index_from_chunks(chunks: list[DocumentChunk]) -> int:
         if source_metadata:
             metadata["source_metadata"] = source_metadata
 
+        heading_prefix = _heading_prefix(source_metadata)
         full_text_search = _build_full_text_search(source_metadata, chunk.content)
 
-        child_chunks = build_hyq_children(source_metadata)
-        for child_index, (child_type, child_text) in enumerate(child_chunks):
+        child_chunks = _split_parent_text_for_direct_index(chunk.content)
+        for child_index, child_text in enumerate(child_chunks):
+            embedding_text = f"{heading_prefix}\n\n{child_text}" if heading_prefix else child_text
             child_metadata = dict(metadata)
-            child_metadata["child_type"] = child_type
+            child_metadata["child_type"] = "section_child"
             child_metadata["child_index"] = child_index
+            child_metadata["chunk_id"] = f"{chunk.id}:section_child:{child_index}"
+            child_metadata["child_chunk_id"] = f"{chunk.id}:section_child:{child_index}"
+            child_metadata["parent_id"] = chunk.id
+            child_metadata["index_type"] = "section_parent_child"
+            child_metadata["heading_path"] = source_metadata.get("heading_path")
+            child_metadata["section_title"] = source_metadata.get("section_title") or source_metadata.get("title")
+            child_metadata["page_start"] = source_metadata.get("page_start") or chunk.source_page
+            child_metadata["page_end"] = source_metadata.get("page_end")
+            child_metadata["child_text"] = child_text
+            child_metadata["token_count"] = _count_tokens(child_text)
             child_metadata["full_text_search"] = full_text_search
 
             documents.append(
                 Document(
-                    page_content=child_text,
+                    page_content=embedding_text,
                     metadata=child_metadata,
                 )
             )

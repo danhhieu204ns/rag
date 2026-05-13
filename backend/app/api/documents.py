@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from ..core.settings import settings
 from ..core.request_logger import request_logging_context
 from ..db import SessionLocal, get_db
-from ..models import ChunkMetadataCache, Document, DocumentChunk, DocumentIndexState
+from ..models import Document, DocumentChunk, DocumentIndexState
 from ..schemas import (
     DocumentChunkListResponse,
     DocumentChunkRead,
@@ -282,89 +282,6 @@ def _compute_file_hash(file_path: Path) -> str:
     return digest.hexdigest()
 
 
-def _compute_chunk_fingerprint(
-    *,
-    chunk_text: str,
-    raw_metadata: dict[str, Any],
-    source_page: int | None,
-    source_kind: str,
-) -> str:
-    payload = {
-        "chunk_text": chunk_text,
-        "source_page": source_page,
-        "source_kind": source_kind,
-        "raw_metadata": _json_safe_value(raw_metadata),
-    }
-    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
-
-def _load_metadata_cache(
-    *,
-    db: Session,
-    document_id: int,
-    file_hash: str,
-    chunk_fingerprints: list[str],
-) -> dict[str, dict[str, Any]]:
-    if not chunk_fingerprints:
-        return {}
-
-    rows = (
-        db.query(ChunkMetadataCache)
-        .filter(ChunkMetadataCache.document_id == document_id)
-        .filter(ChunkMetadataCache.file_hash == file_hash)
-        .filter(ChunkMetadataCache.chunk_fingerprint.in_(chunk_fingerprints))
-        .all()
-    )
-
-    cache_map: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        parsed = _parse_source_metadata(row.metadata_json)
-        if parsed is None:
-            continue
-        cache_map[row.chunk_fingerprint] = parsed
-    return cache_map
-
-
-def _save_metadata_cache(
-    *,
-    db: Session,
-    document_id: int,
-    file_hash: str,
-    cached_payloads: list[tuple[str, str]],
-) -> None:
-    write_attempts = 3
-    for attempt in range(write_attempts):
-        try:
-            db.query(ChunkMetadataCache).filter(
-                ChunkMetadataCache.document_id == document_id,
-                ChunkMetadataCache.file_hash == file_hash,
-            ).delete(synchronize_session=False)
-
-            if cached_payloads:
-                rows = [
-                    ChunkMetadataCache(
-                        document_id=document_id,
-                        file_hash=file_hash,
-                        chunk_fingerprint=fingerprint,
-                        metadata_json=metadata_json,
-                    )
-                    for fingerprint, metadata_json in cached_payloads
-                ]
-                db.add_all(rows)
-
-            db.commit()
-            return
-        except OperationalError as exc:
-            db.rollback()
-            if "database is locked" not in str(exc).lower() or attempt == write_attempts - 1:
-                raise RuntimeError(
-                    "Database is busy while saving metadata cache. Please retry after a few seconds."
-                ) from exc
-            time.sleep(0.4 * (attempt + 1))
-
-
-
 def _to_document_read(document: Document, chunk_count: int) -> DocumentRead:
     return DocumentRead(
         id=document.id,
@@ -398,7 +315,7 @@ def _build_document_chunks_for_indexing(
     original_filename: str,
     file_path: Path,
     file_hash: str,
-) -> tuple[list[DocumentChunk], list[tuple[str, str]], list[dict[str, Any]]]:
+) -> tuple[list[DocumentChunk], list[dict[str, Any]]]:
     del db, original_filename
     markdown, source_parser, source_type, reused_cache = _get_or_parse_markdown(
         document_id=document_id,
@@ -434,9 +351,21 @@ def _build_document_chunks_for_indexing(
         content = str(item.get("content") or "").strip()
         if not content:
             continue
-        source_page = _to_int(item.get("source_page"))
+        source_page = _to_int(item.get("page_start")) or _to_int(item.get("source_page"))
         source_kind = str(item.get("source_kind") or "text_chunk")
         source_metadata = item.get("source_metadata") if isinstance(item.get("source_metadata"), dict) else {}
+        source_metadata = dict(source_metadata)
+        source_metadata["document_id"] = document_id
+        if item.get("parent_id") is not None:
+            source_metadata["logical_parent_id"] = str(item.get("parent_id"))
+        if item.get("section_id") is not None:
+            source_metadata["section_id"] = str(item.get("section_id"))
+        if item.get("heading_path") is not None:
+            source_metadata["heading_path"] = item.get("heading_path")
+        if item.get("page_start") is not None:
+            source_metadata["page_start"] = _to_int(item.get("page_start"))
+        if item.get("page_end") is not None:
+            source_metadata["page_end"] = _to_int(item.get("page_end"))
         serialized = _serialize_source_metadata(source_metadata)
         new_chunks.append(
             DocumentChunk(
@@ -450,8 +379,7 @@ def _build_document_chunks_for_indexing(
         )
 
     precomputed_child_rows = [row for row in child_rows if isinstance(row, dict)]
-    cached_payloads: list[tuple[str, str]] = []
-    return new_chunks, cached_payloads, precomputed_child_rows
+    return new_chunks, precomputed_child_rows
 
 
 def _write_document_chunks(
@@ -580,7 +508,7 @@ def _do_full_indexing_job(
             file_path=file_path,
             file_hash=file_hash,
         )
-        chunk_rows, metadata_cache_payloads, precomputed_child_rows = new_chunks_data
+        chunk_rows, precomputed_child_rows = new_chunks_data
         log.step_done(
             "build_document_chunks",
             parent_chunks=len(chunk_rows),
@@ -594,15 +522,6 @@ def _do_full_indexing_job(
             new_chunks=chunk_rows,
         )
         log.step_done("write_db_chunks")
-
-        log.step_start("save_metadata_cache", count=len(metadata_cache_payloads))
-        _save_metadata_cache(
-            db=db,
-            document_id=document_id,
-            file_hash=file_hash,
-            cached_payloads=metadata_cache_payloads,
-        )
-        log.step_done("save_metadata_cache")
 
         log.step_start("prepare_indexing_payload")
         document_chunks = (
@@ -630,10 +549,20 @@ def _do_full_indexing_job(
                     {
                         "document_id": parent_chunk.document_id,
                         "parent_chunk_id": parent_chunk.id,
-                        "source_page": parent_chunk.source_page,
-                        "child_type": str(row.get("child_type") or "summary"),
+                        "chunk_id": str(row.get("chunk_id") or f"{parent_chunk.id}:section_child:{row.get('child_index') or 0}"),
+                        "parent_id": str(row.get("parent_id") or ""),
+                        "section_id": str(row.get("section_id") or ""),
+                        "source_page": _to_int(row.get("page_start")) or parent_chunk.source_page,
+                        "page_start": _to_int(row.get("page_start")) or parent_chunk.source_page,
+                        "page_end": _to_int(row.get("page_end")),
+                        "child_type": str(row.get("child_type") or "section_child"),
                         "child_index": _to_int(row.get("child_index")) or 0,
                         "child_text": str(row.get("child_text") or ""),
+                        "embedding_text": str(row.get("embedding_text") or row.get("child_text") or ""),
+                        "token_count": _to_int(row.get("token_count")),
+                        "section_title": str(row.get("section_title") or row.get("title") or ""),
+                        "heading_path": row.get("heading_path") if isinstance(row.get("heading_path"), list) else [],
+                        "index_type": str(row.get("index_type") or "section_parent_child"),
                         "source_metadata": (
                             row.get("source_metadata")
                             if isinstance(row.get("source_metadata"), dict)
@@ -643,9 +572,15 @@ def _do_full_indexing_job(
                 )
             log.step_done("prepare_indexing_payload", count=len(upsert_rows))
 
-            log.step_start("upsert_via_indexing_service", count=len(upsert_rows))
-            indexed_count = upsert_index_bundle(document_id=document_id, child_rows=upsert_rows)
-            log.step_done("upsert_via_indexing_service", indexed_count=indexed_count)
+            if upsert_rows:
+                log.step_start("upsert_via_indexing_service", count=len(upsert_rows))
+                indexed_count = upsert_index_bundle(document_id=document_id, child_rows=upsert_rows)
+                log.step_done("upsert_via_indexing_service", indexed_count=indexed_count)
+            else:
+                log.step_start("delete_vectors_empty_child_rows")
+                delete_vectors_by_document_id(document_id)
+                indexed_count = 0
+                log.step_done("delete_vectors_empty_child_rows")
         else:
             log.step_start("delete_vectors")
             delete_vectors_by_document_id(document_id)

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import logging
+import time
+import contextlib
+from datetime import datetime
+import os
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +33,47 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title=settings.app_name)
 
+
+def _ms(start: float) -> float:
+    return (time.perf_counter() - start) * 1000.0
+
+
+@contextlib.contextmanager
+def _timed_step(name: str, logger: logging.Logger, **context):
+    params = " ".join(f"{k}={v}" for k, v in context.items())
+    logger.info("[backend][timing] step=%s status=start %s", name, params)
+    start = time.perf_counter()
+    try:
+        yield
+    except Exception:
+        elapsed = _ms(start)
+        logger.exception("[backend][timing] step=%s status=error elapsed_ms=%.2f %s", name, elapsed, params)
+        raise
+    else:
+        elapsed = _ms(start)
+        logger.info("[backend][timing] step=%s status=ok elapsed_ms=%.2f %s", name, elapsed, params)
+
+
+def _configure_backend_file_logging() -> logging.Logger:
+    root = logging.getLogger("app.main")
+    root.setLevel(logging.INFO)
+    log_dir = Path(__file__).resolve().parents[1] / "storage" / "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = log_dir / ("backend_service_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S") + ".log")
+    from logging.handlers import RotatingFileHandler
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)-12s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fh = RotatingFileHandler(str(log_path), maxBytes=10_000_000, backupCount=5, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+    if not any(isinstance(h, RotatingFileHandler) and h.baseFilename == str(log_path) for h in root.handlers):
+        root.addHandler(fh)
+    return root
+
+
+# configure backend logger
+logger = _configure_backend_file_logging()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allow_origins,
@@ -43,7 +88,11 @@ app.add_middleware(
 def on_startup() -> None:
     """Initialize database tables and seed default admin at app startup."""
 
-    init_db()
+    start = time.perf_counter()
+    logger.info("[backend][startup] initializing database")
+    with _timed_step("startup.init_db", logger):
+        init_db()
+    logger.info("[backend][startup] initialization complete elapsed_ms=%.2f", _ms(start))
 
 
 @app.get("/health")
@@ -51,6 +100,10 @@ def on_startup() -> None:
 def health() -> dict[str, str]:
     """Basic health endpoint for backend service."""
 
+    start = time.perf_counter()
+    logger.info("[backend][health] request received")
+    elapsed = _ms(start)
+    logger.info("[backend][health] response sent elapsed_ms=%.2f", elapsed)
     return {
         "status": "ok",
         "service": "api-gateway",
@@ -63,6 +116,8 @@ def health() -> dict[str, str]:
 def ready(response: Response) -> dict[str, Any]:
     """Readiness endpoint covering local DB and configured internal services."""
 
+    start = time.perf_counter()
+    logger.info("[backend][ready] request received")
     checks: dict[str, Any] = {
         "database": _database_ready(),
         "ollama_service": _http_service_ready(settings.ollama_base_url, settings.ollama_api_key),
@@ -79,6 +134,8 @@ def ready(response: Response) -> dict[str, Any]:
     status = "ok" if all(item["ready"] for item in checks.values()) else "degraded"
     if status != "ok":
         response.status_code = 503
+    elapsed = _ms(start)
+    logger.info("[backend][ready] response sent elapsed_ms=%.2f status=%s", elapsed, status)
     return {
         "status": status,
         "service": "api-gateway",

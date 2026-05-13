@@ -76,8 +76,13 @@ class ChunkSourceInfo(BaseModel):
 
 
 class ChunkContextMetadata(BaseModel):
+    heading_path: list[str] = Field(default_factory=list)
+    h1: str | None = None
     h2: str | None = None
     h3: str | None = None
+    h4: str | None = None
+    h5: str | None = None
+    h6: str | None = None
 
 
 class ChunkSearchOptimization(BaseModel):
@@ -93,18 +98,21 @@ class ChunkAdminTags(BaseModel):
     department: str | None = None
 
 
-class ChunkHyQMetadata(BaseModel):
-    summary: str | None = None
-    questions: list[str] = Field(default_factory=list)
-
-
 class ChunkMetadataRead(BaseModel):
     chunk_id: str | None = None
+    child_chunk_id: str | None = None
+    parent_id: int | str | None = None
+    parent_chunk_id: int | None = None
+    section_id: str | None = None
+    section_title: str | None = None
+    heading_path: list[str] = Field(default_factory=list)
+    page_start: int | None = None
+    page_end: int | None = None
+    index_type: str | None = None
     source_info: ChunkSourceInfo = Field(default_factory=ChunkSourceInfo)
     context: ChunkContextMetadata = Field(default_factory=ChunkContextMetadata)
     search_optimization: ChunkSearchOptimization = Field(default_factory=ChunkSearchOptimization)
     admin_tags: ChunkAdminTags = Field(default_factory=ChunkAdminTags)
-    hyq: ChunkHyQMetadata = Field(default_factory=ChunkHyQMetadata)
 
 
 class DocumentChunkRead(BaseModel):

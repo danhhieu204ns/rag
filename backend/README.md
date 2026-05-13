@@ -5,12 +5,12 @@
 - Document CRUD and upload API
 - Async incremental indexing pipeline per document (BackgroundTasks)
 - Dual PDF parser mode via env (`legacy` or `marker`)
-- Structured chunk metadata schema for hybrid search:
+- Section chunk metadata schema for hybrid search:
 	- `source_info` (file, page, doc_type)
-	- `context` (h2/h3)
-	- `search_optimization` (entities, organizations, dates, document_codes)
+	- `context` / `heading_path`
+	- `search_optimization` (heading keywords, dates, document_codes)
 	- `admin_tags` (security_level, department)
-- Full indexing delegation to `ingestion_service` (parse + clean + chunk + enrich + embed + index)
+- Full indexing delegation to `ingestion_service` (parse + section parent-child chunk + embed child + index)
 - Parent-child retrieval: child vectors are indexed, parent chunk text is returned to LLM
 - Hybrid retrieval (vector + keyword) with reciprocal-rank-fusion
 - Qdrant as vector store backend (local mode by default, remote mode optional)
@@ -119,7 +119,6 @@ RETRIEVAL_SERVICE_URL=http://localhost:8300
 - `SHIELD_API_KEY`: Must match backend `OLLAMA_API_KEY`.
 - `UPSTREAM_OLLAMA_BASE_URL`: Real Ollama server behind the shield, example `http://127.0.0.1:11434`.
 - `CHAT_MODEL`: Real chat model served by Ollama.
-- `INDEXING_MODEL`: Real model for metadata/HyQ indexing endpoints.
 - `EMBEDDING_MODEL`: Real embedding model served by Ollama.
 - `RATE_LIMIT_PER_MINUTE`: Per-key, per-route rate limit.
 
@@ -185,11 +184,11 @@ This file is regenerated on each embed so you can quickly inspect parsing output
 	- queued embed: `chunks_created=0`, `indexed_chunks=0`
 	- unchanged file hash and already embedded: returns cached counts without re-indexing
 
-## Metadata Optimization
+## Indexing
 
-- HyQ LLM calls are now batched: multiple chunks are grouped into one inference call to reduce Ollama I/O overhead.
-- Metadata is cached per `document_id + file_hash + chunk_fingerprint` in SQLite table `chunk_metadata_cache`.
-- Re-indexing the same content reuses cached metadata and skips repeated LLM generation.
+- Indexing uses `section_parent_child`: Markdown heading sections become DB parent chunks, child chunks are embedded in Qdrant.
+- Per-chunk summary and hypothetical-question generation is disabled; indexing does not call the chat LLM.
+- Existing old vectors should be deleted/re-indexed after this change.
 
 ## Operational Notes
 

@@ -253,7 +253,7 @@ def _vector_parent_candidates(
 
         seen_parent_ids.add(parent_chunk_id)
         parent_ids.append(parent_chunk_id)
-        parent_child_type[parent_chunk_id] = str(child.metadata.get("child_type") or "summary")
+        parent_child_type[parent_chunk_id] = str(child.metadata.get("child_type") or "section_child")
 
         if len(parent_ids) >= probe_k:
             break
