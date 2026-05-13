@@ -27,6 +27,17 @@ def _string_env(name: str, default: str) -> str:
     return cleaned or default
 
 
+def _resolve_service_path(raw_path: str, service_root: Path) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path
+
+    parts = path.parts
+    if parts and parts[0] == service_root.name:
+        return service_root.parent / path
+    return service_root / path
+
+
 def _pdf_parser_mode_env(default: str = "legacy") -> str:
     value = _string_env("PDF_PARSER_MODE", default).lower()
     if value not in {"legacy", "marker"}:
@@ -50,7 +61,7 @@ def _int_env(name: str, default: int) -> int:
 
 def get_settings() -> Settings:
     root = Path(__file__).resolve().parents[2]
-    storage_dir = Path(_string_env("INGESTION_STORAGE_DIR", str(root / "storage")))
+    storage_dir = _resolve_service_path(_string_env("INGESTION_STORAGE_DIR", "storage"), root)
     storage_dir.mkdir(parents=True, exist_ok=True)
     return Settings(
         app_name=_string_env("INGESTION_APP_NAME", "RAG Ingestion Service"),
