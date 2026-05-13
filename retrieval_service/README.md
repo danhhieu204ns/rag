@@ -29,6 +29,7 @@ POST   /v1/search/hybrid
 POST   /v1/index/chunks
 DELETE /v1/index/document/{document_id}
 GET    /health
+GET    /ready
 ```
 
 Example retrieve:
@@ -51,3 +52,19 @@ Example retrieve:
 over `document_chunks` in the shared metadata database, then merges candidates
 with reciprocal-rank fusion. The route keeps the same contract as `/v1/retrieve`
 so the Orchestrator does not need to know the retrieval strategy.
+
+## Configuration
+
+- See `.env.example` for supported environment variables and defaults.
+- Important vars: `OLLAMA_SERVICE_URL`, `OLLAMA_API_KEY`, `QDRANT_URL` / `QDRANT_PATH`,
+  `QDRANT_COLLECTION_NAME`, and database path `RETRIEVAL_DATABASE_PATH`.
+
+## Dependencies
+
+- See `requirements.txt` for Python dependencies (FastAPI, qdrant-client, httpx, etc.).
+
+## Notes
+
+- This service exposes both `/health` (basic status) and `/ready` (readiness checks
+  that validate Qdrant and the Ollama embedding service). The `/ready` endpoint
+  returns HTTP 503 when dependencies are not ready.

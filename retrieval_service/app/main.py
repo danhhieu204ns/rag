@@ -82,46 +82,7 @@ def _configure_retrieval_file_logging() -> logging.Logger:
 
 # configure logging early
 logger = _configure_retrieval_file_logging()
-
-
-@app.get("/health")
-def health() -> dict[str, Any]:
-    active_collection = collection_name()
-    qdrant_error: str | None = None
-    try:
-        collection_ready = collection_exists(active_collection)
-        status = "ok"
-    except Exception as exc:  # pragma: no cover - depends on external Qdrant state
-        collection_ready = False
-        status = "degraded"
-        qdrant_error = str(exc)
-
-    return {
-        "status": status,
-        "service": "retrieval-service",
-        "collection": active_collection,
-        "collection_ready": collection_ready,
-        "qdrant": settings.qdrant_url or str(settings.qdrant_path),
-        "qdrant_error": qdrant_error,
-        "ollama_service_url": settings.ollama_service_url,
-    }
-
-
-@app.get("/ready")
-def ready(response: Response) -> dict[str, Any]:
-    qdrant = _qdrant_ready()
-    ollama = _ollama_ready()
-    status = "ok" if qdrant["ready"] and ollama["ready"] else "degraded"
-    if status != "ok":
-        response.status_code = 503
-    return {
-        "status": status,
-        "service": "retrieval-service",
-        "checks": {
-            "qdrant": qdrant,
-            "ollama_service": ollama,
-        },
-    }
+logger = _configure_retrieval_file_logging()
 
 
 def _qdrant_ready() -> dict[str, Any]:
