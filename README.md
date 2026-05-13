@@ -10,8 +10,7 @@ rag/
 ├─ ingestion_service/   # Parse PDF/TXT/MD và split markdown thành chunks
 ├─ ollama_service/      # Shield/proxy trước Ollama, bảo vệ bằng x-api-key
 ├─ retrieval_service/   # Qdrant retrieval/indexing service
-├─ frontend/            # React + Vite UI
-└─ infra/               # Docker Compose cho môi trường local
+└─ frontend/            # React + Vite UI
 ```
 
 ## Kiến trúc tổng thể
@@ -82,8 +81,7 @@ Ghi chú thiết kế: repo đang đi theo hướng `retrieval_service` sở h�
 
 ## Yêu cầu
 
-- Docker Desktop + Docker Compose nếu chạy bằng compose.
-- Hoặc Python 3.11+, Node.js 20+, npm, Ollama nếu chạy thủ công.
+- Python 3.11+, Node.js 20+, npm, Ollama.
 - Model Ollama mặc định trong `.env.example`:
   - `qwen3:30b-a3b-instruct-2507-q4_K_M`
   - `qwen3:4b-instruct-2507-q4_K_M`
@@ -97,76 +95,19 @@ ollama pull qwen3:4b-instruct-2507-q4_K_M
 ollama pull qwen3-embedding:0.6b
 ```
 
-## Cài đặt nhanh bằng Docker Compose
-
-Từ thư mục gốc:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Sửa các giá trị tối thiểu trong `.env`:
-
-```env
-SECRET_KEY=change-this-secret-key-in-production
-SHIELD_API_KEY=change-this-key
-OLLAMA_API_KEY=change-this-key
-ADMIN_DEFAULT_USERNAME=admin
-ADMIN_DEFAULT_PASSWORD=Admin@123
-```
-
-Khởi động toàn bộ hệ thống:
-
-```powershell
-docker compose -f infra/docker-compose.yml up -d --build
-```
-
-Địa chỉ sau khi chạy:
-
-- Frontend: `http://localhost:3000`
-- Backend API: `http://localhost:8000`
-- Backend docs: `http://localhost:8000/docs`
-
-Kiểm tra trạng thái:
-
-```powershell
-docker compose -f infra/docker-compose.yml ps
-docker compose -f infra/docker-compose.yml logs api-gateway
-```
-
-Tắt hệ thống:
-
-```powershell
-docker compose -f infra/docker-compose.yml down
-```
-
-## Chạy local compose (không cần Docker)
-
-Script local-compose cung cấp các lệnh tương đương `up`, `down`, `logs` cho từng service.
-
-Chạy toàn bộ:
-
-```powershell
-./scripts/local-compose.sh up
-```
-
-Dừng toàn bộ:
-
-```powershell
-./scripts/local-compose.sh down
-```
-
-Xem log từng service:
-
-```powershell
-./scripts/local-compose.sh logs api-gateway
-./scripts/local-compose.sh logs retrieval-service
-./scripts/local-compose.sh logs ollama-service
-```
-
-## Cài đặt thủ công cho development
+## Cài đặt nhanh local
 
 Tạo env cho từng service:
+
+```bash
+cp backend/.env.example backend/.env
+cp ingestion_service/.env.example ingestion_service/.env
+cp ollama_service/.env.example ollama_service/.env
+cp retrieval_service/.env.example retrieval_service/.env
+cp frontend/.env.example frontend/.env
+```
+
+Trên Windows PowerShell:
 
 ```powershell
 Copy-Item backend/.env.example backend/.env
@@ -176,7 +117,214 @@ Copy-Item retrieval_service/.env.example retrieval_service/.env
 Copy-Item frontend/.env.example frontend/.env
 ```
 
-Các cấu hình local quan trọng:
+Khởi động toàn bộ hệ thống trên Ubuntu:
+
+```bash
+./scripts/dev.sh
+```
+
+Khởi động toàn bộ hệ thống trên Windows PowerShell:
+
+```powershell
+.\scripts\dev.ps1
+```
+
+Dừng Ubuntu bằng `Ctrl+C` trong terminal đang chạy script. Trên Windows, script mở từng service trong cửa sổ PowerShell riêng; đóng các cửa sổ đó để dừng service.
+
+Địa chỉ sau khi chạy:
+
+- Frontend: `http://localhost:5173`
+- Backend API: `http://localhost:8000`
+- Backend docs: `http://localhost:8000/docs`
+
+## Script chạy riêng từng service
+
+Chạy theo thứ tự dưới đây để các service phụ thuộc không lỗi kết nối lúc khởi động.
+
+Ubuntu:
+
+```bash
+./scripts/start-service.sh ollama
+./scripts/start-service.sh ollama-service
+./scripts/start-service.sh ingestion-service
+./scripts/start-service.sh retrieval-service
+./scripts/start-service.sh backend
+./scripts/start-service.sh frontend
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\start-service.ps1 ollama
+.\scripts\start-service.ps1 ollama-service
+.\scripts\start-service.ps1 ingestion-service
+.\scripts\start-service.ps1 retrieval-service
+.\scripts\start-service.ps1 backend
+.\scripts\start-service.ps1 frontend
+```
+
+Mỗi service nên chạy ở một terminal riêng khi dùng `start-service`.
+
+## Lệnh chạy trực tiếp từng service
+
+Chạy theo thứ tự dưới đây, mỗi service ở một terminal riêng.
+
+1. Ollama runtime
+
+```bash
+ollama serve
+```
+
+2. Qdrant embedded
+
+Mặc định không cần chạy lệnh `qdrant` riêng. Để `QDRANT_URL` rỗng trong `backend/.env` và `retrieval_service/.env`, app sẽ dùng Qdrant embedded qua `qdrant-client` và lưu dữ liệu theo `QDRANT_PATH`.
+
+```env
+QDRANT_URL=
+QDRANT_PATH=backend/storage/indexes/global_qdrant
+```
+
+Nếu muốn dùng Qdrant server ngoài, cần cài Qdrant binary trước rồi mới chạy các lệnh dưới đây và set `QDRANT_URL=http://localhost:6333`.
+
+Ubuntu khi đã cài Qdrant binary:
+
+```bash
+mkdir -p .qdrant
+QDRANT__SERVICE__HTTP_PORT=6333 QDRANT__STORAGE__STORAGE_PATH="$(pwd)/.qdrant" qdrant
+```
+
+Windows PowerShell khi đã cài Qdrant binary:
+
+```powershell
+New-Item -ItemType Directory -Force .qdrant
+$env:QDRANT__SERVICE__HTTP_PORT="6333"
+$env:QDRANT__STORAGE__STORAGE_PATH="$PWD\.qdrant"
+qdrant
+```
+
+3. Ollama Service
+
+```bash
+cd ollama_service
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+cd ollama_service
+source .venv/bin/activate
+uvicorn app.main:app --host 0.0.0.0 --port 8200
+```
+
+Windows PowerShell:
+
+```powershell
+cd ollama_service
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8200
+
+```
+
+4. Ingestion Service
+
+```bash
+cd ingestion_service
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+cd ingestion_service
+source .venv/bin/activate
+uvicorn app.main:app --host 0.0.0.0 --port 8100
+```
+
+Windows PowerShell:
+
+```powershell
+cd ingestion_service
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8100
+```
+
+5. Retrieval Service
+
+```bash
+cd retrieval_service
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+cd retrieval_service
+source .venv/bin/activate
+uvicorn app.main:app --host 0.0.0.0 --port 8300
+```
+
+Windows PowerShell:
+
+```powershell
+cd retrieval_service
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8300
+```
+
+6. Backend / Orchestrator
+
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+cd backend
+source .venv/bin/activate
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Windows PowerShell:
+
+```powershell
+cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+7. Frontend
+
+```bash
+cd frontend
+npm install
+
+cd frontend
+npm run dev
+```
+
+## Script kiểm tra service
+
+Ubuntu:
+
+```bash
+./scripts/check-services.sh
+systemctl status ollama --no-pager
+journalctl -u ollama -n 100 --no-pager
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\check-services.ps1
+Get-Service Ollama
+```
+
+Các script kiểm tra sẽ in process, port đang lắng nghe và health endpoint của từng service.
+
+## Cấu hình local quan trọng
 
 ```env
 # backend/.env
@@ -186,7 +334,7 @@ OLLAMA_CHAT_MODEL=default
 OLLAMA_EMBEDDING_MODEL=default
 INGESTION_SERVICE_URL=http://localhost:8100
 RETRIEVAL_SERVICE_URL=http://localhost:8300
-QDRANT_URL=http://localhost:6333
+QDRANT_URL=
 ```
 
 ```env
@@ -199,120 +347,12 @@ UPSTREAM_OLLAMA_BASE_URL=http://127.0.0.1:11434
 # retrieval_service/.env
 OLLAMA_SERVICE_URL=http://localhost:8200
 OLLAMA_API_KEY=change-this-key
-QDRANT_URL=http://localhost:6333
+QDRANT_URL=
+QDRANT_PATH=backend/storage/indexes/global_qdrant
 RETRIEVAL_DATABASE_PATH=backend/storage/app.db
 ```
 
-### Chạy riêng từng service
-
-Chạy theo thứ tự dưới đây để các service phụ thuộc không lỗi kết nối lúc khởi động. Mỗi block nên chạy ở một terminal riêng.
-
-1. Ollama runtime gốc
-
-```powershell
-ollama serve
-```
-
-Nếu Ollama Desktop đã chạy sẵn trên `http://127.0.0.1:11434`, có thể bỏ qua lệnh này. Kiểm tra model:
-
-```powershell
-ollama list
-```
-
-2. Qdrant vector database
-
-```powershell
-docker run --rm -p 6333:6333 -v ${PWD}/.qdrant:/qdrant/storage qdrant/qdrant:v1.14.0
-```
-
-Health check:
-
-```powershell
-Invoke-RestMethod http://localhost:6333/healthz
-```
-
-3. Ollama Service
-
-Service này là gateway trước Ollama, backend và retrieval service đều gọi qua đây.
-
-```powershell
-cd ollama_service
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8200
-```
-
-Health check:
-
-```powershell
-Invoke-RestMethod http://localhost:8200/ready
-```
-
-4. Ingestion Service
-
-Service này parse/split tài liệu. Backend gọi qua `INGESTION_SERVICE_URL`.
-
-```powershell
-cd ingestion_service
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8100
-```
-
-Health check:
-
-```powershell
-Invoke-RestMethod http://localhost:8100/ready
-```
-
-5. Retrieval Service
-
-Service này sở hữu Qdrant, tự gọi `ollama_service` để embedding query/chunks.
-
-```powershell
-cd retrieval_service
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8300
-```
-
-Health check:
-
-```powershell
-Invoke-RestMethod http://localhost:8300/ready
-```
-
-6. Backend / Orchestrator
-
-Backend là API duy nhất frontend gọi. Trước khi chạy, kiểm tra `backend/.env` có các URL nội bộ sau:
-
-```env
-OLLAMA_BASE_URL=http://localhost:8200
-INGESTION_SERVICE_URL=http://localhost:8100
-RETRIEVAL_SERVICE_URL=http://localhost:8300
-QDRANT_URL=http://localhost:6333
-```
-
-Chạy backend:
-
-```powershell
-cd backend
-pip install -r requirements.txt
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-Health check:
-
-```powershell
-Invoke-RestMethod http://localhost:8000/ready
-```
-
-7. Frontend
-
-```powershell
-cd frontend
-npm install
-npm run dev
-```
-
-Frontend dev mặc định chạy tại `http://localhost:5173`. Nếu dùng Vite dev server, `frontend/.env` nên trỏ về:
+Frontend dev mặc định chạy tại `http://localhost:5173`. `frontend/.env` nên trỏ về:
 
 ```env
 VITE_API_BASE_URL=http://localhost:8000/api
@@ -327,7 +367,7 @@ Tóm tắt port local:
 | Ingestion Service | 8100 | `http://localhost:8100` |
 | Ollama Service | 8200 | `http://localhost:8200` |
 | Retrieval Service | 8300 | `http://localhost:8300` |
-| Qdrant | 6333 | `http://localhost:6333` |
+| Qdrant embedded | N/A | `backend/storage/indexes/global_qdrant` |
 | Ollama runtime | 11434 | `http://localhost:11434` |
 
 
