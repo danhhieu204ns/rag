@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from langchain_core.documents import Document
 from sqlalchemy.orm import Session
+from qdrant_client.http import models as qdrant_models
 
 from ...core.settings import settings
 from ...models import DocumentChunk
@@ -85,10 +86,19 @@ def _search_qdrant_children(query: str, limit: int) -> list[Document]:
         event_prefix="qdrant_query_points",
         details={"limit": limit},
     ):
+        query_filter = qdrant_models.Filter(
+            must=[
+                qdrant_models.FieldCondition(
+                    key="index_type",
+                    match=qdrant_models.MatchValue(value="section_parent_child"),
+                )
+            ]
+        )
         if hasattr(client, "query_points"):
             query_response = client.query_points(
                 collection_name=settings.qdrant_collection_name,
                 query=query_vector,
+                query_filter=query_filter,
                 limit=limit,
                 with_payload=True,
             )
@@ -98,6 +108,7 @@ def _search_qdrant_children(query: str, limit: int) -> list[Document]:
                 client.search(
                     collection_name=settings.qdrant_collection_name,
                     query_vector=query_vector,
+                    query_filter=query_filter,
                     limit=limit,
                     with_payload=True,
                 )
@@ -324,8 +335,6 @@ def _keyword_parent_candidates_qdrant(
     document_ids: list[int] | None,
 ) -> list[int] | None:
     """Keyword candidates via Qdrant full-text index. Returns None if index unavailable."""
-    from qdrant_client.http import models as qdrant_models
-
     client = _get_qdrant_client()
     if not _qdrant_collection_exists(client):
         return None
@@ -336,6 +345,10 @@ def _keyword_parent_candidates_qdrant(
         qdrant_models.FieldCondition(
             key="full_text_search",
             match=qdrant_models.MatchText(text=query),
+        ),
+        qdrant_models.FieldCondition(
+            key="index_type",
+            match=qdrant_models.MatchValue(value="section_parent_child"),
         )
     ]
     if document_ids:

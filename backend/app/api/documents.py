@@ -9,6 +9,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+import re
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.exc import OperationalError
@@ -40,6 +41,7 @@ from ..services.rag.utils import _json_safe_value, _to_int
 router = APIRouter(prefix="/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
 _MARKDOWN_CACHE_VERSION = 1
+_MARKDOWN_DECORATION_RE = re.compile(r"^[\s#*_`]+|[\s#*_`]+$")
 
 
 def _parsed_markdown_cache_dir() -> Path:
@@ -215,6 +217,64 @@ def _parse_source_metadata(raw_json: str | None) -> dict[str, Any] | None:
     return payload
 
 
+def _clean_metadata_heading(value: Any) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+    cleaned = _MARKDOWN_DECORATION_RE.sub("", cleaned).strip()
+    return cleaned
+
+
+def _clean_heading_path(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [cleaned for item in value if (cleaned := _clean_metadata_heading(item))]
+
+
+def _compact_chunk_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(metadata, dict) or not metadata:
+        return {}
+
+    compact: dict[str, Any] = {}
+
+    for key in ("chunk_id", "parent_id", "parent_chunk_id", "section_id"):
+        value = metadata.get(key)
+        if value is not None:
+            compact[key] = value
+
+    child_chunk_id = metadata.get("child_chunk_id")
+    if child_chunk_id:
+        compact["child_chunk_id"] = child_chunk_id
+
+    section_title = _clean_metadata_heading(metadata.get("section_title") or metadata.get("title"))
+    if section_title:
+        compact["section_title"] = section_title
+
+    heading_path = _clean_heading_path(metadata.get("heading_path"))
+    if not heading_path:
+        context = metadata.get("context")
+        if isinstance(context, dict):
+            heading_path = _clean_heading_path(context.get("heading_path"))
+    if heading_path:
+        compact["heading_path"] = heading_path
+
+    for key in ("page_start", "page_end", "index_type"):
+        value = metadata.get(key)
+        if value is not None:
+            compact[key] = value
+
+    source_info = metadata.get("source_info")
+    compact_source_info: dict[str, Any] = {}
+    if isinstance(source_info, dict):
+        if source_info.get("file_name"):
+            compact_source_info["file_name"] = source_info.get("file_name")
+        page_number = _to_int(source_info.get("page_number"))
+        if page_number is not None:
+            compact_source_info["page_number"] = page_number
+    if compact_source_info:
+        compact["source_info"] = compact_source_info
+
+    return compact
+
+
 def _repair_completed_indexing_status(db: Session, document: Document) -> bool:
     if document.status != "indexing":
         return False
@@ -303,7 +363,7 @@ def _to_document_chunk_read(chunk: DocumentChunk) -> DocumentChunkRead:
         content=chunk.content,
         source_page=chunk.source_page,
         source_kind=chunk.source_kind,
-        source_metadata=_parse_source_metadata(chunk.source_metadata_json),
+        source_metadata=_compact_chunk_metadata(_parse_source_metadata(chunk.source_metadata_json)),
         created_at=chunk.created_at,
     )
 
@@ -408,6 +468,15 @@ def _write_document_chunks(
 
             if new_chunks:
                 db.add_all(new_chunks)
+                db.flush()
+                for chunk in new_chunks:
+                    source_metadata = _parse_source_metadata(chunk.source_metadata_json) or {}
+                    source_metadata["document_id"] = document_id
+                    source_metadata["parent_id"] = chunk.id
+                    source_metadata["parent_chunk_id"] = chunk.id
+                    source_metadata.setdefault("chunk_id", f"parent-{chunk.id}")
+                    chunk.source_metadata_json = _serialize_source_metadata(source_metadata)
+                    db.add(chunk)
 
             db.commit()
             return

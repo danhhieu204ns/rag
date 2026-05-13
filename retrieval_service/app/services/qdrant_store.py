@@ -88,10 +88,19 @@ def _to_float(value: Any) -> float | None:
 
 
 def _payload_filter(filters: RetrievalFilters | None) -> qdrant_models.Filter | None:
-    if filters is None:
-        return None
-
     must: list[qdrant_models.Condition] = []
+    metadata_filters = filters.metadata if filters is not None else {}
+    if "index_type" not in metadata_filters:
+        must.append(
+            qdrant_models.FieldCondition(
+                key="index_type",
+                match=qdrant_models.MatchValue(value="section_parent_child"),
+            )
+        )
+
+    if filters is None:
+        return qdrant_models.Filter(must=must)
+
     if filters.document_ids:
         must.append(
             qdrant_models.FieldCondition(
@@ -100,7 +109,7 @@ def _payload_filter(filters: RetrievalFilters | None) -> qdrant_models.Filter | 
             )
         )
 
-    for key, value in filters.metadata.items():
+    for key, value in metadata_filters.items():
         if value is None:
             continue
         if isinstance(value, list):

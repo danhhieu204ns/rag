@@ -181,7 +181,11 @@ def build_parent_child_chunks(
         parent_bodies = split_text_to_chunks(body, chunk_size=body_parent_limit, overlap=0)
 
         for part_index, parent_body in enumerate(parent_bodies):
-            parent_id = section.section_id if len(parent_bodies) == 1 else f"{section.section_id}-parent-{part_index + 1:02d}"
+            parent_id = (
+                f"parent-{section.section_id}"
+                if len(parent_bodies) == 1
+                else f"parent-{section.section_id}-{part_index + 1:02d}"
+            )
             title = section.title if len(parent_bodies) == 1 else f"{section.title} Part {part_index + 1}"
             text = _parent_text(section.heading_path, parent_body)
             parent = ParentChunk(
@@ -210,7 +214,7 @@ def build_parent_child_chunks(
                 embedding_text = f"{prefix}\n\n{child_text}" if prepend_heading_path and prefix else child_text
                 children.append(
                     ChildChunk(
-                        chunk_id=f"{parent.parent_id}-child-{child_index:04d}",
+                        chunk_id=f"child-{parent.parent_id.removeprefix('parent-')}-{child_index:04d}",
                         parent_id=parent.parent_id,
                         section_id=parent.section_id,
                         doc_id=parent.doc_id,

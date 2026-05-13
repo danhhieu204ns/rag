@@ -61,7 +61,7 @@ def _page_join_separator(previous_text: str, next_text: str) -> str:
 
 def _clean_title(raw_title: str) -> str:
     title = re.sub(r"\s+", " ", str(raw_title or "").strip())
-    title = title.strip(" #")
+    title = title.strip(" #*_`")
     return title or DEFAULT_SECTION_TITLE
 
 

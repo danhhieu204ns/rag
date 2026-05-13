@@ -122,7 +122,7 @@ class DocumentChunkRead(BaseModel):
     content: str
     source_page: int | None = Field(default=None, ge=1)
     source_kind: str | None = None
-    source_metadata: ChunkMetadataRead | dict[str, Any] | None = None
+    source_metadata: dict[str, Any] | ChunkMetadataRead | None = None
     created_at: datetime
 
 
@@ -140,7 +140,7 @@ class SourceItem(BaseModel):
     chunk_index: int | None = None
     page: int | None = Field(default=None, ge=1)
     source_kind: str | None = None
-    source_metadata: ChunkMetadataRead | dict[str, Any] | None = None
+    source_metadata: dict[str, Any] | ChunkMetadataRead | None = None
     retrieval_mode: str | None = None
     retrieval_score: float | None = None
     excerpt: str

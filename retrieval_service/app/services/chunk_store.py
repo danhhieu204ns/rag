@@ -108,11 +108,12 @@ def _flatten_metadata_values(value: Any) -> list[str]:
 
 
 def _metadata_matches(metadata: dict[str, Any], filters: Any) -> bool:
-    if filters is None:
-        return True
-
-    requested = getattr(filters, "metadata", None)
-    if not isinstance(requested, dict) or not requested:
+    requested = getattr(filters, "metadata", None) if filters is not None else None
+    if not isinstance(requested, dict):
+        requested = {}
+    if "index_type" not in requested and metadata.get("index_type") != "section_parent_child":
+        return False
+    if not requested:
         return True
 
     flattened = _normalize_lookup_text(" ".join(_flatten_metadata_values(metadata)))

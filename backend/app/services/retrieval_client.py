@@ -114,7 +114,10 @@ def similarity_search(
         json={
             "query": query,
             "top_k": top_k,
-            "filters": {"document_ids": document_ids or [], "metadata": {}},
+            "filters": {
+                "document_ids": document_ids or [],
+                "metadata": {"index_type": "section_parent_child"},
+            },
         },
     )
     payload = response.json()
