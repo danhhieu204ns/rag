@@ -19,7 +19,7 @@ npm run dev
 
 By default frontend calls:
 
-- `http://localhost:8000/api`
+- `/api`
 
 Override with env variable:
 
@@ -28,5 +28,7 @@ Override with env variable:
 Example `.env` inside `frontend`:
 
 ```env
-VITE_API_BASE_URL=http://localhost:8000/api
+VITE_API_BASE_URL=/api
 ```
+
+In development, Vite proxies `/api` to `http://127.0.0.1:8000`.
