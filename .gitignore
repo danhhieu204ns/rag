@@ -6,3 +6,5 @@ dist
 *pyc
 runctl
 storage
+.qdrant
+.venv
