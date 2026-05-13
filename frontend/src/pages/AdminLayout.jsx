@@ -23,7 +23,7 @@ function AdminLayout({ onLogout }) {
               fontWeight: isActive ? "600" : "400"
             })}
           >
-            Quản lí tài liệu
+            Quản lý tài liệu
           </NavLink>
           <NavLink 
             to="/admin/users" 
@@ -37,7 +37,7 @@ function AdminLayout({ onLogout }) {
               fontWeight: isActive ? "600" : "400"
             })}
           >
-            Quản lí người dùng
+            Quản lý người dùng
           </NavLink>
         </nav>
         <div style={{ marginTop: "auto", padding: "1.5rem" }}>

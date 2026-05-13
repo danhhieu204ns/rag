@@ -64,7 +64,7 @@ function UsersPage() {
   return (
     <div className="panel panel-main admin-docs-panel">
       <div className="panel-head">
-        <h2>Quản lí người dùng</h2>
+        <h2>Quản lý người dùng</h2>
         <div className="panel-actions">
           <span className="muted">Người dùng: {users.length}</span>
         </div>

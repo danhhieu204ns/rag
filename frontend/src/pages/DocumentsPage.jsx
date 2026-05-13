@@ -7,7 +7,6 @@ const DOCUMENT_PROGRESS_POLL_INTERVAL_MS = 2500;
 
 function DocumentsPage() {
   const [documents, setDocuments] = useState([]);
-  const [titleDrafts, setTitleDrafts] = useState({});
   const [selectedFile, setSelectedFile] = useState(null);
   const [uploadTitle, setUploadTitle] = useState("");
   const [isBusy, setIsBusy] = useState(false);
@@ -54,38 +53,9 @@ function DocumentsPage() {
     setChunksError("");
   }
 
-  async function fetchDocuments(options = {}) {
-    const { syncDrafts = true } = options;
+  async function fetchDocuments() {
     const response = await api.get("/documents");
     setDocuments(response.data);
-
-    if (syncDrafts) {
-      const nextDrafts = {};
-      response.data.forEach((item) => {
-        nextDrafts[item.id] = item.title;
-      });
-      setTitleDrafts(nextDrafts);
-    } else {
-      setTitleDrafts((prev) => {
-        const merged = { ...prev };
-        const aliveIds = new Set(response.data.map((item) => item.id));
-
-        response.data.forEach((item) => {
-          if (merged[item.id] === undefined) {
-            merged[item.id] = item.title;
-          }
-        });
-
-        Object.keys(merged).forEach((key) => {
-          const id = Number(key);
-          if (!aliveIds.has(id)) {
-            delete merged[key];
-          }
-        });
-
-        return merged;
-      });
-    }
 
     if (selectedChunkDocumentId && !response.data.some((item) => item.id === selectedChunkDocumentId)) {
       closeChunksInspector();
@@ -110,7 +80,7 @@ function DocumentsPage() {
       setChunkOffset(response.data.offset || 0);
     } catch (err) {
       const detail = err?.response?.data?.detail;
-      setChunksError(typeof detail === "string" ? detail : "Khong the tai danh sach chunks.");
+      setChunksError(typeof detail === "string" ? detail : "Không thể tải danh sách chunks.");
     } finally {
       setIsChunksBusy(false);
     }
@@ -121,7 +91,7 @@ function DocumentsPage() {
     if (!selectedFile) return;
 
     setIsBusy(true);
-    setBusyMessage("Dang upload tai lieu...");
+    setBusyMessage("Đang tải tài liệu lên...");
     setError("");
 
     try {
@@ -138,26 +108,7 @@ function DocumentsPage() {
       await fetchDocuments();
     } catch (err) {
       const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Khong the upload tai lieu.");
-    } finally {
-      setIsBusy(false);
-      setBusyMessage("");
-    }
-  }
-
-  async function saveTitle(documentId) {
-    const title = (titleDrafts[documentId] || "").trim();
-    if (!title) return;
-
-    setIsBusy(true);
-    setBusyMessage("Dang cap nhat tieu de...");
-    setError("");
-    try {
-      await api.put(`/documents/${documentId}`, { title });
-      await fetchDocuments();
-    } catch (err) {
-      const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Khong the cap nhat tieu de.");
+      setError(typeof detail === "string" ? detail : "Không thể tải tài liệu lên.");
     } finally {
       setIsBusy(false);
       setBusyMessage("");
@@ -166,16 +117,16 @@ function DocumentsPage() {
 
   async function processDocument(documentId) {
     setIsBusy(true);
-    setBusyMessage("Dang bat dau quy trinh indexing (Parse + Embed)...");
+    setBusyMessage("Đang bắt đầu index tài liệu...");
     setActiveDocumentAction({ documentId, action: "process" });
     setError("");
     try {
       await api.post(`/documents/${documentId}/process`);
-      setBusyMessage("Da queue quy trinh indexing, dang theo doi tien do...");
+      setBusyMessage("Đã đưa tài liệu vào hàng đợi index, đang theo dõi tiến độ...");
       await fetchDocuments();
     } catch (err) {
       const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Khong the bat dau quy trinh indexing.");
+      setError(typeof detail === "string" ? detail : "Không thể bắt đầu index tài liệu.");
     } finally {
       setIsBusy(false);
       setBusyMessage("");
@@ -186,7 +137,7 @@ function DocumentsPage() {
 
   async function deleteDocument(documentId) {
     setIsBusy(true);
-    setBusyMessage("Dang xoa tai lieu...");
+    setBusyMessage("Đang xóa tài liệu...");
     setError("");
     try {
       await api.delete(`/documents/${documentId}`);
@@ -196,7 +147,7 @@ function DocumentsPage() {
       await fetchDocuments();
     } catch (err) {
       const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Khong the xoa tai lieu.");
+      setError(typeof detail === "string" ? detail : "Không thể xóa tài liệu.");
     } finally {
       setIsBusy(false);
       setBusyMessage("");
@@ -205,13 +156,13 @@ function DocumentsPage() {
 
   async function rebuildIndex() {
     setIsBusy(true);
-    setBusyMessage("Dang queue rebuild index tu markdown da parse...");
+    setBusyMessage("Đang đưa các tài liệu cần index vào hàng đợi...");
     setError("");
     try {
       await api.post("/documents/reindex");
     } catch (err) {
       const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Khong the rebuild index.");
+      setError(typeof detail === "string" ? detail : "Không thể index lại tài liệu.");
     } finally {
       setIsBusy(false);
       setBusyMessage("");
@@ -235,8 +186,26 @@ function DocumentsPage() {
     return parsed.toLocaleString();
   }
 
+  function getStatusLabel(status) {
+    const labels = {
+      uploaded: "Chưa index",
+      indexing: "Đang index",
+      embedded: "Đã index",
+      parsed: "Đã parse",
+      index_failed: "Index lỗi",
+    };
+    return labels[status] || status || "Không rõ";
+  }
+
+  function getStatusClass(status) {
+    if (status === "embedded") return "success";
+    if (status === "indexing") return "progress";
+    if (status === "index_failed") return "danger";
+    return "neutral";
+  }
+
   useEffect(() => {
-    fetchDocuments().catch(() => setError("Khong the tai danh sach tai lieu."));
+    fetchDocuments().catch(() => setError("Không thể tải danh sách tài liệu."));
   }, []);
 
   useEffect(() => {
@@ -251,7 +220,7 @@ function DocumentsPage() {
 
       isPollingRef.current = true;
       try {
-        await fetchDocuments({ syncDrafts: false });
+        await fetchDocuments();
       } catch {
         // Polling should stay silent; user-facing errors are handled by explicit actions.
       } finally {
@@ -270,13 +239,13 @@ function DocumentsPage() {
 
     <div className="panel panel-main admin-docs-panel">
       <div className="panel-head">
-        <h2>Danh sach tai lieu</h2>
+        <h2>Quản lý tài liệu</h2>
         <div className="panel-actions">
-          <span className="muted">Tai lieu: {documents.length}</span>
-          <span className="muted">Tong chunks: {totalChunks}</span>
-          {hasIndexingDocuments ? <span className="muted">Dang polling tien trinh...</span> : null}
-          <button onClick={rebuildIndex} disabled={isBusy}>
-            Rebuild index
+          <span className="metric-pill">Tài liệu: {documents.length}</span>
+          <span className="metric-pill">Tổng chunks: {totalChunks}</span>
+          {hasIndexingDocuments ? <span className="status-pill progress">Đang cập nhật tiến độ</span> : null}
+          <button className="soft-button" onClick={rebuildIndex} disabled={isBusy}>
+            Index tài liệu còn thiếu
           </button>
         </div>
       </div>
@@ -289,12 +258,12 @@ function DocumentsPage() {
         />
         <input
           type="text"
-          placeholder="Title (optional)"
+          placeholder="Tiêu đề (không bắt buộc)"
           value={uploadTitle}
           onChange={(event) => setUploadTitle(event.target.value)}
         />
-        <button type="submit" disabled={isBusy || !selectedFile}>
-          {isBusy ? "Dang xu ly..." : "Upload"}
+        <button className="primary" type="submit" disabled={isBusy || !selectedFile}>
+          {isBusy ? "Đang xử lý..." : "Tải lên"}
         </button>
       </form>
 
@@ -303,12 +272,11 @@ function DocumentsPage() {
           <thead>
             <tr>
               <th>ID</th>
-              <th>Tieu de</th>
-              <th>File goc</th>
-              <th>Status</th>
+              <th>Tiêu đề</th>
+              <th>File gốc</th>
+              <th>Trạng thái</th>
               <th>Chunks</th>
-              <th>Thao tac</th>
-              <th>Khac</th>
+              <th>Thao tác</th>
 
             </tr>
           </thead>
@@ -316,42 +284,40 @@ function DocumentsPage() {
             {documents.map((doc) => (
               <tr key={doc.id}>
                 <td>{doc.id}</td>
-                <td>
-                  <input
-                    value={titleDrafts[doc.id] || ""}
-                    onChange={(event) =>
-                      setTitleDrafts((prev) => ({ ...prev, [doc.id]: event.target.value }))
-                    }
-                  />
-                </td>
+                <td className="document-title-cell">{doc.title}</td>
                 <td>{doc.original_filename}</td>
-                <td>{doc.status}</td>
+                <td>
+                  <span className={`status-pill ${getStatusClass(doc.status)}`}>
+                    {getStatusLabel(doc.status)}
+                  </span>
+                </td>
                 <td>{doc.chunk_count}</td>
                 <td className="row-actions">
-                  <button onClick={() => saveTitle(doc.id)} disabled={isBusy}>
-                    Save
-                  </button>
-                  <button
-                    onClick={() => processDocument(doc.id)}
-                    disabled={isBusy || doc.status === "indexing"}
-                    className={doc.status === "embedded" ? "secondary" : "primary"}
-                  >
-                    {isBusy && activeDocumentAction.documentId === doc.id && activeDocumentAction.action === "process"
-                      ? "Dang xu ly..."
-                      : (doc.status === "embedded" ? "Re-index" : "Start Indexing")}
-                  </button>
-                </td>
-
-                <td className="row-actions">
+                  {doc.status !== "embedded" && doc.status !== "indexing" ? (
+                    <button
+                      onClick={() => processDocument(doc.id)}
+                      disabled={isBusy}
+                      className="primary"
+                    >
+                      {isBusy && activeDocumentAction.documentId === doc.id && activeDocumentAction.action === "process"
+                        ? "Đang index..."
+                        : "Index"}
+                    </button>
+                  ) : null}
                   <button onClick={() => handleChunkToggle(doc)} disabled={isBusy || isChunksBusy}>
-                    {selectedChunkDocumentId === doc.id ? "Hide chunks" : "View chunks"}
+                    {selectedChunkDocumentId === doc.id ? "Ẩn chunks" : "Xem chunks"}
                   </button>
                   <button className="danger" onClick={() => deleteDocument(doc.id)} disabled={isBusy}>
-                    Delete
+                    Xóa
                   </button>
                 </td>
               </tr>
             ))}
+            {documents.length === 0 ? (
+              <tr>
+                <td colSpan="6" className="empty-cell">Chưa có tài liệu nào.</td>
+              </tr>
+            ) : null}
           </tbody>
         </table>
       </div>
@@ -361,12 +327,12 @@ function DocumentsPage() {
           <div className="chunk-inspector-head">
             <div>
               <h3>
-                Chunks - Document #{selectedChunkDocumentId}
+                Chunks - Tài liệu #{selectedChunkDocumentId}
                 {selectedChunkDocument ? `: ${selectedChunkDocument.title}` : ""}
               </h3>
               <p className="muted">
-                Total: {chunkTotal}
-                {chunkTotal > 0 ? ` | Showing ${chunkRangeStart}-${chunkRangeEnd}` : ""}
+                Tổng: {chunkTotal}
+                {chunkTotal > 0 ? ` | Đang hiển thị ${chunkRangeStart}-${chunkRangeEnd}` : ""}
               </p>
             </div>
             <div className="chunk-inspector-actions">
@@ -379,7 +345,7 @@ function DocumentsPage() {
                 }
                 disabled={!canGoChunkPrev || isChunksBusy}
               >
-                Prev
+                Trước
               </button>
               <button
                 onClick={() =>
@@ -387,18 +353,18 @@ function DocumentsPage() {
                 }
                 disabled={!canGoChunkNext || isChunksBusy}
               >
-                Next
+                Sau
               </button>
               <button className="danger" onClick={closeChunksInspector}>
-                Close
+                Đóng
               </button>
             </div>
           </div>
 
-          {isChunksBusy ? <p className="muted">Dang tai chunks...</p> : null}
+          {isChunksBusy ? <p className="muted">Đang tải chunks...</p> : null}
           {chunksError ? <p className="error-text">{chunksError}</p> : null}
           {!isChunksBusy && !chunksError && chunks.length === 0 ? (
-            <p className="muted">Tai lieu nay chua co chunk. Bam Embed de tao chunks.</p>
+            <p className="muted">Tài liệu này chưa có chunk. Bấm Index để tạo chunks.</p>
           ) : null}
 
           <div className="chunk-list">
@@ -411,7 +377,7 @@ function DocumentsPage() {
                   <div className="chunk-card-head">
                     <strong>Chunk #{chunk.chunk_index}</strong>
                     <span className="chunk-pill">id {chunk.id}</span>
-                    {chunk.source_page ? <span className="chunk-pill">page {chunk.source_page}</span> : null}
+                    {chunk.source_page ? <span className="chunk-pill">trang {chunk.source_page}</span> : null}
                     {chunk.source_kind ? <span className="chunk-pill">{chunk.source_kind}</span> : null}
                     {chunk.created_at ? (
                       <span className="chunk-pill">{formatChunkDate(chunk.created_at)}</span>
@@ -419,7 +385,7 @@ function DocumentsPage() {
                   </div>
 
                   <details open>
-                    <summary>Content</summary>
+                    <summary>Nội dung</summary>
                     <pre className="chunk-pre">{chunk.content}</pre>
                   </details>
 
