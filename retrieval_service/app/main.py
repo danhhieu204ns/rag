@@ -216,8 +216,18 @@ async def search_hybrid(request: RetrieveRequest) -> RetrieveResponse:
     request_start = time.perf_counter()
     name = collection_name(request.collection)
     logger.info("[retrieval][search_hybrid] request received collection=%s query_len=%d top_k=%s", name, len(request.query or ""), request.top_k)
+    
+    # Optional: Rewrite query for better retrieval
+    query_to_embed = request.query
+    if request.enable_query_rewrite:
+        from .services.query_rewrite import maybe_rewrite_query
+        rewritten_query, rewrite_details = maybe_rewrite_query(request.query)
+        if rewrite_details.get("rewritten"):
+            query_to_embed = rewritten_query
+            logger.info("[retrieval][search_hybrid] query rewritten: %s => %s", request.query[:60], rewritten_query[:60])
+    
     embed_start = time.perf_counter()
-    vector = (await embed_texts([request.query]))[0]
+    vector = (await embed_texts([query_to_embed]))[0]
     logger.info("[retrieval][search_hybrid] step=embed_texts elapsed_ms=%.2f collection=%s", _ms(embed_start), name)
     search_start = time.perf_counter()
     contexts = search_hybrid_contexts(
@@ -226,10 +236,14 @@ async def search_hybrid(request: RetrieveRequest) -> RetrieveResponse:
         name=name,
         top_k=request.top_k or settings.default_top_k,
         filters=request.filters,
+        vector_weight=request.vector_weight or 1.0,
+        keyword_weight=request.keyword_weight or 1.0,
+        candidate_pool=request.candidate_pool,
     )
     logger.info("[retrieval][search_hybrid] step=search_hybrid_contexts elapsed_ms=%.2f collection=%s returned=%d", _ms(search_start), name, len(contexts))
     logger.info("[retrieval][timing] route=/v1/search/hybrid status=ok total_elapsed_ms=%.2f collection=%s returned=%d", _ms(request_start), name, len(contexts))
     return RetrieveResponse(contexts=contexts)
+
 
 
 @app.post("/v1/index/chunks", response_model=IndexChunksResponse)

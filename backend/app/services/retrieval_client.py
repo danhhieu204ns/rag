@@ -108,20 +108,35 @@ def similarity_search(
     document_ids: list[int] | None = None,
     plan: Any | None = None,
 ) -> list[Document]:
+    payload: dict[str, Any] = {
+        "query": query,
+        "top_k": top_k,
+        "filters": {
+            "document_ids": document_ids or [],
+            "metadata": {"index_type": "section_parent_child"},
+        },
+    }
+    
+    # Pass strategy parameters from orchestration plan if available
+    if plan is not None:
+        if hasattr(plan, "vector_rrf_weight"):
+            payload["vector_weight"] = plan.vector_rrf_weight
+        if hasattr(plan, "keyword_rrf_weight"):
+            payload["keyword_weight"] = plan.keyword_rrf_weight
+        if hasattr(plan, "candidate_pool"):
+            payload["candidate_pool"] = plan.candidate_pool
+    
+    # Enable query rewriting from settings if not already set
+    if settings.query_rewrite_enabled and "enable_query_rewrite" not in payload:
+        payload["enable_query_rewrite"] = True
+    
     response = _request(
         "POST",
         "/v1/search/hybrid",
-        json={
-            "query": query,
-            "top_k": top_k,
-            "filters": {
-                "document_ids": document_ids or [],
-                "metadata": {"index_type": "section_parent_child"},
-            },
-        },
+        json=payload,
     )
-    payload = response.json()
-    contexts = payload.get("contexts")
+    payload_response = response.json()
+    contexts = payload_response.get("contexts")
     if not isinstance(contexts, list):
         return []
 

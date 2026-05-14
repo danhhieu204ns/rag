@@ -88,8 +88,6 @@ class QueryLog:
         self._orchestrator_retries: list[dict[str, Any]] = []  # orchestrator_retry events
 
         # --- Retrieval phase ---
-        self._rewrite: dict[str, Any] = {}
-        self._rewrite_ms: float = 0.0             # từ query_rewrite_success.elapsed_ms
         self._kw_start: dict[str, Any] = {}       # keyword_candidates_start
         self._qdrant_hits: dict[str, Any] = {}    # qdrant_child_search_done
         self._semantic: dict[str, Any] = {}       # semantic_candidates_done
@@ -129,13 +127,6 @@ class QueryLog:
 
             elif event == "orchestrator_retry":
                 self._orchestrator_retries.append(details)
-
-            elif event in ("query_rewrite_success", "query_rewrite_skip", "query_rewrite_done"):
-                # Merge mọi rewrite event để giữ fields từ cả 3 event
-                # (success có original_query_preview + elapsed_ms, done có rewritten + effective_query_preview)
-                self._rewrite = {**self._rewrite, **details}
-                if event == "query_rewrite_success":
-                    self._rewrite_ms = float(details.get("elapsed_ms", 0.0))
 
             elif event == "keyword_candidates_start":
                 self._kw_start = details
@@ -237,26 +228,7 @@ class QueryLog:
         # ── PHASE 1 — RETRIEVAL ─────────────────────────────────────────
         section("PHASE 1 — RETRIEVAL")
 
-        # 1a. Query Rewrite
-        rewrite_ms = self._rewrite_ms
-        rewrite_suffix = f"  [{rewrite_ms:.1f}ms]" if rewrite_ms > 0 else ""
-        lines.append(f"\n▶ QUERY REWRITE{rewrite_suffix}")
-        d = self._rewrite
-        if d:
-            rewritten = d.get("rewritten", False)
-            reason = d.get("decision_reason", "")
-            if rewritten:
-                kv("  Trạng thái", "✓ rewritten")
-                original = d.get("original_query_preview") or self._query
-                kv("  Query gốc", _preview(str(original)))
-                kv("  Query mới", _preview(str(d.get("effective_query_preview") or d.get("rewritten_query_preview", ""))))
-            else:
-                kv("  Trạng thái", f"skipped  (reason={reason})")
-                kv("  Query dùng", _preview(self._query))
-        else:
-            kv("  Trạng thái", "no data")
-
-        # 1b. Orchestrator
+        # 1a. Orchestrator
         orch_ms = self._orchestrator_ms
         orch_ms_str = f"  [{orch_ms:.2f}ms]" if orch_ms > 0 else ""
         lines.append(f"\n▶ ORCHESTRATOR{orch_ms_str}")

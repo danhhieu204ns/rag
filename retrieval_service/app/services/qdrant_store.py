@@ -370,15 +370,17 @@ def _merge_hybrid_ids(
     vector_ids: list[int],
     keyword_ids: list[int],
     top_k: int,
+    vector_weight: float = 1.0,
+    keyword_weight: float = 1.0,
 ) -> tuple[list[int], dict[int, float]]:
     rrf_k = 60.0
     scores: dict[int, float] = {}
 
     for rank, chunk_id in enumerate(vector_ids, start=1):
-        scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (rrf_k + rank)
+        scores[chunk_id] = scores.get(chunk_id, 0.0) + (vector_weight / (rrf_k + rank))
 
     for rank, chunk_id in enumerate(keyword_ids, start=1):
-        scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (rrf_k + rank)
+        scores[chunk_id] = scores.get(chunk_id, 0.0) + (keyword_weight / (rrf_k + rank))
 
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     return [chunk_id for chunk_id, _ in ranked[:top_k]], scores
@@ -391,13 +393,19 @@ def search_hybrid_contexts(
     name: str,
     top_k: int,
     filters: RetrievalFilters | None,
+    vector_weight: float = 1.0,
+    keyword_weight: float = 1.0,
+    candidate_pool: int | None = None,
 ) -> list[ContextItem]:
-    probe_k = max(top_k * 4, top_k)
+    if candidate_pool is None:
+        candidate_pool = max(top_k * 4, top_k)
+    else:
+        candidate_pool = max(candidate_pool, top_k)
 
     vector_contexts = search_contexts(
         vector=vector,
         name=name,
-        top_k=probe_k,
+        top_k=candidate_pool,
         filters=filters,
     )
     vector_by_id = {
@@ -409,7 +417,7 @@ def search_hybrid_contexts(
 
     keyword_candidates = search_keyword_candidates(
         query=query,
-        limit=probe_k,
+        limit=candidate_pool,
         filters=filters,
     )
     keyword_by_id = {item.chunk_id: (item, score) for item, score in keyword_candidates}
@@ -419,6 +427,8 @@ def search_hybrid_contexts(
         vector_ids=vector_ids,
         keyword_ids=keyword_ids,
         top_k=top_k,
+        vector_weight=vector_weight,
+        keyword_weight=keyword_weight,
     )
     if not merged_ids:
         return []

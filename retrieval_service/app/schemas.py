@@ -15,6 +15,12 @@ class RetrieveRequest(BaseModel):
     collection: str | None = None
     top_k: int = Field(default=5, ge=1, le=50)
     filters: RetrievalFilters | None = None
+    # Strategy parameters (optional, defaults provided by service)
+    vector_weight: float | None = None  # RRF weight for vector search (default: 1.0)
+    keyword_weight: float | None = None  # RRF weight for keyword search (default: 1.0)
+    candidate_pool: int | None = None  # Top candidates to probe before final ranking (default: top_k)
+    use_reranker: bool | None = None  # Enable reranker if available (default: from settings)
+    enable_query_rewrite: bool | None = None  # Enable query rewriting (default: from settings)
 
 
 class VectorSearchRequest(BaseModel):

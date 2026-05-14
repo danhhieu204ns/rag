@@ -14,6 +14,68 @@ def _headers() -> dict[str, str]:
     return {"x-api-key": settings.ollama_api_key}
 
 
+class SimpleLLMClient:
+    """Minimal LLM client for query rewriting and orchestration."""
+    
+    def __init__(self, base_url: str, model: str, api_key: str | None = None):
+        self.base_url = base_url
+        self.model = model
+        self.api_key = api_key
+        self.headers = {"x-api-key": api_key} if api_key else {}
+    
+    def invoke(self, prompt: str, temperature: float = 0.0) -> Any:
+        """Call LLM with given prompt."""
+        timeout = httpx.Timeout(settings.request_timeout_seconds, connect=10.0)
+        with httpx.Client(timeout=timeout, headers=self.headers) as client:
+            try:
+                response = client.post(
+                    f"{self.base_url}/v1/chat/completions",
+                    json={
+                        "model": self.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": temperature,
+                    },
+                )
+            except httpx.TimeoutException as exc:
+                raise HTTPException(status_code=504, detail="LLM Service timeout.") from exc
+            except httpx.RequestError as exc:
+                raise HTTPException(status_code=502, detail=f"Cannot reach LLM Service: {exc}") from exc
+        
+        if response.status_code >= 400:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        
+        payload = response.json()
+        choices = payload.get("choices", [])
+        if not choices:
+            raise HTTPException(status_code=502, detail="LLM returned no choices.")
+        
+        first_choice = choices[0]
+        message = first_choice.get("message", {})
+        content = message.get("content", "")
+        
+        class LLMResponse:
+            pass
+        
+        result = LLMResponse()
+        result.content = content
+        return result
+
+
+def get_llm_client() -> SimpleLLMClient | None:
+    """Get LLM client for query rewriting, or None if not configured."""
+    try:
+        base_url = settings.ollama_service_url.strip()
+        model = getattr(settings, "ollama_chat_model", "mistral")
+        api_key = getattr(settings, "ollama_api_key", None)
+        
+        if not base_url:
+            return None
+        
+        return SimpleLLMClient(base_url, model, api_key)
+    except Exception:
+        return None
+
+
 def _extract_embeddings(payload: dict[str, Any]) -> list[list[float]]:
     raw_embeddings = payload.get("embeddings")
     if isinstance(raw_embeddings, list):
