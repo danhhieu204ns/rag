@@ -31,6 +31,12 @@ class Settings:
     query_rewrite_min_terms: int
     query_rewrite_max_terms: int
     orchestrator_enabled: bool
+    # Orchestrator (rule-based or LLM-based planning)
+    orchestrator_mode: str
+    orchestrator_llm_model: str
+    orchestrator_llm_temperature: float
+    orchestrator_llm_max_tokens: int
+    orchestrator_llm_timeout_seconds: float
     # Hybrid retrieval
     hybrid_probe_multiplier: int
     hybrid_rrf_k: int
@@ -169,6 +175,11 @@ def get_settings() -> Settings:
         ),
         query_rewrite_max_terms=max(1, _int_env("QUERY_REWRITE_MAX_TERMS", 12)),
         orchestrator_enabled=_bool_env("ORCHESTRATOR_ENABLED", True),
+        orchestrator_mode=_string_env("ORCHESTRATOR_MODE", "rule"),
+        orchestrator_llm_model=_string_env("ORCHESTRATOR_LLM_MODEL", "llama2"),
+        orchestrator_llm_temperature=_float_env("ORCHESTRATOR_LLM_TEMPERATURE", 0.0),
+        orchestrator_llm_max_tokens=_int_env("ORCHESTRATOR_LLM_MAX_TOKENS", 500),
+        orchestrator_llm_timeout_seconds=_float_env("ORCHESTRATOR_LLM_TIMEOUT_SECONDS", 10.0),
         hybrid_probe_multiplier=max(1, _int_env("HYBRID_PROBE_MULTIPLIER", 4)),
         hybrid_rrf_k=max(1, _int_env("HYBRID_RRF_K", 60)),
         hybrid_vector_rrf_weight=_float_env("HYBRID_VECTOR_RRF_WEIGHT", 1.0),
