@@ -65,12 +65,17 @@ domain-specific terms through `BM25_EXTRA_SYNONYMS`.
 - See `.env.example` for supported environment variables and defaults.
 - Important vars: `OLLAMA_SERVICE_URL`, `OLLAMA_API_KEY`, `QDRANT_URL` / `QDRANT_PATH`,
   `QDRANT_COLLECTION_NAME`, and database path `RETRIEVAL_DATABASE_PATH`.
+- Hybrid vars: `HYBRID_PROBE_MULTIPLIER`, `HYBRID_RRF_K`,
+  `HYBRID_VECTOR_RRF_WEIGHT`, `HYBRID_KEYWORD_RRF_WEIGHT`.
+- Reranker vars: `RERANKER_ENABLED`, `RERANKER_MODEL`,
+  `RERANKER_CANDIDATE_POOL`.
 - BM25 vars: `BM25_ENABLED`, `BM25_BILINGUAL_EXPANSION`,
   `BM25_CANDIDATE_LIMIT_MULTIPLIER`, `BM25_EXTRA_SYNONYMS`.
 
 ## Dependencies
 
-- See `requirements.txt` for Python dependencies (FastAPI, qdrant-client, httpx, etc.).
+- See `requirements.txt` for Python dependencies (FastAPI, qdrant-client, httpx,
+  sentence-transformers for reranking, etc.).
 
 ## Notes
 

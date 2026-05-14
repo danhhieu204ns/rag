@@ -470,10 +470,11 @@ Xem [backend/README.md](backend/README.md#api-endpoints) để chi tiết đầy
 - `CHUNK_SIZE`, `CHUNK_OVERLAP`: Chunking parameters
 
 **Legacy/Advanced** (không khuyến nghị thay đổi):
-- `RETRIEVAL_SEARCH_CHILD_CHUNKS`: Search strategy
-- `HYBRID_PROBE_MULTIPLIER`, `HYBRID_RRF_K`: Hybrid search tuning
+- `RETRIEVER_K`: Số context cuối mặc định đưa vào prompt khi request không truyền `top_k`
+- `RETRIEVAL_SEARCH_CHILD_CHUNKS`: Search strategy trong `retrieval_service`
+- `HYBRID_PROBE_MULTIPLIER`, `HYBRID_RRF_K`: Hybrid search tuning trong `retrieval_service`
 - `BM25_ENABLED`, `BM25_BILINGUAL_EXPANSION`, `BM25_EXTRA_SYNONYMS`: Keyword/BM25 retrieval tuning in `retrieval_service`
-- `RERANKER_ENABLED`, `RERANKER_MODEL`: Reranking parameters
+- `RERANKER_ENABLED`, `RERANKER_MODEL`: Reranking parameters trong `retrieval_service`
 
 ## Dữ liệu runtime
 
@@ -634,11 +635,12 @@ CHILD_CHUNK_SIZE=500         # Child chunk size
 ### Search Tuning
 
 ```env
-# In backend/.env / retrieval_service/.env
+# In retrieval_service/.env
 RERANKER_ENABLED=true        # Better results, slower
-QUERY_REWRITE_ENABLED=false  # Query expansion, slower
-RETRIEVAL_TOP_K=10           # More results = slower
 HYBRID_RRF_K=60              # Reciprocal rank fusion parameter
+
+# In backend/.env
+QUERY_REWRITE_ENABLED=false  # Query expansion, slower
 ```
 
 ### Scaling

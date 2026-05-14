@@ -32,15 +32,6 @@ class Settings:
     query_rewrite_max_terms: int
     orchestrator_enabled: bool
     orchestrator_timeout_seconds: float
-    # Hybrid retrieval
-    hybrid_probe_multiplier: int
-    hybrid_rrf_k: int
-    hybrid_vector_rrf_weight: float
-    hybrid_keyword_rrf_weight: float
-    # Reranking
-    reranker_enabled: bool
-    reranker_model: str
-    reranker_candidate_pool: int
     indexing_concurrency: int
     embedding_batch_size: int
     ingestion_service_url: str
@@ -161,7 +152,7 @@ def get_settings() -> Settings:
         pdf_parser_mode=_pdf_parser_mode_env(),
         chunk_size=_int_env("CHUNK_SIZE", 500),
         chunk_overlap=_int_env("CHUNK_OVERLAP", 50),
-        retriever_k=4,
+        retriever_k=max(1, min(_int_env("RETRIEVER_K", 4), 20)),
         query_rewrite_enabled=_bool_env("QUERY_REWRITE_ENABLED", False),
         query_rewrite_min_terms=max(
             1,
@@ -170,13 +161,6 @@ def get_settings() -> Settings:
         query_rewrite_max_terms=max(1, _int_env("QUERY_REWRITE_MAX_TERMS", 12)),
         orchestrator_enabled=_bool_env("ORCHESTRATOR_ENABLED", True),
         orchestrator_timeout_seconds=_float_env("ORCHESTRATOR_TIMEOUT_SECONDS", 30.0),
-        hybrid_probe_multiplier=max(1, _int_env("HYBRID_PROBE_MULTIPLIER", 4)),
-        hybrid_rrf_k=max(1, _int_env("HYBRID_RRF_K", 60)),
-        hybrid_vector_rrf_weight=_float_env("HYBRID_VECTOR_RRF_WEIGHT", 1.0),
-        hybrid_keyword_rrf_weight=_float_env("HYBRID_KEYWORD_RRF_WEIGHT", 1.0),
-        reranker_enabled=_bool_env("RERANKER_ENABLED", True),
-        reranker_model=_string_env("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
-        reranker_candidate_pool=_int_env("RERANKER_CANDIDATE_POOL", 20),
         indexing_concurrency=_int_env("INDEXING_CONCURRENCY", 12),
         embedding_batch_size=_int_env("EMBEDDING_BATCH_SIZE", 128),
         ingestion_service_url=_string_env("INGESTION_SERVICE_URL", "").rstrip("/"),

@@ -401,7 +401,6 @@ trên SQLite FTS5 của bảng `document_chunks`, rồi fuse với vector search
 PDF_PARSER_MODE=legacy              # legacy (PyMuPDF) or marker
 CHUNK_SIZE=1000                     # Target chunk length (characters)
 CHUNK_OVERLAP=150                   # Overlap between chunks
-RERANKER_ENABLED=true               # Enable BGE reranking
 QUERY_REWRITE_ENABLED=false         # Enable query rewriting (HyDE-like)
 ```
 
@@ -530,9 +529,10 @@ Backend dùng `BackgroundTasks` để xử lý indexing không đồng bộ:
 - Debug markdown: `ingestion_service/storage/markdown_logs/marker/` (nếu dùng marker)
 
 **Performance Tuning:**
+- `RETRIEVER_K`: Số context cuối đưa vào prompt mặc định khi request không truyền `top_k`
 - `CHUNK_SIZE`: Tăng → ít chunks hơn, nhưng context dài hơn
 - `CHUNK_OVERLAP`: Overlap để tránh mất context ở boundaries
-- `RERANKER_ENABLED`: Rerank top_k results (chậm hơn nhưng kết quả tốt hơn)
+- `RERANKER_ENABLED`: nằm trong `retrieval_service`; rerank candidate pool trước khi trả top_k
 
 **Scaling:**
 - Ingestion: scale riêng nếu có nhiều documents

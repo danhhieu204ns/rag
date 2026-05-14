@@ -8,6 +8,7 @@ without retrieval context.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -24,6 +25,66 @@ OutputMode = Literal["qa", "outline", "script", "quiz", "summary_doc"]
 
 logger = logging.getLogger(__name__)
 
+_RETRIEVAL_INTENT_PHRASES = (
+    "phân biệt",
+    "so sánh",
+    "giải thích",
+    "trình bày",
+    "liệt kê",
+    "tóm tắt",
+    "định nghĩa",
+    "là gì",
+    "như thế nào",
+    "hoạt động",
+    "vì sao",
+    "tại sao",
+    "quy định",
+    "chính sách",
+    "hướng dẫn",
+    "điều kiện",
+    "yêu cầu",
+    "bao nhiêu",
+    "compare",
+    "explain",
+    "summarize",
+    "define",
+    "what is",
+    "how does",
+)
+_ASSISTANT_IDENTITY_PHRASES = (
+    "bạn là ai",
+    "bạn là gì",
+    "tên bạn",
+    "who are you",
+    "what are you",
+)
+_LOW_SIGNAL_TERMS = {
+    "haha",
+    "hihi",
+    "xin",
+    "chào",
+    "hello",
+    "hi",
+    "cảm",
+    "ơn",
+    "thanks",
+    "thank",
+    "you",
+    "hãy",
+    "vui",
+    "lòng",
+    "giúp",
+    "tôi",
+    "mình",
+    "ngắn",
+    "gọn",
+    "trả",
+    "lời",
+    "thật",
+    "trong",
+    "từ",
+}
+
 
 # ─── Data model ───────────────────────────────────────────────────────────────
 
@@ -33,10 +94,6 @@ class OrchestrationPlan:
     output_mode: OutputMode
     strategy: QueryStrategy
     top_k: int
-    vector_rrf_weight: float
-    keyword_rrf_weight: float
-    use_reranker: bool
-    candidate_pool: int
     max_iterations: int
     expand_query: bool
     signals: list[str] = field(default_factory=list)
@@ -71,6 +128,22 @@ def _call_orchestrator_service(query: str) -> dict[str, Any] | None:
         return None
 
 
+def _looks_like_retrieval_query(query: str) -> bool:
+    text = " ".join(str(query or "").casefold().split())
+    if not text or any(phrase in text for phrase in _ASSISTANT_IDENTITY_PHRASES):
+        return False
+    if not any(phrase in text for phrase in _RETRIEVAL_INTENT_PHRASES):
+        return False
+
+    terms = re.findall(r"[\wÀ-ỹĐđ]+", text, flags=re.UNICODE)
+    signal_terms = [
+        term
+        for term in terms
+        if len(term) >= 2 and term not in _LOW_SIGNAL_TERMS and not term.isdigit()
+    ]
+    return bool(signal_terms)
+
+
 def classify_query(
     query: str,
     base_top_k: int,
@@ -81,6 +154,12 @@ def classify_query(
     requires_retrieval = bool(raw.get("requires_retrieval", True))
     query_type = str(raw.get("query_type") or ("needs_retrieval" if requires_retrieval else "chitchat"))
     signals = [str(s) for s in (raw.get("signals") or []) if s]
+    retrieval_guard_applied = False
+    if not requires_retrieval and _looks_like_retrieval_query(query):
+        requires_retrieval = True
+        query_type = "needs_retrieval"
+        retrieval_guard_applied = True
+        signals.append("retrieval_guard")
     confidence_raw = raw.get("confidence", 0.0)
     try:
         confidence = max(0.0, min(1.0, float(confidence_raw)))
@@ -92,19 +171,23 @@ def classify_query(
         output_mode=output_mode_override or "qa",
         strategy="balanced",
         top_k=base_top_k,
-        vector_rrf_weight=settings.hybrid_vector_rrf_weight,
-        keyword_rrf_weight=settings.hybrid_keyword_rrf_weight,
-        use_reranker=settings.reranker_enabled and requires_retrieval,
-        candidate_pool=settings.reranker_candidate_pool,
         max_iterations=1,
         expand_query=False,
         signals=signals,
         requires_retrieval=requires_retrieval,
         confidence=confidence,
-        llm_reason=str(raw.get("reason") or "") or None,
+        llm_reason=_orchestrator_reason(raw, retrieval_guard_applied),
         orchestrator_source="llm",
     )
     return _emit_plan(query, started_at, plan)
+
+
+def _orchestrator_reason(raw: dict[str, Any], retrieval_guard_applied: bool) -> str | None:
+    reason = str(raw.get("reason") or "").strip()
+    if retrieval_guard_applied:
+        guard_reason = "retrieval_guard: query has factual/explanatory intent"
+        return f"{reason} | {guard_reason}" if reason else guard_reason
+    return reason or None
 
 
 def _emit_plan(query: str, started_at: float, plan: OrchestrationPlan) -> OrchestrationPlan:
@@ -116,15 +199,12 @@ def _emit_plan(query: str, started_at: float, plan: OrchestrationPlan) -> Orches
 
     _emit_query_progress(
         "[orchestrator] src=%s type=%s mode=%s strategy=%s top_k=%d "
-        "vw=%.1f kw=%.1f reranker=%s iters=%d signals=%s (%.2fms)",
+        "retrieval_defaults=retrieval_service iters=%d signals=%s (%.2fms)",
         src,
         plan.query_type,
         plan.output_mode,
         plan.strategy,
         plan.top_k,
-        plan.vector_rrf_weight,
-        plan.keyword_rrf_weight,
-        plan.use_reranker,
         plan.max_iterations,
         plan.signals,
         elapsed,
@@ -135,10 +215,7 @@ def _emit_plan(query: str, started_at: float, plan: OrchestrationPlan) -> Orches
             "output_mode": plan.output_mode,
             "strategy": plan.strategy,
             "top_k": plan.top_k,
-            "vector_rrf_weight": plan.vector_rrf_weight,
-            "keyword_rrf_weight": plan.keyword_rrf_weight,
-            "use_reranker": plan.use_reranker,
-            "candidate_pool": plan.candidate_pool,
+            "retrieval_defaults_source": "retrieval_service",
             "max_iterations": plan.max_iterations,
             "expand_query": plan.expand_query,
             "signals": plan.signals,

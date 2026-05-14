@@ -219,6 +219,7 @@ async def search_hybrid(request: RetrieveRequest) -> RetrieveResponse:
     
     # Optional: Rewrite query for better retrieval
     query_to_embed = request.query
+    rewrite_details: dict[str, Any] = {}
     if request.enable_query_rewrite:
         from .services.query_rewrite import maybe_rewrite_query
         rewritten_query, rewrite_details = maybe_rewrite_query(request.query)
@@ -228,21 +229,52 @@ async def search_hybrid(request: RetrieveRequest) -> RetrieveResponse:
     
     embed_start = time.perf_counter()
     vector = (await embed_texts([query_to_embed]))[0]
-    logger.info("[retrieval][search_hybrid] step=embed_texts elapsed_ms=%.2f collection=%s", _ms(embed_start), name)
+    embed_elapsed_ms = _ms(embed_start)
+    logger.info("[retrieval][search_hybrid] step=embed_texts elapsed_ms=%.2f collection=%s", embed_elapsed_ms, name)
     search_start = time.perf_counter()
+    debug: dict[str, Any] = {
+        "collection": name,
+        "query_rewrite": rewrite_details,
+        "query_to_embed": query_to_embed if query_to_embed != request.query else None,
+        "timings_ms": {"embed_query": round(embed_elapsed_ms, 2)},
+    }
+    vector_weight = (
+        request.vector_weight
+        if request.vector_weight is not None
+        else settings.hybrid_vector_rrf_weight
+    )
+    keyword_weight = (
+        request.keyword_weight
+        if request.keyword_weight is not None
+        else settings.hybrid_keyword_rrf_weight
+    )
+    use_reranker = (
+        request.use_reranker
+        if request.use_reranker is not None
+        else settings.reranker_enabled
+    )
     contexts = search_hybrid_contexts(
         query=request.query,
         vector=vector,
         name=name,
         top_k=request.top_k or settings.default_top_k,
         filters=request.filters,
-        vector_weight=request.vector_weight or 1.0,
-        keyword_weight=request.keyword_weight or 1.0,
+        vector_weight=vector_weight,
+        keyword_weight=keyword_weight,
         candidate_pool=request.candidate_pool,
+        use_reranker=use_reranker,
+        debug=debug,
     )
-    logger.info("[retrieval][search_hybrid] step=search_hybrid_contexts elapsed_ms=%.2f collection=%s returned=%d", _ms(search_start), name, len(contexts))
-    logger.info("[retrieval][timing] route=/v1/search/hybrid status=ok total_elapsed_ms=%.2f collection=%s returned=%d", _ms(request_start), name, len(contexts))
-    return RetrieveResponse(contexts=contexts)
+    search_elapsed_ms = _ms(search_start)
+    total_elapsed_ms = _ms(request_start)
+    debug_timings = debug.setdefault("timings_ms", {})
+    if isinstance(debug_timings, dict):
+        debug_timings["embed_query"] = round(embed_elapsed_ms, 2)
+        debug_timings["search_hybrid_contexts"] = round(search_elapsed_ms, 2)
+        debug_timings["total"] = round(total_elapsed_ms, 2)
+    logger.info("[retrieval][search_hybrid] step=search_hybrid_contexts elapsed_ms=%.2f collection=%s returned=%d", search_elapsed_ms, name, len(contexts))
+    logger.info("[retrieval][timing] route=/v1/search/hybrid status=ok total_elapsed_ms=%.2f collection=%s returned=%d", total_elapsed_ms, name, len(contexts))
+    return RetrieveResponse(contexts=contexts, debug=debug)
 
 
 

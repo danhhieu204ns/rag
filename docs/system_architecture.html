@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RAG System Architecture</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg: #f5f2eb;
+      --bg-elevated: #fffdf8;
+      --panel: #ffffff;
+      --text: #1f2428;
+      --muted: #5b6470;
+      --line: #ddd4c8;
+      --accent: #c2410c;
+      --accent-2: #0f766e;
+      --accent-3: #4338ca;
+      --shadow: 0 14px 40px rgba(32, 28, 22, 0.10);
+      --radius: 18px;
+      --radius-sm: 12px;
+      --code-bg: #0f172a;
+      --code-text: #e2e8f0;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(194, 65, 12, 0.08), transparent 34%),
+        radial-gradient(circle at top right, rgba(15, 118, 110, 0.07), transparent 28%),
+        linear-gradient(180deg, #fbf7f1 0%, var(--bg) 100%);
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .page {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 0;
+      align-self: start;
+      height: 100vh;
+      padding: 24px 18px;
+      border-right: 1px solid var(--line);
+      background: rgba(255, 253, 248, 0.82);
+      backdrop-filter: blur(10px);
+      overflow: auto;
+    }
+
+    .brand {
+      padding: 18px;
+      border-radius: var(--radius);
+      background: linear-gradient(135deg, #ffffff 0%, #f8efe3 100%);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+      margin-bottom: 20px;
+    }
+
+    .brand h1 {
+      margin: 0 0 8px;
+      font-size: 1.15rem;
+      line-height: 1.3;
+    }
+
+    .brand p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.94rem;
+    }
+
+    .toc {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .toc a {
+      display: block;
+      padding: 10px 12px;
+      border-radius: 12px;
+      color: var(--text);
+      border: 1px solid transparent;
+    }
+
+    .toc a:hover {
+      background: rgba(194, 65, 12, 0.08);
+      border-color: rgba(194, 65, 12, 0.15);
+      text-decoration: none;
+    }
+
+    .content {
+      padding: 28px;
+      max-width: 1440px;
+      width: 100%;
+    }
+
+    .hero {
+      padding: 28px;
+      background: linear-gradient(135deg, rgba(255,255,255,0.96), rgba(255,248,241,0.90));
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      margin-bottom: 20px;
+    }
+
+    .hero h2 {
+      margin: 0 0 12px;
+      font-size: clamp(1.8rem, 3vw, 2.8rem);
+      line-height: 1.1;
+    }
+
+    .hero p {
+      margin: 0 0 10px;
+      color: var(--muted);
+      max-width: 980px;
+      line-height: 1.6;
+    }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .meta-card,
+    .card,
+    .callout,
+    .diagram-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+
+    .meta-card {
+      padding: 14px 16px;
+    }
+
+    .meta-card .label {
+      font-size: 0.82rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 6px;
+    }
+
+    .meta-card .value {
+      font-size: 1rem;
+      font-weight: 700;
+    }
+
+    section {
+      margin-bottom: 22px;
+    }
+
+    h3 {
+      margin: 0 0 12px;
+      font-size: 1.45rem;
+      line-height: 1.2;
+    }
+
+    h4 {
+      margin: 0 0 10px;
+      font-size: 1.08rem;
+    }
+
+    .card {
+      padding: 18px;
+      margin-bottom: 14px;
+    }
+
+    .card p,
+    .card li,
+    .callout p,
+    .callout li,
+    td,
+    th {
+      line-height: 1.6;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--line);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 860px;
+    }
+
+    th, td {
+      padding: 12px 14px;
+      border-bottom: 1px solid #ece6dc;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #faf4ea;
+      font-size: 0.92rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    td code,
+    .inline-code {
+      padding: 2px 6px;
+      border-radius: 8px;
+      background: #f4efe8;
+      border: 1px solid #e5ddd0;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      margin: 0;
+      padding: 16px;
+      border-radius: 14px;
+      background: var(--code-bg);
+      color: var(--code-text);
+      overflow: auto;
+      border: 1px solid #0b1220;
+      font-size: 0.9rem;
+      line-height: 1.55;
+    }
+
+    .callout {
+      padding: 16px 18px;
+      margin-bottom: 14px;
+      background: linear-gradient(180deg, rgba(15,118,110,0.08), rgba(255,255,255,1));
+    }
+
+    .callout.warn {
+      background: linear-gradient(180deg, rgba(194,65,12,0.08), rgba(255,255,255,1));
+    }
+
+    .callout strong {
+      display: block;
+      margin-bottom: 8px;
+    }
+
+    .diagram-card {
+      padding: 14px;
+      margin: 14px 0;
+      background: #fffefb;
+    }
+
+    .diagram-title {
+      margin: 0 0 10px;
+      font-weight: 700;
+    }
+
+    .mermaid {
+      overflow: auto;
+    }
+
+    ul {
+      margin: 10px 0 0 20px;
+      padding: 0;
+    }
+
+    li + li { margin-top: 6px; }
+
+    .note {
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: rgba(67, 56, 202, 0.08);
+      color: var(--accent-3);
+      font-size: 0.84rem;
+      font-weight: 700;
+    }
+
+    .source-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .source-item {
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+    }
+
+    .source-item .path {
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .footer-gap {
+      height: 24px;
+    }
+
+    @media (max-width: 1180px) {
+      .page { grid-template-columns: 1fr; }
+      .sidebar {
+        position: relative;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .meta-grid,
+      .grid-2,
+      .grid-3,
+      .source-list {
+        grid-template-columns: 1fr;
+      }
+      .content { padding: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <aside class="sidebar">
+      <div class="brand">
+        <h1>RAG System Architecture</h1>
+        <p>Tài liệu kiến trúc hệ thống dựa trên code hiện tại trong workspace này.</p>
+      </div>
+      <nav class="toc">
+        <a href="#overview">Tổng quan</a>
+        <a href="#backend">Backend / API Gateway</a>
+        <a href="#ingestion">Ingestion Service</a>
+        <a href="#retrieval">Retrieval Service</a>
+        <a href="#ollama">Ollama / LLM Service</a>
+        <a href="#frontend">Frontend</a>
+        <a href="#storage">Storage / Database</a>
+        <a href="#flows">Data Flow</a>
+        <a href="#diagrams">Sơ đồ</a>
+        <a href="#sources">Nguồn tham chiếu</a>
+        <a href="#open-questions">Điểm chưa rõ</a>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <header class="hero" id="overview">
+        <span class="tag">RAG / FastAPI / React / Qdrant / Ollama</span>
+        <h2>Kiến trúc hệ thống RAG hiện tại</h2>
+        <p>
+          Trang này mô tả kiến trúc theo code thực tế trong workspace. Backend đóng vai trò orchestrator,
+          ingestion tách riêng để parse/chunk/index tài liệu, retrieval sở hữu Qdrant + BM25 hybrid search,
+          và Ollama service là shield/proxy đặt trước Ollama thật.
+        </p>
+        <p>
+          Tài liệu ưu tiên mô tả theo luồng chạy của hệ thống để developer mới có thể đọc mà chưa cần mở code.
+          Các chỗ chưa thể khẳng định từ code sẽ được ghi rõ là <strong>Chưa xác định rõ từ code hiện tại</strong>.
+        </p>
+
+        <div class="meta-grid">
+          <div class="meta-card"><div class="label">Backend</div><div class="value">FastAPI orchestrator</div></div>
+          <div class="meta-card"><div class="label">Indexing</div><div class="value">section_parent_child</div></div>
+          <div class="meta-card"><div class="label">Retrieval</div><div class="value">Qdrant + BM25 + parent expansion</div></div>
+          <div class="meta-card"><div class="label">LLM</div><div class="value">Ollama shield/proxy</div></div>
+        </div>
+      </header>
+
+      <section class="card" id="backend">
+        <h3>1. Backend / API Gateway</h3>
+        <p>
+          Backend là service mà frontend gọi trực tiếp. Nó xử lý auth, quản lý tài liệu, chat sessions,
+          lưu metadata vào SQLite, và điều phối các service còn lại qua các client nội bộ.
+        </p>
+        <div class="grid-2">
+          <div>
+            <h4>Vai trò chính</h4>
+            <ul>
+              <li>Nhận request từ frontend qua prefix <span class="inline-code">/api</span>.</li>
+              <li>Quản lý JWT đăng nhập admin và phân quyền user/admin.</li>
+              <li>Lưu document, chunks, index state, chat sessions, chat messages trong SQLite.</li>
+              <li>Gọi ingestion service để parse/chunk/index tài liệu.</li>
+              <li>Gọi retrieval service để tìm ngữ cảnh và gọi Ollama service để tạo câu trả lời.</li>
+            </ul>
+          </div>
+          <div>
+            <h4>Router chính</h4>
+            <ul>
+              <li><span class="inline-code">/api/auth</span> - login, me</li>
+              <li><span class="inline-code">/api/users</span> - CRUD user admin</li>
+              <li><span class="inline-code">/api/documents</span> - upload, list, parse, process, reindex, chunks, delete</li>
+              <li><span class="inline-code">/api/chat</span> - chat sessions và streaming query</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout">
+          <strong>Điểm đáng chú ý</strong>
+          <p>
+            Backend không thao tác trực tiếp với Qdrant. Nó chỉ đọc/ghi metadata SQLite và dùng client service
+            để gọi ingestion/retrieval/ollama. Readiness endpoint của backend kiểm tra DB, Ollama service,
+            ingestion service và retrieval service nếu được cấu hình.
+          </p>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Endpoint</th>
+                <th>Mục đích</th>
+                <th>Ghi chú</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td><code>GET /api/health</code></td><td>Health check backend</td><td>Trả service <code>api-gateway</code></td></tr>
+              <tr><td><code>GET /api/ready</code></td><td>Readiness check</td><td>Kiểm tra DB + service phụ thuộc</td></tr>
+              <tr><td><code>POST /api/auth/login</code></td><td>Đăng nhập admin</td><td>Trả JWT bearer token</td></tr>
+              <tr><td><code>GET /api/auth/me</code></td><td>Thông tin user hiện tại</td><td>Yêu cầu bearer token</td></tr>
+              <tr><td><code>POST /api/documents/upload</code></td><td>Upload tài liệu</td><td>Chỉ admin</td></tr>
+              <tr><td><code>POST /api/documents/{id}/process</code></td><td>Queue indexing full</td><td>Chạy nền qua BackgroundTasks</td></tr>
+              <tr><td><code>POST /api/documents/{id}/embed</code></td><td>Queue indexing full</td><td>Khác tên nhưng cùng pipeline</td></tr>
+              <tr><td><code>POST /api/documents/reindex</code></td><td>Queue tài liệu cần index</td><td>Reindex các tài liệu pending</td></tr>
+              <tr><td><code>GET /api/chat/sessions</code></td><td>Danh sách session</td><td>Gắn với user hiện tại</td></tr>
+              <tr><td><code>POST /api/chat/query</code></td><td>Streaming RAG answer</td><td>SSE, lưu user + assistant message</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" id="ingestion">
+        <h3>2. Ingestion Service</h3>
+        <p>
+          Ingestion service xử lý file đầu vào, convert sang Markdown, tách section, tạo parent-child chunk,
+          rồi trả bundle để backend lưu parent chunks vào SQLite và upsert child rows sang retrieval service.
+        </p>
+
+        <div class="grid-2">
+          <div>
+            <h4>Luồng xử lý</h4>
+            <ul>
+              <li>Nhận <code>.pdf</code>, <code>.txt</code>, <code>.md</code> qua <code>POST /v1/parse</code> hoặc <code>/v1/index/build</code>.</li>
+              <li>PDF có 2 mode: <code>legacy</code> và <code>marker</code> theo <code>PDF_PARSER_MODE</code>.</li>
+              <li>Markdown được parse thành các section dựa trên heading, bỏ qua fenced code block khi nhận diện heading.</li>
+              <li>Chunking theo mô hình <code>section_parent_child</code> bắt buộc.</li>
+              <li>Trả về parent payloads và child rows để backend tiếp tục ghi DB và index.</li>
+            </ul>
+          </div>
+          <div>
+            <h4>Endpoints chính</h4>
+            <ul>
+              <li><code>GET /health</code>, <code>GET /ready</code></li>
+              <li><code>POST /v1/parse</code> - parse file thành markdown</li>
+              <li><code>POST /v1/split</code> - split markdown thành chunks debug</li>
+              <li><code>POST /v1/index/build</code> - build bundle từ file</li>
+              <li><code>POST /v1/index/build-from-markdown</code> - build bundle từ markdown</li>
+              <li><code>POST /v1/index/upsert</code> - upsert child rows sang retrieval service</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout">
+          <strong>Parent-child chunking</strong>
+          <p>
+            Code hiện tại dùng <code>build_section_parent_child_index</code> và <code>build_parent_child_chunks</code>.
+            Parent chunk chứa heading path + body; child chunk tách nhỏ hơn, có <code>embedding_text</code> có thể prepend heading path.
+            Điều này giúp retrieval search trên child vectors nhưng backend/LLM nhận parent-like context rõ nghĩa hơn.
+          </p>
+        </div>
+
+        <div class="grid-2">
+          <div>
+            <h4>Metadata được sinh ra</h4>
+            <ul>
+              <li><code>index_type</code>: <code>section_parent_child</code></li>
+              <li><code>parent_id</code>, <code>section_id</code>, <code>section_title</code></li>
+              <li><code>heading_path</code>, <code>page_start</code>, <code>page_end</code></li>
+              <li><code>source_info</code> với <code>file_name</code>, <code>page_number</code>, <code>doc_type</code></li>
+              <li><code>context</code> với <code>h1..h6</code></li>
+              <li><code>search_optimization</code>: keywords, dates, document_codes</li>
+              <li><code>admin_tags</code> và thông tin chunking role parent/child</li>
+            </ul>
+          </div>
+          <div>
+            <h4>Quá trình build index</h4>
+            <ul>
+              <li>Backend lưu file upload vào <code>backend/storage/uploads</code>.</li>
+              <li>Backend gọi ingestion để parse markdown, rồi tạo parent/child bundle.</li>
+              <li>Backend lưu parent chunks vào SQLite table <code>document_chunks</code>.</li>
+              <li>Backend ghép child rows với <code>parent_chunk_id</code> thật rồi gọi ingestion <code>/v1/index/upsert</code>.</li>
+              <li>Ingestion batch các child rows và gọi retrieval service <code>/v1/index/chunks</code>.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>File nguồn</th><th>Vai trò</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>ingestion_service/app/main.py</code></td><td>FastAPI entrypoint, endpoints parse/split/index</td></tr>
+              <tr><td><code>ingestion_service/app/services/document_processing.py</code></td><td>Parse markdown, load documents, split</td></tr>
+              <tr><td><code>ingestion_service/app/services/markdown_sections.py</code></td><td>Parse heading sections, page spans</td></tr>
+              <tr><td><code>ingestion_service/app/services/parent_child_chunker.py</code></td><td>Parent/child chunk generation</td></tr>
+              <tr><td><code>ingestion_service/app/services/indexing_pipeline.py</code></td><td>Assemble metadata payloads</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" id="retrieval">
+        <h3>3. Retrieval Service</h3>
+        <p>
+          Retrieval service sở hữu Qdrant và metadata DB phục vụ search. Nó nhận query, gọi Ollama service để embed,
+          rồi thực hiện vector search, BM25 keyword search, hợp nhất kết quả bằng Reciprocal Rank Fusion (RRF),
+          sau đó trả context cho backend.
+        </p>
+
+        <div class="grid-2">
+          <div>
+            <h4>Những gì code hiện có</h4>
+            <ul>
+              <li>Vector search qua Qdrant.</li>
+              <li>Hybrid search: vector + BM25 keyword search trên SQLite FTS5.</li>
+              <li>Parent retrieval: child hits được expand thành parent context nếu bật <code>expand_to_parent</code>.</li>
+              <li>Deduplicate parent contexts theo parent_id nếu bật <code>deduplicate_parents</code>.</li>
+              <li>Query rewrite có code sẵn trong <code>services/query_rewrite.py</code> và được gọi khi request bật cờ.</li>
+            </ul>
+          </div>
+          <div>
+            <h4>Endpoints</h4>
+            <ul>
+              <li><code>POST /v1/retrieve</code> - embed query rồi search vector</li>
+              <li><code>POST /v1/search/vector</code> - search bằng vector đã có</li>
+              <li><code>POST /v1/search/hybrid</code> - vector + BM25 + RRF</li>
+              <li><code>POST /v1/index/chunks</code> - upsert chunks</li>
+              <li><code>DELETE /v1/index/document/{document_id}</code> - xoá vectors của document</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout">
+          <strong>Reranking</strong>
+          <p>
+            Có dấu vết config và schema cho <code>use_reranker</code>, <code>reranker_enabled</code> và <code>RERANKER_MODEL</code>.
+            Tuy nhiên trong các đường gọi chính đã đọc, chưa thấy bước rerank thực thi rõ ràng trong retrieval pipeline.
+            Vì vậy phần reranking được ghi là <strong>Chưa xác định rõ từ code hiện tại</strong> ở mức runtime thực tế.
+          </p>
+        </div>
+
+        <div class="grid-2">
+          <div>
+            <h4>Hybrid search hoạt động thế nào</h4>
+            <ul>
+              <li>Embed query bằng Ollama service.</li>
+              <li>Lấy candidate vector từ Qdrant theo <code>candidate_pool</code>.</li>
+              <li>Lấy candidate keyword từ SQLite FTS5 với bilingual expansion.</li>
+              <li>Gộp bằng RRF với trọng số vector/keyword.</li>
+              <li>Lấy stored parent chunks theo ID để trả context cuối cùng.</li>
+            </ul>
+          </div>
+          <div>
+            <h4>Parent retrieval</h4>
+            <ul>
+              <li>Qdrant lưu child chunks.</li>
+              <li>Retrieval map child hit về parent chunk trong SQLite.</li>
+              <li>Khi <code>expand_to_parent</code> bật, context trả về là parent text thay vì child text đơn lẻ.</li>
+              <li>Điều này phù hợp với cách backend dùng context để sinh câu trả lời có citation.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Thành phần</th><th>Thực tế trong code</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Qdrant collection</td><td><code>global_child_chunks</code> theo default setting</td></tr>
+              <tr><td>Vector DB</td><td>Qdrant embedded qua path hoặc Qdrant server qua URL</td></tr>
+              <tr><td>Keyword search</td><td>SQLite FTS5 + bilingual synonym expansion</td></tr>
+              <tr><td>Query rewrite</td><td>Có code, bật theo <code>enable_query_rewrite</code> hoặc setting</td></tr>
+              <tr><td>Reranker</td><td>Chưa xác định rõ từ code hiện tại</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" id="ollama">
+        <h3>4. Ollama / LLM Service</h3>
+        <p>
+          Ollama service là lớp shield/proxy trước Ollama thật. Backend và retrieval service không gọi trực tiếp Ollama upstream;
+          mọi request đi qua service này để đảm bảo API key, rate limit, và ép model theo cấu hình server.
+        </p>
+
+        <div class="grid-2">
+          <div>
+            <h4>Vai trò</h4>
+            <ul>
+              <li>Bảo vệ bằng header <code>x-api-key</code>.</li>
+              <li>Ép model chat, orchestrator, embedding theo cấu hình server.</li>
+              <li>Giới hạn request/phút và một số giới hạn input.</li>
+              <li>Cung cấp cả route proxy kiểu <code>/v1/*</code> và native <code>/api/*</code>.</li>
+              <li>Vô hiệu hóa <code>/v1/indexing/batch</code> với HTTP 410.</li>
+            </ul>
+          </div>
+          <div>
+            <h4>Endpoints nội bộ</h4>
+            <ul>
+              <li><code>GET /health</code>, <code>GET /ready</code></li>
+              <li><code>GET /v1/models</code>, <code>GET /api/tags</code></li>
+              <li><code>POST /v1/chat</code>, <code>POST /v1/generate</code></li>
+              <li><code>POST /v1/orchestrator/classify</code></li>
+              <li><code>POST /v1/embed</code>, <code>POST /api/embed</code>, <code>POST /api/embeddings</code></li>
+              <li><code>POST /api/chat</code>, <code>POST /api/generate</code></li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout">
+          <strong>Models theo code hiện tại</strong>
+          <p>
+            Chat model mặc định: <code>qwen3:30b-a3-b-instruct-2507-q4_K_M</code>.
+            Orchestrator model mặc định: <code>qwen3:4b-instruct-2507-q4_K_M</code>.
+            Embedding model mặc định: <code>qwen3-embedding:0.6b</code>.
+          </p>
+        </div>
+
+        <p class="note">
+          Backend dùng <code>/api/chat</code> qua LangChain ChatOllama, dùng <code>/api/embed</code> qua OllamaEmbeddings,
+          và dùng <code>/v1/orchestrator/classify</code> để quyết định câu hỏi có cần retrieval hay không.
+        </p>
+      </section>
+
+      <section class="card" id="frontend">
+        <h3>5. Frontend</h3>
+        <p>
+          Frontend là React + Vite app, chỉ gọi backend qua <code>/api</code>. Nó không truy cập trực tiếp ingestion,
+          retrieval, hay Ollama service.
+        </p>
+
+        <div class="grid-2">
+          <div>
+            <h4>Pages / components chính</h4>
+            <ul>
+              <li><code>LoginPage</code> - đăng nhập admin.</li>
+              <li><code>ChatPage</code> - chat UI, SSE stream, hiển thị citation/source cards.</li>
+              <li><code>DocumentsPage</code> - upload, index, xem chunks, reindex.</li>
+              <li><code>UsersPage</code> - quản lý user.</li>
+              <li><code>AdminLayout</code> - sidebar điều hướng admin.</li>
+            </ul>
+          </div>
+          <div>
+            <h4>Luồng người dùng</h4>
+            <ul>
+              <li>Đăng nhập bằng admin account.</li>
+              <li>Upload tài liệu ở Documents page qua form multipart.</li>
+              <li>Bấm Index để gọi backend queue indexing.</li>
+              <li>Chat page gửi câu hỏi sang <code>/api/chat/query</code> và đọc SSE stream.</li>
+              <li>Frontend render sources/citation theo payload trả về từ backend.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout">
+          <strong>Nhận xét thực tế</strong>
+          <p>
+            Frontend hiện có cấu trúc thiên về admin + chat nội bộ. File <code>frontend/src/api.js</code> cấu hình axios
+            mặc định baseURL <code>/api</code> hoặc <code>VITE_API_BASE_URL</code>. Chat page dùng <code>fetch</code> trực tiếp
+            với endpoint SSE để đọc token stream.
+          </p>
+        </div>
+      </section>
+
+      <section class="card" id="storage">
+        <h3>6. Storage / Database</h3>
+        <p>
+          Hệ thống dùng SQLite làm metadata store, filesystem để lưu file upload/cache/logs, và Qdrant làm vector store.
+        </p>
+
+        <div class="grid-2">
+          <div>
+            <h4>SQLite metadata</h4>
+            <ul>
+              <li><code>users</code></li>
+              <li><code>documents</code></li>
+              <li><code>document_chunks</code></li>
+              <li><code>document_index_states</code></li>
+              <li><code>chat_sessions</code></li>
+              <li><code>chat_messages</code></li>
+            </ul>
+          </div>
+          <div>
+            <h4>Filesystem / cache</h4>
+            <ul>
+              <li><code>backend/storage/uploads</code> - file upload gốc</li>
+              <li><code>backend/storage/parsed_markdown_cache</code> - cache markdown parse</li>
+              <li><code>backend/storage/indexes/global_qdrant</code> - Qdrant embedded local path</li>
+              <li><code>backend/storage/logs</code> - log backend</li>
+              <li><code>ingestion_service/storage</code>, <code>retrieval_service/storage</code>, <code>ollama_service/storage</code> - logs/runtime data</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Thành phần</th>
+                <th>Vai trò</th>
+                <th>Ghi chú</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>Qdrant collection</td><td>Vector chunks</td><td>Default <code>global_child_chunks</code></td></tr>
+              <tr><td>SQLite</td><td>Metadata + chat history</td><td>Backend owns schema migrations nhỏ</td></tr>
+              <tr><td>Upload storage</td><td>File gốc để parse/index lại</td><td>Có file hash để detect thay đổi</td></tr>
+              <tr><td>Parsed markdown cache</td><td>Tránh parse lại file cũ</td><td>Cache theo document id + file hash + parser mode</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" id="flows">
+        <h3>7. Data Flow</h3>
+        <p>
+          Các flow dưới đây mô tả logic end-to-end theo code hiện tại. Phần nào chưa đủ tín hiệu trong code sẽ ghi chú rõ.
+        </p>
+
+        <div class="grid-2">
+          <div>
+            <h4>Upload document flow</h4>
+            <ol>
+              <li>Frontend gửi file tới <code>POST /api/documents/upload</code>.</li>
+              <li>Backend lưu file vào <code>backend/storage/uploads</code> và tạo row <code>documents</code> với status <code>uploaded</code>.</li>
+              <li>Admin bấm Index để queue <code>/api/documents/{id}/process</code> hoặc <code>/embed</code>.</li>
+            </ol>
+          </div>
+          <div>
+            <h4>Indexing flow</h4>
+            <ol>
+              <li>Backend chuyển document sang status <code>indexing</code>.</li>
+              <li>Backend gọi ingestion <code>/v1/parse</code> hoặc lấy cache markdown.</li>
+              <li>Ingestion tạo parent chunks và child rows từ markdown sections.</li>
+              <li>Backend ghi parent chunks vào SQLite.</li>
+              <li>Backend gọi ingestion <code>/v1/index/upsert</code>.</li>
+              <li>Ingestion gửi child rows sang retrieval <code>/v1/index/chunks</code>.</li>
+              <li>Retrieval embed + upsert vectors vào Qdrant, sau đó backend cập nhật status <code>embedded</code>.</li>
+            </ol>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div>
+            <h4>Chat / RAG query flow</h4>
+            <ol>
+              <li>Frontend gọi <code>POST /api/chat/query</code> bằng SSE.</li>
+              <li>Backend tạo session nếu cần và lưu user message vào SQLite.</li>
+              <li>Backend dùng orchestrator để quyết định có cần retrieval hay không.</li>
+              <li>Nếu cần, backend gọi retrieval <code>/v1/search/hybrid</code>.</li>
+              <li>Retrieval embed query, search Qdrant + BM25, expand parent context, trả docs.</li>
+              <li>Backend build prompt và gọi Ollama service để sinh answer stream.</li>
+              <li>Backend lưu assistant message cùng sources_json vào SQLite và stream token về frontend.</li>
+            </ol>
+          </div>
+          <div>
+            <h4>Retrieval-only flow</h4>
+            <ol>
+              <li>API tồn tại rõ nhất ở retrieval service: <code>/v1/retrieve</code>, <code>/v1/search/vector</code>, <code>/v1/search/hybrid</code>.</li>
+              <li>Backend hiện chủ yếu dùng retrieval như một bước trong RAG chat, không thấy UI frontend gọi retrieval trực tiếp.</li>
+              <li>Vì vậy retrieval-only flow là luồng nội bộ phục vụ backend, không phải luồng chính trên UI.</li>
+            </ol>
+          </div>
+        </div>
+
+        <div class="callout warn">
+          <strong>Error flow cơ bản</strong>
+          <ul>
+            <li>Document đang index sẽ trả <code>409</code> khi queue lại.</li>
+            <li>Thiếu file upload hoặc document không tồn tại sẽ trả <code>404</code>.</li>
+            <li>Ingestion parse/split lỗi thường trả <code>400</code>; lỗi gọi service ngoài có thể được map thành <code>502</code>.</li>
+            <li>Backend readiness sẽ trả <code>503</code> nếu một dependency không sẵn sàng.</li>
+            <li>Ollama service bảo vệ bằng <code>x-api-key</code>; thiếu key trả <code>401</code>, sai key trả <code>403</code>.</li>
+            <li>Retrieval service ready trả <code>503</code> nếu Qdrant hoặc Ollama embedding không sẵn sàng.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="card" id="diagrams">
+        <h3>8. Sơ đồ</h3>
+        <p>Ba sơ đồ Mermaid dưới đây mô tả overall architecture, indexing pipeline, và query/RAG pipeline.</p>
+
+        <div class="diagram-card">
+          <div class="diagram-title">Overall system architecture</div>
+          <div class="mermaid">
+flowchart LR
+  FE[Frontend\nReact + Vite] --> BE[Backend / API Gateway\nFastAPI]
+  BE --> IN[Ingestion Service\nparse + section chunk + build bundle]
+  BE --> RE[Retrieval Service\nQdrant + BM25 + parent expansion]
+  BE --> OS[Ollama Service\nshield / proxy]
+  IN --> RE
+  RE --> QD[(Qdrant / SQLite metadata)]
+  OS --> OL[(Ollama runtime)]
+  BE --> DB[(SQLite metadata)]
+  BE --> FS[(Uploads / parsed cache / logs)]
+  RE --> OL
+          </div>
+        </div>
+
+        <div class="diagram-card">
+          <div class="diagram-title">Indexing pipeline</div>
+          <div class="mermaid">
+flowchart TD
+  A[Frontend upload file] --> B[Backend POST /api/documents/upload]
+  B --> C[Save file to backend/storage/uploads]
+  B --> D[Create document row status=uploaded]
+  D --> E[Queue /api/documents/{id}/process or /embed]
+  E --> F[Backend parse/cached markdown via ingestion /v1/parse]
+  F --> G[Ingestion build /v1/index/build-from-markdown]
+  G --> H[Parse sections + parent-child chunking]
+  H --> I[Backend writes parent chunks to SQLite]
+  I --> J[Backend upserts child_rows via ingestion /v1/index/upsert]
+  J --> K[Retrieval /v1/index/chunks embeds + upserts Qdrant]
+  K --> L[Backend updates index state + status embedded]
+          </div>
+        </div>
+
+        <div class="diagram-card">
+          <div class="diagram-title">Query / RAG pipeline</div>
+          <div class="mermaid">
+sequenceDiagram
+  participant U as Frontend
+  participant B as Backend
+  participant R as Retrieval Service
+  participant O as Ollama Service
+  participant Q as Qdrant / SQLite
+
+  U->>B: POST /api/chat/query (SSE)
+  B->>B: Save user message + resolve session
+  B->>O: /v1/orchestrator/classify (optional)
+  alt needs retrieval
+    B->>R: POST /v1/search/hybrid
+    R->>O: POST /v1/embed
+    R->>Q: vector search + BM25 + parent expansion
+    R-->>B: contexts + scores + metadata
+  else direct answer
+    B->>B: Skip retrieval
+  end
+  B->>O: POST /api/chat for generation
+  O-->>B: token stream / final answer
+  B->>B: Save assistant message + sources_json
+  B-->>U: SSE tokens + sources + done
+          </div>
+        </div>
+      </section>
+
+      <section class="card" id="sources">
+        <h3>Nguồn tham chiếu chính</h3>
+        <p class="note">Các file dưới đây là điểm bám chính để đọc sâu thêm. Đây là nguồn cho mọi nhận định trong trang này.</p>
+        <div class="source-list">
+          <div class="source-item"><div class="path">backend/app/main.py</div><div>Backend entrypoint, health/ready, routers.</div></div>
+          <div class="source-item"><div class="path">backend/app/api/documents.py</div><div>Upload, process, parse, chunks, reindex, delete.</div></div>
+          <div class="source-item"><div class="path">backend/app/api/chat.py</div><div>Chat sessions và SSE query pipeline.</div></div>
+          <div class="source-item"><div class="path">backend/app/services/*.py</div><div>Clients gọi ingestion / retrieval / ollama và orchestration runtime.</div></div>
+          <div class="source-item"><div class="path">ingestion_service/app/*</div><div>Parse, markdown sections, parent-child chunking, index bundle.</div></div>
+          <div class="source-item"><div class="path">retrieval_service/app/*</div><div>Qdrant, BM25, hybrid search, parent expansion, query rewrite.</div></div>
+          <div class="source-item"><div class="path">ollama_service/app/*</div><div>Shield/proxy, auth, rate limit, chat/generate/embed routes.</div></div>
+          <div class="source-item"><div class="path">frontend/src/*</div><div>Login, chat, documents, users, admin layout, API client.</div></div>
+        </div>
+      </section>
+
+      <section class="card" id="open-questions">
+        <h3>Điểm chưa rõ cần developer xác nhận</h3>
+        <ul>
+          <li><strong>Reranker runtime:</strong> Có config và schema cho reranker, nhưng chưa thấy đoạn thực thi rerank rõ ràng trong pipeline retrieval hiện tại.</li>
+          <li><strong>Query rewrite mặc định:</strong> Code có hỗ trợ, nhưng cần xác nhận biến môi trường runtime có bật hay không trong deployment thực tế.</li>
+          <li><strong>Retrieval-only UI:</strong> Có API retrieval-only ở service, nhưng frontend hiện không có màn hình gọi trực tiếp luồng này.</li>
+          <li><strong>Ollama upstream topology:</strong> Shield đọc upstream qua <code>UPSTREAM_OLLAMA_BASE_URL</code>/<code>OLLAMA_UPSTREAM_BASE_URL</code>/<code>OLLAMA_BASE_URL</code>, nhưng giá trị deploy thật cần xác nhận để tránh trỏ nhầm vào chính shield.</li>
+          <li><strong>Qdrant mode:</strong> Code hỗ trợ embedded path hoặc Qdrant server URL; môi trường production đang dùng kiểu nào thì nên xác nhận thêm.</li>
+        </ul>
+      </section>
+
+      <div class="footer-gap"></div>
+    </main>
+  </div>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "base",
+      securityLevel: "strict",
+      themeVariables: {
+        fontFamily: "Inter, Segoe UI, Arial, sans-serif",
+        primaryColor: "#fff5eb",
+        primaryTextColor: "#1f2428",
+        primaryBorderColor: "#c2410c",
+        lineColor: "#8a7f71",
+        tertiaryColor: "#f4efe8",
+      },
+    });
+  </script>
+</body>
+</html>

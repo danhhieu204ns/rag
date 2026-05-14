@@ -94,6 +94,7 @@ class QueryLog:
         self._keyword: dict[str, Any] = {}        # keyword_candidates_*_done
         self._rrf: dict[str, Any] = {}            # rrf_merge_done
         self._rerank: dict[str, Any] = {}         # rerank_documents
+        self._retrieval_service: dict[str, Any] = {}  # delegated retrieval_service summary
         self._final_chunks: list[dict[str, Any]] = []  # similarity_search_done
         self._timing: dict[str, float] = {}       # similarity_search_timing
 
@@ -157,6 +158,9 @@ class QueryLog:
 
             elif event == "similarity_search_timing":
                 self._timing = details.get("stage_timings_ms", {})
+
+            elif event == "retrieval_service_done":
+                self._retrieval_service = details
 
     def record_generation_start(self) -> None:
         self._gen_started_at = time.perf_counter()
@@ -234,21 +238,11 @@ class QueryLog:
         lines.append(f"\n▶ ORCHESTRATOR{orch_ms_str}")
         od = self._orchestrator
         if od:
-            from .settings import settings as _s
             kv("  Query type", od.get("query_type", "?"))
             kv("  Output mode", od.get("output_mode", "qa"))
             kv("  Strategy", od.get("strategy", "?"))
             kv("  Top-K (plan)", od.get("top_k", "?"))
-            v_w = od.get("vector_rrf_weight", "?")
-            k_w = od.get("keyword_rrf_weight", "?")
-            v_def = _s.hybrid_vector_rrf_weight
-            k_def = _s.hybrid_keyword_rrf_weight
-            v_mark = "  ← tuned" if isinstance(v_w, float) and abs(v_w - v_def) > 0.05 else ""
-            k_mark = "  ← tuned" if isinstance(k_w, float) and abs(k_w - k_def) > 0.05 else ""
-            kv("  Vector RRF weight", f"{v_w}{v_mark}")
-            kv("  Keyword RRF weight", f"{k_w}{k_mark}")
-            kv("  Reranker", "on" if od.get("use_reranker") else "off")
-            kv("  Candidate pool", od.get("candidate_pool", "?"))
+            kv("  Retrieval defaults", od.get("retrieval_defaults_source", "retrieval_service"))
             kv("  Max iterations", od.get("max_iterations", 1))
             kv("  Signals", ", ".join(od.get("signals", [])) or "-")
             if self._orchestrator_retries:
@@ -265,6 +259,8 @@ class QueryLog:
 
         # 1c. Semantic Search
         sem_ms = self._timing.get("semantic_candidates", 0.0)
+        retrieval_service_ms = self._timing.get("retrieval_service", 0.0)
+        retrieval_skipped = self._orchestrator.get("requires_retrieval") is False
         lines.append(f"\n▶ SEMANTIC SEARCH (vector)  [{sem_ms:.1f}ms]")
 
         hits = self._qdrant_hits.get("points_preview", [])
@@ -285,12 +281,33 @@ class QueryLog:
             child_types = d.get("semantic_child_type_preview", {})
             n = min(self._top_k, len(parent_ids))
             kv("  Parent chunks tổng", len(parent_ids))
+            sem_chunks: dict[int, dict[str, Any]] = {
+                int(c["chunk_id"]): c
+                for c in d.get("semantic_selected_chunks", [])
+                if c.get("chunk_id") is not None
+            }
             lines.append(f"  Top {n} parent chunk IDs:")
-            lines.append(f"    {'rank':<7}  {'chunk_id':<12}  child_type")
-            lines.append("    " + "-" * 34)
-            for i, cid in enumerate(parent_ids[:n], start=1):
-                ct = child_types.get(cid, "")
-                lines.append(f"    #{i:<6}  {str(cid):<12}  {ct}")
+            if sem_chunks:
+                lines.append(f"    {'rank':<7}  {'chunk_id':<12}  {'score':<10}  page   excerpt")
+                lines.append("    " + "-" * 66)
+                for i, cid in enumerate(parent_ids[:n], start=1):
+                    info = sem_chunks.get(int(cid), {})
+                    score = info.get("score", "n/a")
+                    sc_str = f"{score:.4f}" if isinstance(score, float) else str(score)
+                    page = info.get("page") or "-"
+                    excerpt = _preview(str(info.get("content", "")), 34)
+                    lines.append(f"    #{i:<6}  {str(cid):<12}  {sc_str:<10}  {str(page):<5}  {excerpt}")
+            else:
+                lines.append(f"    {'rank':<7}  {'chunk_id':<12}  child_type")
+                lines.append("    " + "-" * 34)
+                for i, cid in enumerate(parent_ids[:n], start=1):
+                    ct = child_types.get(cid, "")
+                    lines.append(f"    #{i:<6}  {str(cid):<12}  {ct}")
+        elif retrieval_skipped:
+            kv("  Trạng thái", "skipped by orchestrator (requires_retrieval=false)")
+        elif self._retrieval_service:
+            kv("  Trạng thái", "delegated to retrieval_service")
+            kv("  Service elapsed", f"{retrieval_service_ms:.1f}ms")
         else:
             kv("  Trạng thái", "no data")
 
@@ -330,6 +347,13 @@ class QueryLog:
                 lines.append("    " + "-" * 32)
                 for i, cid in enumerate(selected[:n], start=1):
                     lines.append(f"    #{i:<6}  {str(cid):<12}  n/a (qdrant fast-path)")
+        elif retrieval_skipped:
+            kv("  Trạng thái", "skipped by orchestrator (requires_retrieval=false)")
+        elif self._retrieval_service:
+            kv("  Trạng thái", "delegated to retrieval_service")
+            modes = self._retrieval_service.get("mode_counts", {})
+            if modes:
+                kv("  Returned modes", modes)
         else:
             kv("  Trạng thái", "no data")
 
@@ -358,21 +382,42 @@ class QueryLog:
                 in_k = cid in kw_set
                 mode = "hybrid" if in_v and in_k else ("vector" if in_v else "keyword")
                 lines.append(f"    #{i:<6}  {str(cid):<12}  {score:<14.6f}  {mode}")
+        elif retrieval_skipped:
+            kv("  Trạng thái", "skipped by orchestrator (requires_retrieval=false)")
+        elif self._retrieval_service:
+            kv("  Trạng thái", "delegated to retrieval_service")
+            kv("  Returned contexts", self._retrieval_service.get("raw_context_count", 0))
         else:
             kv("  Trạng thái", "no data")
 
         # 1e. Reranking
         rerank_ms = self._timing.get("reranker", 0.0)
-        lines.append(f"\n▶ RERANKING ({settings.reranker_model})  [{rerank_ms:.1f}ms]")
+        reranker_model = (
+            self._rerank.get("model")
+            or self._retrieval_service.get("reranker_model")
+            or "retrieval_service"
+        )
+        lines.append(f"\n▶ RERANKING ({reranker_model})  [{rerank_ms:.1f}ms]")
         d = self._rerank
         if d:
             in_c = d.get("input_count", 0)
             out_c = d.get("output_count", 0)
+            status = d.get("status")
             kv("  Input → Output", f"{in_c} → {out_c} chunks")
-            kv("  Top score trước rerank", f"{d.get('original_top_score', 0.0):.4f}")
-            kv("  Top score sau rerank", f"{d.get('reranked_top_score', 0.0):.4f}")
-        elif not settings.reranker_enabled:
-            kv("  Trạng thái", "disabled")
+            if status:
+                kv("  Status", status)
+            original_score = d.get("original_top_score")
+            reranked_score = d.get("reranked_top_score")
+            if isinstance(original_score, (int, float)):
+                kv("  Top score trước rerank", f"{original_score:.4f}")
+            if isinstance(reranked_score, (int, float)):
+                kv("  Top score sau rerank", f"{reranked_score:.4f}")
+            if d.get("error"):
+                kv("  Error", d.get("error"))
+        elif retrieval_skipped:
+            kv("  Trạng thái", "skipped by orchestrator (requires_retrieval=false)")
+        elif self._retrieval_service:
+            kv("  Trạng thái", self._retrieval_service.get("reranker_status", "delegated to retrieval_service"))
         else:
             kv("  Trạng thái", "skipped (pool size <= top_k)")
 
@@ -381,7 +426,12 @@ class QueryLog:
         kw_ms_v = self._timing.get("keyword_candidates", 0.0)
         parallel_wall = max(sem_ms_v, kw_ms_v)
         rewrite_ms = self._timing.get("query_rewrite", 0.0)
-        retrieval_total = rewrite_ms + parallel_wall + rrf_ms + rerank_ms
+        embed_ms = self._timing.get("query_embedding", 0.0)
+        retrieval_total = (
+            retrieval_service_ms
+            if retrieval_service_ms > 0
+            else rewrite_ms + parallel_wall + rrf_ms + rerank_ms
+        )
         lines.append(f"\n▶ KẾT QUẢ CUỐI RETRIEVAL  [tổng wall-clock: {retrieval_total:.1f}ms]")
         if self._final_chunks:
             lines.append(
@@ -404,6 +454,10 @@ class QueryLog:
                     f"  #{str(rank):<6}  {str(cid):<10}  {mode:<10}  "
                     f"{rscore:<12.4f}  {rerank_str:<14}  {str(page):<5}  {_preview(str(fname), 26)}"
                 )
+        elif retrieval_skipped:
+            kv("  Trạng thái", "skipped by orchestrator (requires_retrieval=false)")
+        elif self._retrieval_service:
+            kv("  Trạng thái", "retrieval_service returned 0 contexts")
         else:
             kv("  Trạng thái", "no data")
 
@@ -422,6 +476,10 @@ class QueryLog:
             kv("Orchestrator classify", f"{self._orchestrator_ms:.2f}ms{retry_note}", indent=2)
         if rewrite_ms > 0:
             kv("Query rewrite", f"{rewrite_ms:.1f}ms", indent=2)
+        if embed_ms > 0:
+            kv("Query embedding", f"{embed_ms:.1f}ms", indent=2)
+        if retrieval_service_ms > 0:
+            kv("Retrieval service", f"{retrieval_service_ms:.1f}ms", indent=2)
         kv("Semantic search", f"{sem_ms_v:.1f}ms", indent=2)
         kv("Keyword search", f"{kw_ms_v:.1f}ms  (chạy song song với semantic)", indent=2)
         kv("Parallel wall-clock", f"{parallel_wall:.1f}ms  (= max của 2 bước trên)", indent=2)

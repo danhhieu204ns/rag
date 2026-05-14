@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
@@ -13,6 +14,7 @@ from ..core.settings import settings
 from ..schemas import ChunkIndexItem, ContextItem, RetrievalFilters
 from .chunk_store import StoredChunk, load_chunks_by_ids, search_keyword_candidates
 from .parent_retrieval import ChildHit, ParentRecord, expand_child_hits_to_parent_contexts
+from .reranker import rerank_contexts
 
 _client: QdrantClient | None = None
 
@@ -365,22 +367,62 @@ def _context_from_stored_chunk(
     )
 
 
+def _debug_preview_text(value: str, limit: int = 160) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _debug_source_file(metadata: dict[str, Any]) -> str | None:
+    source_info = metadata.get("source_info")
+    if isinstance(source_info, dict):
+        file_name = str(source_info.get("file_name") or "").strip()
+        if file_name:
+            return file_name
+    return _source_from_metadata(metadata)
+
+
+def _context_debug_item(item: ContextItem, rank: int) -> dict[str, Any]:
+    metadata = item.metadata if isinstance(item.metadata, dict) else {}
+    return {
+        "rank": rank,
+        "chunk_id": item.chunk_id,
+        "document_id": item.document_id,
+        "score": item.score,
+        "page": item.page,
+        "file": _debug_source_file(metadata),
+        "content": _debug_preview_text(item.content),
+    }
+
+
+def _stored_chunk_debug_item(chunk: StoredChunk, score: float, rank: int) -> dict[str, Any]:
+    return {
+        "rank": rank,
+        "chunk_id": chunk.chunk_id,
+        "document_id": chunk.document_id,
+        "score": score,
+        "page": chunk.source_page,
+        "file": _debug_source_file(chunk.source_metadata or {}),
+        "content": _debug_preview_text(chunk.content),
+    }
+
+
 def _merge_hybrid_ids(
     *,
     vector_ids: list[int],
     keyword_ids: list[int],
     top_k: int,
+    rrf_k: int,
     vector_weight: float = 1.0,
     keyword_weight: float = 1.0,
 ) -> tuple[list[int], dict[int, float]]:
-    rrf_k = 60.0
+    rrf_k_float = float(rrf_k)
     scores: dict[int, float] = {}
 
     for rank, chunk_id in enumerate(vector_ids, start=1):
-        scores[chunk_id] = scores.get(chunk_id, 0.0) + (vector_weight / (rrf_k + rank))
+        scores[chunk_id] = scores.get(chunk_id, 0.0) + (vector_weight / (rrf_k_float + rank))
 
     for rank, chunk_id in enumerate(keyword_ids, start=1):
-        scores[chunk_id] = scores.get(chunk_id, 0.0) + (keyword_weight / (rrf_k + rank))
+        scores[chunk_id] = scores.get(chunk_id, 0.0) + (keyword_weight / (rrf_k_float + rank))
 
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     return [chunk_id for chunk_id, _ in ranked[:top_k]], scores
@@ -396,18 +438,26 @@ def search_hybrid_contexts(
     vector_weight: float = 1.0,
     keyword_weight: float = 1.0,
     candidate_pool: int | None = None,
+    use_reranker: bool | None = None,
+    debug: dict[str, Any] | None = None,
 ) -> list[ContextItem]:
+    effective_use_reranker = settings.reranker_enabled if use_reranker is None else use_reranker
     if candidate_pool is None:
-        candidate_pool = max(top_k * 4, top_k)
+        candidate_pool = max(top_k * settings.hybrid_probe_multiplier, top_k)
+        if effective_use_reranker:
+            candidate_pool = max(candidate_pool, settings.reranker_candidate_pool)
     else:
         candidate_pool = max(candidate_pool, top_k)
+    merge_limit = candidate_pool if effective_use_reranker else top_k
 
+    vector_started_at = time.perf_counter()
     vector_contexts = search_contexts(
         vector=vector,
         name=name,
         top_k=candidate_pool,
         filters=filters,
     )
+    vector_elapsed_ms = round((time.perf_counter() - vector_started_at) * 1000, 2)
     vector_by_id = {
         int(item.chunk_id): item
         for item in vector_contexts
@@ -415,26 +465,70 @@ def search_hybrid_contexts(
     }
     vector_ids = list(vector_by_id)
 
+    keyword_started_at = time.perf_counter()
     keyword_candidates = search_keyword_candidates(
         query=query,
         limit=candidate_pool,
         filters=filters,
     )
+    keyword_elapsed_ms = round((time.perf_counter() - keyword_started_at) * 1000, 2)
     keyword_by_id = {item.chunk_id: (item, score) for item, score in keyword_candidates}
     keyword_ids = list(keyword_by_id)
 
+    merge_started_at = time.perf_counter()
     merged_ids, merged_scores = _merge_hybrid_ids(
         vector_ids=vector_ids,
         keyword_ids=keyword_ids,
-        top_k=top_k,
+        top_k=merge_limit,
+        rrf_k=settings.hybrid_rrf_k,
         vector_weight=vector_weight,
         keyword_weight=keyword_weight,
     )
+    merge_elapsed_ms = round((time.perf_counter() - merge_started_at) * 1000, 2)
+    if debug is not None:
+        debug.update(
+            {
+                "top_k": top_k,
+                "candidate_pool": candidate_pool,
+                "vector_weight": vector_weight,
+                "keyword_weight": keyword_weight,
+                "rrf_k": settings.hybrid_rrf_k,
+                "reranker_enabled": effective_use_reranker,
+                "timings_ms": {
+                    "semantic_candidates": vector_elapsed_ms,
+                    "keyword_candidates": keyword_elapsed_ms,
+                    "rrf_merge": merge_elapsed_ms,
+                },
+                "vector_candidates": [
+                    _context_debug_item(item, rank)
+                    for rank, item in enumerate(vector_contexts, start=1)
+                ],
+                "keyword_candidates": [
+                    _stored_chunk_debug_item(chunk, score, rank)
+                    for rank, (chunk, score) in enumerate(keyword_candidates, start=1)
+                ],
+                "rrf_score_preview": [
+                    {"chunk_id": chunk_id, "score": merged_scores.get(chunk_id, 0.0)}
+                    for chunk_id in merged_ids
+                ],
+            }
+        )
     if not merged_ids:
+        if debug is not None:
+            debug["merged_candidates"] = []
+            debug["mode_counts"] = {}
+            debug["reranker"] = {
+                "enabled": effective_use_reranker,
+                "model": settings.reranker_model,
+                "input_count": 0,
+                "output_count": 0,
+                "status": "skipped_empty_pool",
+            }
         return []
 
     stored_chunks = load_chunks_by_ids(merged_ids)
     contexts: list[ContextItem] = []
+    mode_counts: dict[str, int] = {}
     for chunk_id in merged_ids:
         in_vector = chunk_id in vector_by_id
         in_keyword = chunk_id in keyword_by_id
@@ -444,6 +538,7 @@ def search_hybrid_contexts(
             mode = "keyword"
         else:
             mode = "vector"
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
 
         stored = stored_chunks.get(chunk_id)
         if stored is not None:
@@ -485,4 +580,51 @@ def search_hybrid_contexts(
             )
         )
 
-    return contexts[:top_k]
+    if debug is not None:
+        debug["mode_counts"] = mode_counts
+        debug["merged_candidates"] = [
+            {
+                **_context_debug_item(item, rank),
+                "mode": item.metadata.get("retrieval_mode")
+                if isinstance(item.metadata, dict) else None,
+                "rrf_score": item.score,
+            }
+            for rank, item in enumerate(contexts[:top_k], start=1)
+        ]
+
+    if effective_use_reranker:
+        rerank_started_at = time.perf_counter()
+        final_contexts, reranker_debug = rerank_contexts(
+            query=query,
+            contexts=contexts,
+            top_k=top_k,
+            enabled=True,
+        )
+        reranker_elapsed_ms = round((time.perf_counter() - rerank_started_at) * 1000, 2)
+    else:
+        final_contexts, reranker_debug = rerank_contexts(
+            query=query,
+            contexts=contexts,
+            top_k=top_k,
+            enabled=False,
+        )
+        reranker_elapsed_ms = 0.0
+
+    if debug is not None:
+        timings = debug.setdefault("timings_ms", {})
+        if isinstance(timings, dict):
+            timings["reranker"] = reranker_elapsed_ms
+        debug["reranker"] = reranker_debug
+        debug["final_candidates"] = [
+            {
+                **_context_debug_item(item, rank),
+                "mode": item.metadata.get("retrieval_mode")
+                if isinstance(item.metadata, dict) else None,
+                "rrf_score": item.score,
+                "reranker_score": item.metadata.get("reranker_score")
+                if isinstance(item.metadata, dict) else None,
+            }
+            for rank, item in enumerate(final_contexts, start=1)
+        ]
+
+    return final_contexts

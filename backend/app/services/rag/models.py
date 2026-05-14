@@ -85,26 +85,6 @@ def _get_variant_llm() -> ChatOllama:
     return _variant_llm
 
 def get_reranker() -> Any:
-    """Lazy-load CrossEncoder reranker."""
-    global _reranker
-    if _reranker is None and settings.reranker_enabled:
-        try:
-            from sentence_transformers import CrossEncoder
-            _reranker = CrossEncoder(
-                settings.reranker_model,
-                max_length=512,
-            )
-            logger.info(
-                "[reranker] Loaded CrossEncoder: model=%s",
-                settings.reranker_model,
-            )
-        except ImportError:
-            logger.error(
-                "[reranker] sentence-transformers not installed. "
-                "Run: pip install sentence-transformers"
-            )
-            return None
-        except Exception as e:
-            logger.error("[reranker] Failed to load reranker: %s", str(e))
-            return None
-    return _reranker
+    """Backward-compatible stub; reranking is owned by retrieval_service."""
+    logger.debug("[reranker] Backend reranker disabled; retrieval_service owns reranking.")
+    return None

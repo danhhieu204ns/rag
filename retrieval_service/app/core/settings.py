@@ -22,8 +22,14 @@ class Settings:
     expand_to_parent: bool
     deduplicate_parents: bool
     top_k_children: int
-    final_top_k_parents: int
     request_timeout_seconds: float
+    hybrid_probe_multiplier: int
+    hybrid_rrf_k: int
+    hybrid_vector_rrf_weight: float
+    hybrid_keyword_rrf_weight: float
+    reranker_enabled: bool
+    reranker_model: str
+    reranker_candidate_pool: int
     bm25_enabled: bool
     bm25_bilingual_expansion: bool
     bm25_candidate_limit_multiplier: int
@@ -116,8 +122,14 @@ def get_settings() -> Settings:
         expand_to_parent=_bool_env("RETRIEVAL_EXPAND_TO_PARENT", True),
         deduplicate_parents=_bool_env("RETRIEVAL_DEDUPLICATE_PARENTS", True),
         top_k_children=max(1, _int_env("RETRIEVAL_TOP_K_CHILDREN", 20)),
-        final_top_k_parents=max(1, _int_env("RETRIEVAL_FINAL_TOP_K_PARENTS", 5)),
         request_timeout_seconds=_float_env("RETRIEVAL_TIMEOUT_SECONDS", 180.0),
+        hybrid_probe_multiplier=max(1, _int_env("HYBRID_PROBE_MULTIPLIER", 4)),
+        hybrid_rrf_k=max(1, _int_env("HYBRID_RRF_K", 60)),
+        hybrid_vector_rrf_weight=_float_env("HYBRID_VECTOR_RRF_WEIGHT", 1.0),
+        hybrid_keyword_rrf_weight=_float_env("HYBRID_KEYWORD_RRF_WEIGHT", 1.0),
+        reranker_enabled=_bool_env("RERANKER_ENABLED", True),
+        reranker_model=_string_env("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
+        reranker_candidate_pool=max(1, _int_env("RERANKER_CANDIDATE_POOL", 20)),
         bm25_enabled=_bool_env("BM25_ENABLED", True),
         bm25_bilingual_expansion=_bool_env("BM25_BILINGUAL_EXPANSION", True),
         bm25_candidate_limit_multiplier=max(1, _int_env("BM25_CANDIDATE_LIMIT_MULTIPLIER", 10)),

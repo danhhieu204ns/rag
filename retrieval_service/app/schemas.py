@@ -42,6 +42,7 @@ class ContextItem(BaseModel):
 
 class RetrieveResponse(BaseModel):
     contexts: list[ContextItem]
+    debug: dict[str, Any] = Field(default_factory=dict)
 
 
 class ChunkIndexItem(BaseModel):
