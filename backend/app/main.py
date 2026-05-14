@@ -55,19 +55,20 @@ def _timed_step(name: str, logger: logging.Logger, **context):
 
 
 def _configure_backend_file_logging() -> logging.Logger:
+    # Disabled file logging
     root = logging.getLogger("app.main")
     root.setLevel(logging.INFO)
-    log_dir = Path(__file__).resolve().parents[1] / "storage" / "logs"
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = log_dir / ("backend_service_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S") + ".log")
-    from logging.handlers import RotatingFileHandler
-
-    formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)-12s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    fh = RotatingFileHandler(str(log_path), maxBytes=10_000_000, backupCount=5, encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(formatter)
-    if not any(isinstance(h, RotatingFileHandler) and h.baseFilename == str(log_path) for h in root.handlers):
-        root.addHandler(fh)
+    # log_dir = Path(__file__).resolve().parents[1] / "storage" / "logs"
+    # os.makedirs(log_dir, exist_ok=True)
+    # log_path = log_dir / ("backend_service_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S") + ".log")
+    # from logging.handlers import RotatingFileHandler
+    #
+    # formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)-12s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    # fh = RotatingFileHandler(str(log_path), maxBytes=10_000_000, backupCount=5, encoding="utf-8")
+    # fh.setLevel(logging.INFO)
+    # fh.setFormatter(formatter)
+    # if not any(isinstance(h, RotatingFileHandler) and h.baseFilename == str(log_path) for h in root.handlers):
+    #     root.addHandler(fh)
     return root
 
 
