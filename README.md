@@ -472,6 +472,7 @@ Xem [backend/README.md](backend/README.md#api-endpoints) để chi tiết đầy
 **Legacy/Advanced** (không khuyến nghị thay đổi):
 - `RETRIEVAL_SEARCH_CHILD_CHUNKS`: Search strategy
 - `HYBRID_PROBE_MULTIPLIER`, `HYBRID_RRF_K`: Hybrid search tuning
+- `BM25_ENABLED`, `BM25_BILINGUAL_EXPANSION`, `BM25_EXTRA_SYNONYMS`: Keyword/BM25 retrieval tuning in `retrieval_service`
 - `RERANKER_ENABLED`, `RERANKER_MODEL`: Reranking parameters
 
 ## Dữ liệu runtime

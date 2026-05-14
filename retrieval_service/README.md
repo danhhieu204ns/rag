@@ -48,16 +48,25 @@ Example retrieve:
 }
 ```
 
-`/v1/search/hybrid` combines vector retrieval from Qdrant with keyword matching
-over `document_chunks` in the shared metadata database, then merges candidates
-with reciprocal-rank fusion. The route keeps the same contract as `/v1/retrieve`
-so the Orchestrator does not need to know the retrieval strategy.
+`/v1/search/hybrid` combines vector retrieval from Qdrant with BM25 keyword
+retrieval over `document_chunks` in the shared metadata database, then merges
+candidates with reciprocal-rank fusion. The route keeps the same contract as
+`/v1/retrieve` so the Orchestrator does not need to know the retrieval strategy.
+
+BM25 uses SQLite FTS5 and indexes parent chunk content plus selected metadata
+fields: title, heading path, `search_optimization` keywords, document codes,
+dates, source info, and a bilingual alias field. Vietnamese-English expansion
+is enabled by default so Vietnamese queries can match common English terms such
+as `annual leave`, `policy`, `contract`, and `performance review`. Add
+domain-specific terms through `BM25_EXTRA_SYNONYMS`.
 
 ## Configuration
 
 - See `.env.example` for supported environment variables and defaults.
 - Important vars: `OLLAMA_SERVICE_URL`, `OLLAMA_API_KEY`, `QDRANT_URL` / `QDRANT_PATH`,
   `QDRANT_COLLECTION_NAME`, and database path `RETRIEVAL_DATABASE_PATH`.
+- BM25 vars: `BM25_ENABLED`, `BM25_BILINGUAL_EXPANSION`,
+  `BM25_CANDIDATE_LIMIT_MULTIPLIER`, `BM25_EXTRA_SYNONYMS`.
 
 ## Dependencies
 

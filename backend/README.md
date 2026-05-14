@@ -392,6 +392,8 @@ QDRANT_API_KEY=                             # Required if QDRANT_URL is set
 ```
 
 Backend không query Qdrant trực tiếp trong runtime chat/retrieval. Qdrant được quản lý bởi `retrieval_service`.
+Keyword retrieval cũng nằm trong `retrieval_service`: `/v1/search/hybrid` dùng BM25
+trên SQLite FTS5 của bảng `document_chunks`, rồi fuse với vector search bằng RRF.
 
 ### Document Processing
 

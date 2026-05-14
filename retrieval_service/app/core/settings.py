@@ -24,6 +24,10 @@ class Settings:
     top_k_children: int
     final_top_k_parents: int
     request_timeout_seconds: float
+    bm25_enabled: bool
+    bm25_bilingual_expansion: bool
+    bm25_candidate_limit_multiplier: int
+    bm25_extra_synonyms: str
 
 
 def _string_env(name: str, default: str) -> str:
@@ -114,6 +118,10 @@ def get_settings() -> Settings:
         top_k_children=max(1, _int_env("RETRIEVAL_TOP_K_CHILDREN", 20)),
         final_top_k_parents=max(1, _int_env("RETRIEVAL_FINAL_TOP_K_PARENTS", 5)),
         request_timeout_seconds=_float_env("RETRIEVAL_TIMEOUT_SECONDS", 180.0),
+        bm25_enabled=_bool_env("BM25_ENABLED", True),
+        bm25_bilingual_expansion=_bool_env("BM25_BILINGUAL_EXPANSION", True),
+        bm25_candidate_limit_multiplier=max(1, _int_env("BM25_CANDIDATE_LIMIT_MULTIPLIER", 10)),
+        bm25_extra_synonyms=_string_env("BM25_EXTRA_SYNONYMS", ""),
     )
 
 
