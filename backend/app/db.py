@@ -59,6 +59,42 @@ def _ensure_document_chunk_columns() -> None:
             )
 
 
+def _ensure_chat_session_user_ownership() -> None:
+    """Add chat_sessions.user_id and backfill old rows for per-user chat isolation."""
+
+    with engine.begin() as connection:
+        has_chat_sessions = connection.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='chat_sessions'")
+        ).fetchone()
+        if not has_chat_sessions:
+            return
+
+        columns_info = connection.execute(text("PRAGMA table_info(chat_sessions)")).fetchall()
+        existing_columns = {str(row[1]) for row in columns_info}
+
+        if "user_id" not in existing_columns:
+            connection.execute(text("ALTER TABLE chat_sessions ADD COLUMN user_id INTEGER"))
+            connection.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_chat_sessions_user_id ON chat_sessions(user_id)")
+            )
+
+        fallback_user_row = connection.execute(
+            text(
+                "SELECT id FROM users "
+                "ORDER BY CASE WHEN role = 'admin' THEN 0 ELSE 1 END, id ASC "
+                "LIMIT 1"
+            )
+        ).fetchone()
+        if fallback_user_row is None:
+            return
+
+        fallback_user_id = int(fallback_user_row[0])
+        connection.execute(
+            text("UPDATE chat_sessions SET user_id = :uid WHERE user_id IS NULL"),
+            {"uid": fallback_user_id},
+        )
+
+
 
 def get_db() -> Generator[Session, None, None]:
     """Yield one database session per request."""
@@ -99,6 +135,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_document_chunk_columns()
     _seed_admin()
+    _ensure_chat_session_user_ownership()
 
 
 def _seed_admin() -> None:

@@ -17,6 +17,11 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(20), default="user", nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    chat_sessions: Mapped[list[ChatSession]] = relationship(
+        "ChatSession",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
 
 class Document(Base):
@@ -88,6 +93,7 @@ class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -101,6 +107,7 @@ class ChatSession(Base):
         back_populates="session",
         cascade="all, delete-orphan",
     )
+    user: Mapped[User] = relationship("User", back_populates="chat_sessions")
 
 
 class ChatMessage(Base):

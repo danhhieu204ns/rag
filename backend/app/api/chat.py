@@ -13,7 +13,7 @@ from ..core.settings import settings
 from ..core.query_logger import query_logging_context
 from ..core.request_logger import request_logging_context, get_request_logger
 from ..db import get_db
-from ..models import ChatMessage, ChatSession
+from ..models import ChatMessage, ChatSession, User
 from ..schemas import (
     ChatMessageRead,
     ChatQueryRequest,
@@ -22,6 +22,7 @@ from ..schemas import (
     ChatSessionRead,
     SourceItem,
 )
+from .auth import get_current_user
 from ..services.rag.orchestrator import classify_query
 from ..services.rag_runtime import (
     build_sources,
@@ -76,19 +77,31 @@ def _message_to_read(item: ChatMessage) -> ChatMessageRead:
 
 
 @router.get("/sessions", response_model=list[ChatSessionRead])
-def list_sessions(db: Session = Depends(get_db)) -> list[ChatSessionRead]:
+def list_sessions(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[ChatSessionRead]:
     """List chat sessions sorted by recent update."""
 
-    sessions = db.query(ChatSession).order_by(ChatSession.updated_at.desc()).all()
+    sessions = (
+        db.query(ChatSession)
+        .filter(ChatSession.user_id == current_user.id)
+        .order_by(ChatSession.updated_at.desc())
+        .all()
+    )
     return [_session_to_read(session) for session in sessions]
 
 
 @router.post("/sessions", response_model=ChatSessionRead, status_code=status.HTTP_201_CREATED)
-def create_session(payload: ChatSessionCreate, db: Session = Depends(get_db)) -> ChatSessionRead:
+def create_session(
+    payload: ChatSessionCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChatSessionRead:
     """Create an empty chat session."""
 
     title = (payload.title or "New chat").strip() or "New chat"
-    session = ChatSession(title=title)
+    session = ChatSession(title=title, user_id=current_user.id)
     db.add(session)
     db.commit()
     db.refresh(session)
@@ -96,11 +109,15 @@ def create_session(payload: ChatSessionCreate, db: Session = Depends(get_db)) ->
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_session(session_id: int, db: Session = Depends(get_db)) -> None:
+def delete_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
     """Delete one chat session and all messages in it."""
 
     session = db.get(ChatSession, session_id)
-    if session is None:
+    if session is None or session.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Session not found.")
 
     db.delete(session)
@@ -108,11 +125,15 @@ def delete_session(session_id: int, db: Session = Depends(get_db)) -> None:
 
 
 @router.get("/sessions/{session_id}/messages", response_model=list[ChatMessageRead])
-def list_messages(session_id: int, db: Session = Depends(get_db)) -> list[ChatMessageRead]:
+def list_messages(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[ChatMessageRead]:
     """Return all messages from selected chat session."""
 
     session = db.get(ChatSession, session_id)
-    if session is None:
+    if session is None or session.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Session not found.")
 
     messages = (
@@ -125,7 +146,11 @@ def list_messages(session_id: int, db: Session = Depends(get_db)) -> list[ChatMe
 
 
 @router.post("/query")
-def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+def query_chat(
+    payload: ChatQueryRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> StreamingResponse:
     """Run one RAG query, save both user and assistant messages, and stream the response."""
 
     user_text = payload.message.strip()
@@ -138,7 +163,7 @@ def query_chat(payload: ChatQueryRequest, db: Session = Depends(get_db)) -> Stre
     
     # We will pass a db session and stream directly.
     return StreamingResponse(
-        _run_query_chat_stream(payload, user_text, top_k, db),
+        _run_query_chat_stream(payload, user_text, top_k, db, current_user),
         media_type="text/event-stream"
     )
 
@@ -148,13 +173,14 @@ def _run_query_chat_stream(
     user_text: str,
     top_k: int,
     db: Session,
+    current_user: User,
 ):
     with query_logging_context(
         query=user_text,
         session_id=payload.session_id,
         top_k=top_k,
     ) as _qlog:
-        yield from _run_query_chat_stream_inner(payload, user_text, top_k, db, _qlog)
+        yield from _run_query_chat_stream_inner(payload, user_text, top_k, db, _qlog, current_user)
 
 
 def _run_query_chat_stream_inner(
@@ -163,6 +189,7 @@ def _run_query_chat_stream_inner(
     top_k: int,
     db: Session,
     _qlog,
+    current_user: User,
 ):
     request_started_at = time.perf_counter()
 
@@ -178,14 +205,14 @@ def _run_query_chat_stream_inner(
     session_stage_started_at = time.perf_counter()
     if payload.session_id is not None:
         session = db.get(ChatSession, payload.session_id)
-        if session is None:
+        if session is None or session.user_id != current_user.id:
             yield f"data: {json.dumps({'type': 'error', 'detail': 'Session not found.'})}\n\n"
             return
 
     first_question_title = _build_title_from_first_question(user_text)
 
     if session is None:
-        session = ChatSession(title=first_question_title)
+        session = ChatSession(title=first_question_title, user_id=current_user.id)
         db.add(session)
         db.commit()
         db.refresh(session)
@@ -305,4 +332,3 @@ def _run_query_chat_stream_inner(
     _emit_query_progress("[chat.query] Completed request: session_id=%d", session.id)
     
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
-
