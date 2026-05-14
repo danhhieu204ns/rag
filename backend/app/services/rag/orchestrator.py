@@ -1,38 +1,23 @@
-"""
-Query Orchestrator — retrieval + output planner.
+"""Simple LLM orchestrator.
 
-For each incoming query the orchestrator produces an OrchestrationPlan that
-drives two orthogonal concerns:
-
-  output_mode — what kind of structured content to generate
-                ("qa" | "outline" | "script" | "quiz" | "summary_doc")
-
-  query_type  — how to retrieve (which search arm to emphasise, how many
-                candidates to gather, whether to retry)
-
-Rule-based detection order inside classify_query_rule_based():
-  1. Output mode is resolved first (highest priority).
-     Structured modes (outline / script / quiz / summary_doc) carry their
-     own retrieval config so query-type classification is skipped for them.
-  2. For plain Q&A mode the existing 9-bucket query-type logic runs.
-
-classify_query() keeps the public API stable while routing between rule,
-LLM, and hybrid planner modes.
+Use a single LLM classification pass to decide whether retrieval is required.
+If not required (e.g. greeting/chit-chat), chat route can answer directly
+without retrieval context.
 """
 
 from __future__ import annotations
 
 import logging
-import math
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import httpx
+
 from ...core.settings import settings
-from .llm_orchestrator import get_llm_orchestrator_client
+from ..ollama_service_client import ollama_service_headers, require_ollama_service_url
 from .logging import _emit_query_progress
-from .utils import _normalize_lookup_text, _lookup_terms, _preview_text
+from .utils import _preview_text
 
 QueryStrategy = Literal["keyword_heavy", "vector_heavy", "balanced", "broad"]
 OutputMode = Literal["qa", "outline", "script", "quiz", "summary_doc"]
@@ -40,105 +25,10 @@ OutputMode = Literal["qa", "outline", "script", "quiz", "summary_doc"]
 logger = logging.getLogger(__name__)
 
 
-# ─── Document-code patterns ────────────────────────────────────────────────────
-_DOC_CODE_RE = re.compile(
-    r"\b\d{1,6}[/-][A-ZĐĂÂÊÔƯ]{2,}(?:[/-][A-ZĐĂÂÊÔƯ]{2,})*\b"
-    r"|\b[A-ZĐĂÂÊÔƯ]{2,}[/-]\d{1,6}(?:[/-][A-ZĐĂÂÊÔƯ]{2,})*\b",
-    re.UNICODE,
-)
-_DOC_CODE_NORM_RE = re.compile(
-    r"\b\d{1,6}[/-][A-Za-z]{2,}(?:[/-][A-Za-z]{2,})*\b"
-    r"|\b[A-Za-z]{2,}[/-]\d{1,6}(?:[/-][A-Za-z]{2,})*\b"
-    r"|\b(?:so|so\s+van\s+ban|cong\s+van|quyet\s+dinh|nghi\s+dinh"
-    r"|thong\s+tu|chi\s+thi|nghi\s+quyet|van\s+ban)\s+so\s+\d{1,6}\b",
-)
-
-# ─── Output-mode detection (normalized text) ──────────────────────────────────
-_OUTPUT_MODE_RE: dict[str, re.Pattern[str]] = {
-    "outline": re.compile(
-        r"\b(tao\s+de\s+cuong|lap\s+de\s+cuong|viet\s+de\s+cuong"
-        r"|outline|dan\s+y|xay\s+dung\s+de\s+cuong|tao\s+outline"
-        r"|de\s+cuong\s+bai|lap\s+dan\s+y|tao\s+dan\s+y)\b"
-    ),
-    "script": re.compile(
-        r"\b(tao\s+script|viet\s+script|kich\s+ban\s+giang"
-        r"|soan\s+bai\s+giang|viet\s+kich\s+ban|kich\s+ban\s+bai\s+giang"
-        r"|soan\s+giao\s+an|viet\s+bai\s+giang|tao\s+bai\s+giang)\b"
-    ),
-    "quiz": re.compile(
-        r"\b(tao\s+cau\s+hoi|tao\s+bai\s+tap|de\s+kiem\s+tra"
-        r"|cau\s+hoi\s+on\s+tap|tao\s+de\s+thi|bo\s+cau\s+hoi"
-        r"|bai\s+tap\s+thuc\s+hanh|cau\s+hoi\s+trac\s+nghiem"
-        r"|tao\s+bai\s+kiem\s+tra)\b"
-    ),
-    "summary_doc": re.compile(
-        r"\b(tom\s+tat\s+toan\s+bo|tom\s+tat\s+chuong|tom\s+tat\s+tai\s+lieu"
-        r"|tong\s+hop\s+noi\s+dung|tom\s+tat\s+va\s+phan\s+tich"
-        r"|tong\s+quan\s+tai\s+lieu|tom\s+luoc)\b"
-    ),
-}
-
-# Retrieval config for each structured mode (overrides query-type classification)
-_STRUCTURED_MODE_CONFIG: dict[str, dict] = {
-    "outline":     {"top_k_mult": 3.0, "strategy": "vector_heavy", "vw": 1.6, "kw": 0.7},
-    "script":      {"top_k_mult": 3.0, "strategy": "vector_heavy", "vw": 1.7, "kw": 0.6},
-    "quiz":        {"top_k_mult": 2.5, "strategy": "balanced",     "vw": 1.2, "kw": 1.1},
-    "summary_doc": {"top_k_mult": 4.0, "strategy": "vector_heavy", "vw": 1.8, "kw": 0.5},
-}
-
-# ─── Q&A query-type intent signals ────────────────────────────────────────────
-_DEFINITION_RE = re.compile(
-    r"\b(la\s+gi|dinh\s+nghia|khai\s+niem|nghia\s+la|co\s+nghia"
-    r"|hieu\s+nhu\s+the\s+nao|tuc\s+la|duoc\s+hieu\s+la|duoc\s+goi\s+la"
-    r"|bao\s+gom\s+nhung\s+gi|the\s+nao\s+la)\b",
-)
-_FACTUAL_RE = re.compile(
-    r"\b(bao\s+nhieu|muc\s+toi\s+da|muc\s+toi\s+thieu|so\s+luong"
-    r"|ty\s+le|phan\s+tram|thoi\s+han|thoi\s+gian|quy\s+dinh\s+muc"
-    r"|dieu\s+kien\s+la\s+gi|tieu\s+chuan|tieu\s+chi|nam\s+nao"
-    r"|ngay\s+nao|bao\s+lau|gia\s+tri|han\s+muc|cap\s+do|muc\s+phat"
-    r"|muc\s+luong|quy\s+mo|tong\s+so|so\s+nam|bao\s+nhieu\s+nam)\b",
-)
-_PROCEDURAL_RE = re.compile(
-    r"\b(lam\s+the\s+nao|quy\s+trinh|thu\s+tuc|cac\s+buoc|huong\s+dan"
-    r"|can\s+lam\s+gi|cach\s+thuc|phuong\s+thuc|lam\s+sao|de\s+duoc"
-    r"|dang\s+ky|xin\s+cap|trinh\s+tu|ky\s+ket|ky\s+hop\s+dong"
-    r"|nop\s+ho\s+so|gui\s+don|yeu\s+cau|de\s+nghi|xin\s+phep"
-    r"|thu\s+tuc\s+nhu\s+the\s+nao|can\s+nhung\s+gi)\b",
-)
-_COMPARATIVE_RE = re.compile(
-    r"\b(so\s+sanh|khac\s+nhau|giong\s+nhau|su\s+khac\s+biet"
-    r"|phan\s+biet|diem\s+giong|diem\s+khac|khac\s+gi|giong\s+gi"
-    r"|uu\s+nhuoc\s+diem|uu\s+diem|nhuoc\s+diem|giua\s+\w+\s+va)\b",
-)
-_LISTING_RE = re.compile(
-    r"\b(liet\s+ke|nhung\s+loai|cac\s+loai|cac\s+truong\s+hop|tat\s+ca"
-    r"|danh\s+sach|co\s+nhung|co\s+may\s+loai|co\s+bao\s+nhieu\s+loai"
-    r"|nhung\s+gi|bao\s+gom\s+nhung|cac\s+thanh\s+phan|cac\s+yeu\s+to"
-    r"|cac\s+dieu\s+kien|nhung\s+truong\s+hop|cac\s+hinh\s+thuc)\b",
-)
-_SUMMARY_RE = re.compile(
-    r"\b(tom\s+tat|tong\s+hop|toan\s+bo|noi\s+dung\s+chinh|y\s+chinh"
-    r"|mo\s+ta|gioi\s+thieu|noi\s+dung\s+van\s+ban|quy\s+dinh\s+ve"
-    r"|cac\s+noi\s+dung|noi\s+dung\s+co\s+ban|chu\s+yeu\s+la)\b",
-)
-_FOLLOWUP_RE = re.compile(
-    r"\b(no\b|dieu\s+do|van\s+de\s+nay|dieu\s+nay|truong\s+hop\s+nay"
-    r"|nhu\s+vay|dieu\s+tren|y\s+kien\s+do|quy\s+dinh\s+tren|nhu\s+da\s+neu)\b",
-)
-
-
 # ─── Data model ───────────────────────────────────────────────────────────────
 
 @dataclass
 class OrchestrationPlan:
-    """
-    Adaptive plan produced by classify_query().
-
-    output_mode controls *what* to generate; the other fields control *how*
-    to retrieve. Both concerns are resolved in one zero-latency pass.
-    """
-
     query_type: str
     output_mode: OutputMode
     strategy: QueryStrategy
@@ -150,319 +40,35 @@ class OrchestrationPlan:
     max_iterations: int
     expand_query: bool
     signals: list[str] = field(default_factory=list)
-
-    # LLM orchestrator fields (optional, for backward compatibility)
+    requires_retrieval: bool = True
     confidence: float = 1.0
-    requires_context: bool = False
-    coverage_mode: str = "topk"  # "topk" | "section_coverage" | "document_coverage"
     llm_reason: str | None = None
-    orchestrator_source: str = "rule"  # "rule" | "llm" | "fallback"
-
-    def with_broader_search(self) -> "OrchestrationPlan":
-        """Return a relaxed copy used on retry iterations."""
-        return OrchestrationPlan(
-            query_type=self.query_type,
-            output_mode=self.output_mode,
-            strategy="broad",
-            top_k=self.top_k,
-            vector_rrf_weight=max(self.vector_rrf_weight, 1.0),
-            keyword_rrf_weight=max(self.keyword_rrf_weight, 1.0),
-            use_reranker=self.use_reranker,
-            candidate_pool=min(self.candidate_pool + 10, 40),
-            max_iterations=1,
-            expand_query=True,
-            signals=[*self.signals, "retry_broader"],
-            confidence=self.confidence,
-            requires_context=self.requires_context,
-            coverage_mode=self.coverage_mode,
-            llm_reason=self.llm_reason,
-            orchestrator_source=self.orchestrator_source,
-        )
+    orchestrator_source: str = "llm"
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
-def classify_query_rule_based(
-    query: str,
-    base_top_k: int,
-    output_mode_override: OutputMode | None = None,
-    *,
-    emit: bool = True,
-) -> OrchestrationPlan:
-    """Original rule-based classifier extracted for reuse and fallback."""
-    started_at = time.perf_counter()
-
-    def finish(plan: OrchestrationPlan) -> OrchestrationPlan:
-        return _emit_plan(query, started_at, plan) if emit else plan
-
-    normalized = _normalize_lookup_text(query)
-    terms = _lookup_terms(query)
-    term_count = len(terms)
-    signals: list[str] = []
-
-    reranker_on = settings.reranker_enabled
-    base_pool = settings.reranker_candidate_pool
-
-    # ── Step 1: resolve output mode ───────────────────────────────────────────
-    output_mode: OutputMode = output_mode_override or "qa"
-    if output_mode == "qa":
-        for mode, pattern in _OUTPUT_MODE_RE.items():
-            if pattern.search(normalized):
-                output_mode = mode  # type: ignore[assignment]
-                signals.append(f"output_mode:{mode}")
-                break
-
-    # ── Step 2a: structured modes — fixed retrieval config ────────────────────
-    if output_mode != "qa":
-        cfg = _STRUCTURED_MODE_CONFIG[output_mode]
-        top_k = max(base_top_k, int(base_top_k * cfg["top_k_mult"]))
-        return finish(
-            OrchestrationPlan(
-                query_type=f"structured_{output_mode}",
-                output_mode=output_mode,
-                strategy=cfg["strategy"],  # type: ignore[arg-type]
-                top_k=top_k,
-                vector_rrf_weight=float(cfg["vw"]),
-                keyword_rrf_weight=float(cfg["kw"]),
-                use_reranker=reranker_on,
-                candidate_pool=min(base_pool + 10, 30),
-                max_iterations=1,
-                expand_query=False,
-                signals=signals,
-            ),
-        )
-
-    # ── Step 2b: Q&A mode — nuanced query-type classification ─────────────────
-
-    # 1. Document lookup
-    if _DOC_CODE_RE.search(query) or _DOC_CODE_NORM_RE.search(normalized):
-        signals.append("doc_code_detected")
-        return finish(OrchestrationPlan(
-            query_type="document_lookup", output_mode="qa",
-            strategy="keyword_heavy", top_k=base_top_k,
-            vector_rrf_weight=0.3, keyword_rrf_weight=2.5,
-            use_reranker=False, candidate_pool=base_pool,
-            max_iterations=2, expand_query=False, signals=signals,
-        ))
-
-    # 2. Short / follow-up. Keep short definition queries like "RAG là gì?"
-    # in the definition bucket, but preserve vague pronoun follow-ups.
-    if _FOLLOWUP_RE.search(normalized) or (term_count <= 2 and not _DEFINITION_RE.search(normalized)):
-        signals.append("short_or_followup")
-        return finish(OrchestrationPlan(
-            query_type="contextual_followup", output_mode="qa",
-            strategy="vector_heavy", top_k=base_top_k,
-            vector_rrf_weight=2.2, keyword_rrf_weight=0.2,
-            use_reranker=False, candidate_pool=base_pool,
-            max_iterations=1, expand_query=False, signals=signals,
-        ))
-
-    # 3. Definition
-    if _DEFINITION_RE.search(normalized):
-        signals.append("definition_signal")
-        return finish(OrchestrationPlan(
-            query_type="definition_lookup", output_mode="qa",
-            strategy="vector_heavy", top_k=base_top_k,
-            vector_rrf_weight=1.9, keyword_rrf_weight=0.5,
-            use_reranker=reranker_on, candidate_pool=min(base_pool, 15),
-            max_iterations=1, expand_query=False, signals=signals,
-        ))
-
-    # 4. Comparative
-    if _COMPARATIVE_RE.search(normalized):
-        signals.append("comparative_signal")
-        return finish(OrchestrationPlan(
-            query_type="comparative", output_mode="qa",
-            strategy="broad", top_k=min(base_top_k * 2, 10),
-            vector_rrf_weight=1.2, keyword_rrf_weight=1.0,
-            use_reranker=reranker_on, candidate_pool=min(base_pool + 10, 30),
-            max_iterations=2, expand_query=True, signals=signals,
-        ))
-
-    # 5. Procedural
-    if _PROCEDURAL_RE.search(normalized):
-        signals.append("procedural_signal")
-        return finish(OrchestrationPlan(
-            query_type="procedural", output_mode="qa",
-            strategy="vector_heavy", top_k=min(base_top_k + 2, 8),
-            vector_rrf_weight=1.5, keyword_rrf_weight=0.8,
-            use_reranker=reranker_on, candidate_pool=min(base_pool + 5, 25),
-            max_iterations=1, expand_query=term_count < 5, signals=signals,
-        ))
-
-    # 6. Listing
-    if _LISTING_RE.search(normalized):
-        signals.append("listing_signal")
-        return finish(OrchestrationPlan(
-            query_type="listing", output_mode="qa",
-            strategy="vector_heavy", top_k=min(base_top_k + 2, 8),
-            vector_rrf_weight=1.6, keyword_rrf_weight=0.6,
-            use_reranker=False, candidate_pool=base_pool,
-            max_iterations=1, expand_query=False, signals=signals,
-        ))
-
-    # 7. Factual / quantitative
-    if _FACTUAL_RE.search(normalized):
-        signals.append("factual_signal")
-        return finish(OrchestrationPlan(
-            query_type="factual_specific", output_mode="qa",
-            strategy="balanced", top_k=base_top_k,
-            vector_rrf_weight=1.1, keyword_rrf_weight=1.4,
-            use_reranker=reranker_on, candidate_pool=base_pool,
-            max_iterations=2, expand_query=False, signals=signals,
-        ))
-
-    # 8. Short summary cue (single-query, not full-doc)
-    if _SUMMARY_RE.search(normalized):
-        signals.append("summary_signal")
-        return finish(OrchestrationPlan(
-            query_type="summary_overview", output_mode="qa",
-            strategy="vector_heavy", top_k=min(base_top_k + 2, 8),
-            vector_rrf_weight=1.7, keyword_rrf_weight=0.6,
-            use_reranker=False, candidate_pool=base_pool,
-            max_iterations=1, expand_query=False, signals=signals,
-        ))
-
-    # 9. Long / highly specific phrase
-    if term_count >= 8:
-        signals.append("long_specific_query")
-        return finish(OrchestrationPlan(
-            query_type="specific_query", output_mode="qa",
-            strategy="balanced", top_k=base_top_k,
-            vector_rrf_weight=1.0, keyword_rrf_weight=1.5,
-            use_reranker=reranker_on, candidate_pool=base_pool,
-            max_iterations=1, expand_query=False, signals=signals,
-        ))
-
-    # 10. Default hybrid
-    signals.append("default_hybrid")
-    return finish(OrchestrationPlan(
-        query_type="general", output_mode="qa",
-        strategy="balanced", top_k=base_top_k,
-        vector_rrf_weight=settings.hybrid_vector_rrf_weight,
-        keyword_rrf_weight=settings.hybrid_keyword_rrf_weight,
-        use_reranker=reranker_on, candidate_pool=base_pool,
-        max_iterations=1, expand_query=False, signals=signals,
-    ))
-
-
-def _validate_and_map_llm_plan(
-    raw: dict[str, Any],
-    query: str,
-    base_top_k: int,
-    output_mode_override: OutputMode | None,
-    started_at: float,
-) -> OrchestrationPlan | None:
-    """Validate LLM JSON and map to OrchestrationPlan. Return None if invalid."""
-    required_keys = {
-        "query_type", "output_mode", "strategy", "top_k_multiplier",
-        "vector_rrf_weight", "keyword_rrf_weight", "use_reranker",
-        "candidate_pool_delta", "max_iterations", "expand_query",
-        "requires_context", "coverage_mode", "confidence", "signals", "reason",
-    }
-    if not isinstance(raw, dict):
-        logger.warning("[llm_orchestrator] plan is not an object")
-        return None
-    if not required_keys.issubset(raw.keys()):
-        logger.warning("[llm_orchestrator] missing keys in plan: %s", required_keys - set(raw.keys()))
-        return None
-
+def _call_orchestrator_service(query: str) -> dict[str, Any] | None:
     try:
-        output_mode = str(raw.get("output_mode"))
-        if output_mode_override is not None:
-            output_mode = output_mode_override  # enforce override
-
-        strategy = str(raw.get("strategy"))
-        query_type = str(raw.get("query_type") or "").strip()
-        coverage_mode = str(raw.get("coverage_mode"))
-        signals_raw = raw.get("signals")
-        if not query_type:
-            logger.warning("[llm_orchestrator] empty query_type")
-            return None
-        if not isinstance(raw.get("use_reranker"), bool):
-            logger.warning("[llm_orchestrator] use_reranker must be boolean")
-            return None
-        if not isinstance(raw.get("expand_query"), bool):
-            logger.warning("[llm_orchestrator] expand_query must be boolean")
-            return None
-        if not isinstance(raw.get("requires_context"), bool):
-            logger.warning("[llm_orchestrator] requires_context must be boolean")
-            return None
-        if not isinstance(signals_raw, list):
-            logger.warning("[llm_orchestrator] signals must be an array")
-            return None
-
-        top_k_multiplier = float(raw.get("top_k_multiplier"))
-        vector_rrf_weight = float(raw.get("vector_rrf_weight"))
-        keyword_rrf_weight = float(raw.get("keyword_rrf_weight"))
-        use_reranker = raw.get("use_reranker")
-        candidate_pool_delta = int(raw.get("candidate_pool_delta"))
-        max_iterations = int(raw.get("max_iterations"))
-        expand_query = raw.get("expand_query")
-        requires_context = raw.get("requires_context")
-        confidence = float(raw.get("confidence"))
-        signals = list(signals_raw)
-        reason = str(raw.get("reason") or "")
-    except Exception:
-        logger.exception("[llm_orchestrator] plan fields type error")
+        service_url = require_ollama_service_url()
+        headers = ollama_service_headers()
+    except RuntimeError:
         return None
 
-    # Basic enums check
-    if output_mode not in ("qa", "outline", "script", "quiz", "summary_doc"):
-        logger.warning("[llm_orchestrator] invalid output_mode: %s", output_mode)
+    timeout = httpx.Timeout(settings.orchestrator_timeout_seconds, connect=5.0)
+    payload = {"query": query}
+    try:
+        with httpx.Client(timeout=timeout, headers=headers) as client:
+            resp = client.post(f"{service_url}/v1/orchestrator/classify", json=payload)
+            resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except httpx.HTTPError:
+        logger.exception("[orchestrator] service classify call failed")
         return None
-    if strategy not in ("keyword_heavy", "vector_heavy", "balanced", "broad"):
-        logger.warning("[llm_orchestrator] invalid strategy: %s", strategy)
+    except ValueError as exc:
+        logger.warning("[orchestrator] service classify response was not JSON: %s", exc)
         return None
-    if coverage_mode not in ("topk", "section_coverage", "document_coverage"):
-        logger.warning("[llm_orchestrator] invalid coverage_mode: %s", coverage_mode)
-        return None
-
-    # Clamp numeric values
-    top_k_multiplier = max(1.0, min(5.0, float(top_k_multiplier)))
-    vector_rrf_weight = max(0.1, min(3.0, float(vector_rrf_weight)))
-    keyword_rrf_weight = max(0.1, min(3.0, float(keyword_rrf_weight)))
-    candidate_pool_delta = max(0, min(20, int(candidate_pool_delta)))
-    max_iterations = max(1, min(3, int(max_iterations)))
-    confidence = max(0.0, min(1.0, float(confidence)))
-
-    # Confidence threshold: if too low, reject
-    if confidence < 0.4:
-        logger.info("[llm_orchestrator] low confidence %.2f -> fallback", confidence)
-        return None
-
-    # Compute derived fields
-    top_k = max(base_top_k, int(math.ceil(base_top_k * top_k_multiplier)))
-    candidate_pool = min(settings.reranker_candidate_pool + candidate_pool_delta, 40)
-
-    # Normalize signals
-    signals = [str(s) for s in signals if s]
-    signals.append("llm_orchestrator")
-    signals.append(f"confidence:{confidence:.2f}")
-    signals.append(f"coverage_mode:{coverage_mode}")
-    if requires_context:
-        signals.append("requires_context")
-
-    plan = OrchestrationPlan(
-        query_type=query_type,
-        output_mode=output_mode,  # type: ignore[arg-type]
-        strategy=strategy,  # type: ignore[arg-type]
-        top_k=top_k,
-        vector_rrf_weight=vector_rrf_weight,
-        keyword_rrf_weight=keyword_rrf_weight,
-        use_reranker=use_reranker,
-        candidate_pool=candidate_pool,
-        max_iterations=max_iterations,
-        expand_query=expand_query,
-        signals=signals,
-        confidence=confidence,
-        requires_context=requires_context,
-        coverage_mode=coverage_mode,
-        llm_reason=reason,
-        orchestrator_source="llm",
-    )
-
-    return _emit_plan(query, started_at, plan)
 
 
 def classify_query(
@@ -470,60 +76,42 @@ def classify_query(
     base_top_k: int,
     output_mode_override: OutputMode | None = None,
 ) -> OrchestrationPlan:
-    """Wrapper that routes between rule-based and LLM orchestrators.
-
-    Modes available via settings.orchestrator_mode: "rule" | "llm" | "hybrid".
-    """
     started_at = time.perf_counter()
-    mode = (settings.orchestrator_mode or "rule").lower()
-    if mode not in {"rule", "llm", "hybrid"}:
-        logger.warning("[orchestrator] unknown mode=%s, using rule-based planner", mode)
-        return classify_query_rule_based(query, base_top_k, output_mode_override)
-
-    # Fast path: rule-only
-    if mode == "rule":
-        return classify_query_rule_based(query, base_top_k, output_mode_override)
-
-    # Hybrid: if high-precision patterns (document codes, structured modes), use rule-based
-    normalized = _normalize_lookup_text(query)
-    if mode == "hybrid":
-        if _DOC_CODE_RE.search(query) or _DOC_CODE_NORM_RE.search(normalized):
-            return classify_query_rule_based(query, base_top_k, output_mode_override)
-
-    # Try LLM planner (sync) and fallback to rule-based on any failure
-    client = get_llm_orchestrator_client()
-    plan_raw = None
+    raw = _call_orchestrator_service(query) or {}
+    requires_retrieval = bool(raw.get("requires_retrieval", True))
+    query_type = str(raw.get("query_type") or ("needs_retrieval" if requires_retrieval else "chitchat"))
+    signals = [str(s) for s in (raw.get("signals") or []) if s]
+    confidence_raw = raw.get("confidence", 0.0)
     try:
-        plan_raw = client.plan_sync(query, base_top_k, output_mode_override)
-    except Exception:
-        logger.exception("[orchestrator] LLM planner sync call failed")
-        plan_raw = None
+        confidence = max(0.0, min(1.0, float(confidence_raw)))
+    except (TypeError, ValueError):
+        confidence = 0.0
 
-    if not plan_raw:
-        # fallback
-        plan = classify_query_rule_based(query, base_top_k, output_mode_override, emit=False)
-        plan.signals = [*plan.signals, "llm_fallback"]
-        plan.orchestrator_source = "fallback"
-        return _emit_plan(query, started_at, plan)
+    plan = OrchestrationPlan(
+        query_type=query_type,
+        output_mode=output_mode_override or "qa",
+        strategy="balanced",
+        top_k=base_top_k,
+        vector_rrf_weight=settings.hybrid_vector_rrf_weight,
+        keyword_rrf_weight=settings.hybrid_keyword_rrf_weight,
+        use_reranker=settings.reranker_enabled and requires_retrieval,
+        candidate_pool=settings.reranker_candidate_pool,
+        max_iterations=1,
+        expand_query=False,
+        signals=signals,
+        requires_retrieval=requires_retrieval,
+        confidence=confidence,
+        llm_reason=str(raw.get("reason") or "") or None,
+        orchestrator_source="llm",
+    )
+    return _emit_plan(query, started_at, plan)
 
-    mapped = _validate_and_map_llm_plan(plan_raw, query, base_top_k, output_mode_override, started_at)
-    if mapped is None:
-        plan = classify_query_rule_based(query, base_top_k, output_mode_override, emit=False)
-        plan.signals = [*plan.signals, "llm_fallback"]
-        plan.orchestrator_source = "fallback"
-        return _emit_plan(query, started_at, plan)
-
-    return mapped
-
-
-# ─── Internal helper ──────────────────────────────────────────────────────────
 
 def _emit_plan(query: str, started_at: float, plan: OrchestrationPlan) -> OrchestrationPlan:
     elapsed = round((time.perf_counter() - started_at) * 1000, 2)
     src = getattr(plan, "orchestrator_source", "rule")
     confidence = getattr(plan, "confidence", None)
-    coverage_mode = getattr(plan, "coverage_mode", None)
-    requires_context = getattr(plan, "requires_context", None)
+    requires_retrieval = getattr(plan, "requires_retrieval", None)
     llm_reason = getattr(plan, "llm_reason", None)
 
     _emit_query_progress(
@@ -556,8 +144,7 @@ def _emit_plan(query: str, started_at: float, plan: OrchestrationPlan) -> Orches
             "signals": plan.signals,
             "orchestrator_source": src,
             "confidence": confidence,
-            "coverage_mode": coverage_mode,
-            "requires_context": requires_context,
+            "requires_retrieval": requires_retrieval,
             "llm_reason": (llm_reason[:400] if isinstance(llm_reason, str) else None),
             "elapsed_ms": elapsed,
         },

@@ -31,12 +31,7 @@ class Settings:
     query_rewrite_min_terms: int
     query_rewrite_max_terms: int
     orchestrator_enabled: bool
-    # Orchestrator (rule-based or LLM-based planning)
-    orchestrator_mode: str
-    orchestrator_llm_model: str
-    orchestrator_llm_temperature: float
-    orchestrator_llm_max_tokens: int
-    orchestrator_llm_timeout_seconds: float
+    orchestrator_timeout_seconds: float
     # Hybrid retrieval
     hybrid_probe_multiplier: int
     hybrid_rrf_k: int
@@ -46,7 +41,6 @@ class Settings:
     reranker_enabled: bool
     reranker_model: str
     reranker_candidate_pool: int
-    metadata_llm_batch_size: int
     indexing_concurrency: int
     embedding_batch_size: int
     ingestion_service_url: str
@@ -175,11 +169,7 @@ def get_settings() -> Settings:
         ),
         query_rewrite_max_terms=max(1, _int_env("QUERY_REWRITE_MAX_TERMS", 12)),
         orchestrator_enabled=_bool_env("ORCHESTRATOR_ENABLED", True),
-        orchestrator_mode=_string_env("ORCHESTRATOR_MODE", "rule"),
-        orchestrator_llm_model=_string_env("ORCHESTRATOR_LLM_MODEL", "llama2"),
-        orchestrator_llm_temperature=_float_env("ORCHESTRATOR_LLM_TEMPERATURE", 0.0),
-        orchestrator_llm_max_tokens=_int_env("ORCHESTRATOR_LLM_MAX_TOKENS", 500),
-        orchestrator_llm_timeout_seconds=_float_env("ORCHESTRATOR_LLM_TIMEOUT_SECONDS", 10.0),
+        orchestrator_timeout_seconds=_float_env("ORCHESTRATOR_TIMEOUT_SECONDS", 30.0),
         hybrid_probe_multiplier=max(1, _int_env("HYBRID_PROBE_MULTIPLIER", 4)),
         hybrid_rrf_k=max(1, _int_env("HYBRID_RRF_K", 60)),
         hybrid_vector_rrf_weight=_float_env("HYBRID_VECTOR_RRF_WEIGHT", 1.0),
@@ -187,7 +177,6 @@ def get_settings() -> Settings:
         reranker_enabled=_bool_env("RERANKER_ENABLED", True),
         reranker_model=_string_env("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
         reranker_candidate_pool=_int_env("RERANKER_CANDIDATE_POOL", 20),
-        metadata_llm_batch_size=_int_env("METADATA_LLM_BATCH_SIZE", 12),
         indexing_concurrency=_int_env("INDEXING_CONCURRENCY", 12),
         embedding_batch_size=_int_env("EMBEDDING_BATCH_SIZE", 128),
         ingestion_service_url=_string_env("INGESTION_SERVICE_URL", "").rstrip("/"),

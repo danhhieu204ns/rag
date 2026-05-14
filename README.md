@@ -3,7 +3,7 @@
 Ứng dụng RAG đầy đủ dùng **FastAPI** (backend), **React + Vite** (frontend), **Ollama** (LLM), và **Qdrant** (vector DB) để:
 - Upload và index tài liệu (PDF/TXT/MD)
 - Tạo chunks theo mô hình section-aware parent-child
-- Thực hiện hybrid search (vector + keyword)
+- Truy vấn retrieval (vector + keyword + rerank) qua `retrieval_service`
 - Chat hỏi đáp với trích dẫn nguồn và lịch sử persistent
 
 ## Tech Stack
@@ -11,11 +11,11 @@
 | Layer | Technology |
 |-------|-----------|
 | **Frontend** | React 18, Vite, TypeScript |
-| **Backend Orchestrator** | FastAPI, SQLAlchemy, SQLite |
+| **Backend** | FastAPI, SQLAlchemy, SQLite |
 | **Document Processing** | PyMuPDF/Marker (PDF), LangChain |
 | **Vector DB** | Qdrant, qdrant-client |
 | **LLM** | Ollama, LangChain |
-| **Search** | Hybrid (Vector + Keyword), RRF ranking, BGE Reranker |
+| **Search** | Retrieval Service (Vector + Keyword), RRF ranking, BGE Reranker |
 | **Auth** | JWT, bcrypt |
 | **Deployment** | Docker, Cloudflare Tunnel (optional) |
 
@@ -97,7 +97,7 @@ Frontend
    ↓
 Backend nhận câu hỏi
    ↓
-Backend gọi Retrieval Service lấy top_k context qua hybrid search
+Backend gọi Retrieval Service lấy top_k context
    ↓
 Retrieval Service gọi Ollama Service để embedding query và search Qdrant
    ↓
@@ -106,7 +106,7 @@ Backend build prompt, gọi Ollama Service để generate answer
 Backend lưu chat history và trả answer + sources về frontend
 ```
 
-Ghi chú thiết kế: repo đang đi theo hướng `retrieval_service` sở hữu Vector DB. Backend có fallback truy cập Qdrant trực tiếp khi `RETRIEVAL_SERVICE_URL` rỗng để giữ tương thích local/dev, nhưng cấu hình khuyến nghị là đi qua `retrieval_service`.
+Ghi chú thiết kế: `retrieval_service` sở hữu Vector DB và backend luôn gọi retrieval qua service này.
 
 ## Yêu cầu
 
@@ -370,6 +370,9 @@ QDRANT_URL=
 # ollama_service/.env
 SHIELD_API_KEY=change-this-key
 UPSTREAM_OLLAMA_BASE_URL=http://127.0.0.1:11434
+CHAT_MODEL=qwen3:30b-a3b-instruct-2507-q4_K_M
+ORCHESTRATOR_MODEL=qwen3:4b-instruct-2507-q4_K_M
+EMBEDDING_MODEL=qwen3-embedding:0.6b
 ```
 
 ```env

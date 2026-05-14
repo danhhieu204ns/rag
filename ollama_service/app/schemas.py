@@ -22,6 +22,10 @@ class GenerateRequest(BaseModel):
     options: dict[str, Any] | None = None
 
 
+class OrchestratorClassifyRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+
+
 class IndexingBatchRequest(BaseModel):
     texts: list[str] = Field(..., min_length=1, max_length=100)
     instruction: str | None = None

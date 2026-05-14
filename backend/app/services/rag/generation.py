@@ -112,6 +112,17 @@ QUY TẮC TRẢ LỜI:
    Nếu toàn bộ nội dung có thể kết luận thành ý chính, hãy tóm tắt ý chính đó ở cuối phần trả lời (sau khi đã trình bày chi tiết), chỉ cần có nhiều nhất 1 kết luận ngắn gọn, rõ ràng, KHÔNG thêm bất kỳ lời dẫn nhập nào cho phần kết luận này.\
 """
 
+_QA_NO_CONTEXT_SYSTEM_PROMPT = """\
+Bạn là ViettelRAG - trợ lý hội thoại tiếng Việt của Viettel.
+
+QUY TẮC TRẢ LỜI KHI KHÔNG CÓ TÀI LIỆU THAM KHẢO:
+- Trả lời tự nhiên, ngắn gọn, thân thiện theo ngữ cảnh hội thoại.
+- Với greeting/chit-chat (ví dụ: "xin chào", "cảm ơn"), trả lời trực tiếp như trợ lý thông thường.
+- KHÔNG nhắc tới "Chunk", "tài liệu tham khảo", hoặc lý do thiếu tài liệu.
+- KHÔNG bịa dữ kiện chuyên môn; nếu người dùng hỏi kiến thức cần kiểm chứng, nói rõ cần cung cấp tài liệu/chủ đề cụ thể.
+- Dùng xưng hô "mình" và "bạn".
+"""
+
 _OUTLINE_SYSTEM_PROMPT = """\
 Bạn là ViettelRAG - trợ lý tạo tài liệu học tập chuyên nghiệp của Viettel.
 Tài liệu tham khảo được đánh số theo ký hiệu "--- Chunk N ---". Khi trích dẫn, dùng [Chunk N] ở CUỐI bullet/câu.
@@ -364,19 +375,31 @@ def _build_messages(
         return f"{msg.role.upper()}: {content}"
 
     history_block = "\n".join(_fmt(msg) for msg in history)
-    context_block = _build_context_block(context_docs)
+    has_context = len(context_docs) > 0
+    context_block = _build_context_block(context_docs) if has_context else ""
     system_content = _SYSTEM_PROMPTS.get(output_mode, _QA_SYSTEM_PROMPT)
+    if output_mode == "qa" and not has_context:
+        system_content = _QA_NO_CONTEXT_SYSTEM_PROMPT
     task_label = _USER_PROMPT_TASK_LABELS.get(output_mode, _USER_PROMPT_TASK_LABELS["qa"])
 
-    user_content = (
-        "=== TÀI LIỆU THAM KHẢO ===\n"
-        f"{context_block}\n\n"
-        "=== LỊCH SỬ TRÒ CHUYỆN ===\n"
-        f"{history_block or 'Chưa có.'}\n\n"
-        "=== YÊU CẦU ===\n"
-        f"{question}\n\n"
-        f"{task_label}:"
-    )
+    if has_context:
+        user_content = (
+            "=== TÀI LIỆU THAM KHẢO ===\n"
+            f"{context_block}\n\n"
+            "=== LỊCH SỬ TRÒ CHUYỆN ===\n"
+            f"{history_block or 'Chưa có.'}\n\n"
+            "=== YÊU CẦU ===\n"
+            f"{question}\n\n"
+            f"{task_label}:"
+        )
+    else:
+        user_content = (
+            "=== LỊCH SỬ TRÒ CHUYỆN ===\n"
+            f"{history_block or 'Chưa có.'}\n\n"
+            "=== YÊU CẦU ===\n"
+            f"{question}\n\n"
+            "Trả lời hội thoại trực tiếp:"
+        )
 
     return [
         SystemMessage(content=system_content),

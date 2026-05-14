@@ -380,6 +380,7 @@ class QueryLog:
         sem_ms_v = self._timing.get("semantic_candidates", 0.0)
         kw_ms_v = self._timing.get("keyword_candidates", 0.0)
         parallel_wall = max(sem_ms_v, kw_ms_v)
+        rewrite_ms = self._timing.get("query_rewrite", 0.0)
         retrieval_total = rewrite_ms + parallel_wall + rrf_ms + rerank_ms
         lines.append(f"\n▶ KẾT QUẢ CUỐI RETRIEVAL  [tổng wall-clock: {retrieval_total:.1f}ms]")
         if self._final_chunks:

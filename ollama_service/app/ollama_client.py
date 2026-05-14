@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -51,8 +52,13 @@ def validate_text_batch(
         validate_text_length(str(item), max_chars, f"{field_name}[{index}]")
 
 
-def enforce_num_predict(payload: dict[str, Any], max_num_predict: int) -> dict[str, Any]:
-    payload["stream"] = False
+def enforce_num_predict(
+    payload: dict[str, Any],
+    max_num_predict: int,
+    *,
+    stream: bool | None = False,
+) -> dict[str, Any]:
+    payload["stream"] = bool(stream)
     options = dict(payload.get("options") or {})
 
     try:
@@ -70,6 +76,98 @@ def _timeout(total_seconds: float) -> httpx.Timeout:
         total_seconds,
         connect=settings.ollama_connect_timeout_seconds,
     )
+
+
+async def open_ollama_stream(
+    path: str,
+    payload: dict[str, Any],
+    *,
+    timeout_seconds: float,
+) -> tuple[httpx.AsyncClient, httpx.Response]:
+    started = time.perf_counter()
+    model_name = payload.get("model")
+    client = httpx.AsyncClient(timeout=_timeout(timeout_seconds))
+    try:
+        logger.info(
+            "[ollama-service] -> upstream STREAM POST %s base_url=%s timeout=%.1fs model=%s",
+            path,
+            settings.ollama_base_url,
+            timeout_seconds,
+            model_name,
+        )
+        request = client.build_request("POST", f"{settings.ollama_base_url}{path}", json=payload)
+        response = await client.send(request, stream=True)
+    except httpx.TimeoutException as exc:
+        await client.aclose()
+        logger.error(
+            "[ollama-service][timing] upstream stream timeout POST %s model=%s elapsed_ms=%.2f: %s",
+            path,
+            model_name,
+            _ms(started),
+            exc,
+        )
+        raise HTTPException(status_code=504, detail=f"Ollama timeout khi gọi {path}.") from exc
+    except httpx.RequestError as exc:
+        await client.aclose()
+        logger.error(
+            "[ollama-service][timing] upstream stream request error POST %s model=%s elapsed_ms=%.2f: %s",
+            path,
+            model_name,
+            _ms(started),
+            exc,
+        )
+        raise HTTPException(status_code=502, detail=f"Không kết nối được Ollama: {exc}") from exc
+
+    if response.status_code >= 400:
+        body = await response.aread()
+        await response.aclose()
+        await client.aclose()
+        detail = body.decode("utf-8", errors="replace") or response.reason_phrase
+        logger.error(
+            "[ollama-service][timing] upstream stream returned HTTP %s for POST %s model=%s elapsed_ms=%.2f",
+            response.status_code,
+            path,
+            model_name,
+            _ms(started),
+        )
+        raise HTTPException(status_code=response.status_code, detail=detail)
+
+    logger.info(
+        "[ollama-service][timing] upstream stream opened POST %s status=%s model=%s elapsed_ms=%.2f",
+        path,
+        response.status_code,
+        model_name,
+        _ms(started),
+    )
+    return client, response
+
+
+async def iter_ollama_stream(
+    client: httpx.AsyncClient,
+    response: httpx.Response,
+    *,
+    path: str,
+    started: float,
+) -> AsyncIterator[bytes]:
+    chunk_count = 0
+    byte_count = 0
+    try:
+        async for chunk in response.aiter_bytes():
+            if not chunk:
+                continue
+            chunk_count += 1
+            byte_count += len(chunk)
+            yield chunk
+    finally:
+        await response.aclose()
+        await client.aclose()
+        logger.info(
+            "[ollama-service][timing] upstream stream closed POST %s chunks=%d bytes=%d elapsed_ms=%.2f",
+            path,
+            chunk_count,
+            byte_count,
+            _ms(started),
+        )
 
 
 async def post_ollama(path: str, payload: dict[str, Any], *, timeout_seconds: float) -> dict[str, Any]:

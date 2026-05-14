@@ -13,7 +13,7 @@ from ..core.settings import settings
 from ..core.query_logger import query_logging_context
 from ..core.request_logger import request_logging_context, get_request_logger
 from ..db import get_db
-from ..models import ChatMessage, ChatSession, User
+from ..models import ChatMessage, ChatSession, Document, User
 from ..schemas import (
     ChatMessageRead,
     ChatQueryRequest,
@@ -53,6 +53,58 @@ def _build_title_from_first_question(message: str) -> str:
     return cleaned[:255]
 
 
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _enrich_sources_with_document_name(db: Session, sources: list[dict]) -> list[dict]:
+    """Backfill filename in source_metadata when retrieval metadata is missing."""
+    if not sources:
+        return sources
+
+    document_ids = {
+        int(src.get("document_id"))
+        for src in sources
+        if isinstance(src, dict) and src.get("document_id") is not None
+    }
+    if not document_ids:
+        return sources
+
+    documents = (
+        db.query(Document.id, Document.original_filename, Document.title)
+        .filter(Document.id.in_(document_ids))
+        .all()
+    )
+    by_id = {int(doc_id): {"original_filename": original_filename, "title": title} for doc_id, original_filename, title in documents}
+
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        document_id = src.get("document_id")
+        if document_id is None:
+            continue
+        doc_info = by_id.get(int(document_id))
+        if not doc_info:
+            continue
+
+        source_metadata = src.get("source_metadata")
+        if not isinstance(source_metadata, dict):
+            source_metadata = {}
+            src["source_metadata"] = source_metadata
+
+        source_info = source_metadata.get("source_info")
+        if not isinstance(source_info, dict):
+            source_info = {}
+            source_metadata["source_info"] = source_info
+
+        if not source_info.get("file_name"):
+            source_info["file_name"] = doc_info["original_filename"] or doc_info["title"]
+        source_metadata.setdefault("original_filename", doc_info["original_filename"])
+        source_metadata.setdefault("title", doc_info["title"])
+
+    return sources
+
+
 
 def _session_to_read(item: ChatSession) -> ChatSessionRead:
     return ChatSessionRead(
@@ -64,8 +116,11 @@ def _session_to_read(item: ChatSession) -> ChatSessionRead:
 
 
 
-def _message_to_read(item: ChatMessage) -> ChatMessageRead:
-    sources = [SourceItem(**source) for source in parse_sources(item.sources_json)]
+def _message_to_read(item: ChatMessage, db: Session | None = None) -> ChatMessageRead:
+    parsed_sources = parse_sources(item.sources_json)
+    if db is not None:
+        parsed_sources = _enrich_sources_with_document_name(db, parsed_sources)
+    sources = [SourceItem(**source) for source in parsed_sources]
     return ChatMessageRead(
         id=item.id,
         session_id=item.session_id,
@@ -142,7 +197,7 @@ def list_messages(
         .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
         .all()
     )
-    return [_message_to_read(message) for message in messages]
+    return [_message_to_read(message, db=db) for message in messages]
 
 
 @router.post("/query")
@@ -156,15 +211,14 @@ def query_chat(
     user_text = payload.message.strip()
     top_k = payload.top_k or settings.retriever_k
 
-    # Because StreamingResponse executes the generator lazily, 
-    # we don't wrap the whole return in the context manager, 
-    # but we can do the initial DB setup synchronously if we want, 
-    # or just let the generator handle it.
-    
-    # We will pass a db session and stream directly.
     return StreamingResponse(
         _run_query_chat_stream(payload, user_text, top_k, db, current_user),
-        media_type="text/event-stream"
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -269,21 +323,27 @@ def _run_query_chat_stream_inner(
         )
     output_mode: str = plan.output_mode if plan else (payload.output_mode or "qa")
 
-    retrieval_started_at = time.perf_counter()
-    retrieved_docs = similarity_search(
-        user_text,
-        top_k=top_k,
-        db=db,
-        document_ids=payload.document_ids,
-        plan=plan,
-    )
-    _emit_query_progress("[chat.query] Retrieved context docs: count=%d", len(retrieved_docs))
+    retrieved_docs = []
+    if plan is None or getattr(plan, "requires_retrieval", True):
+        retrieval_started_at = time.perf_counter()
+        retrieved_docs = similarity_search(
+            user_text,
+            top_k=top_k,
+            db=db,
+            document_ids=payload.document_ids,
+            plan=plan,
+        )
+        _emit_query_progress("[chat.query] Retrieved context docs: count=%d", len(retrieved_docs))
+    else:
+        _emit_query_progress("[chat.query] Orchestrator chose direct answer without retrieval")
 
-    sources = build_sources(retrieved_docs)
+    sources = _enrich_sources_with_document_name(db, build_sources(retrieved_docs))
 
-    yield f"data: {json.dumps({'type': 'session', 'session_id': session.id})}\n\n"
-    yield f"data: {json.dumps({'type': 'output_mode', 'mode': output_mode})}\n\n"
-    yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
+    # Send comment prelude early to reduce proxy buffering on some deployments.
+    yield ": stream-start\n\n"
+    yield _sse({"type": "session", "session_id": session.id})
+    yield _sse({"type": "output_mode", "mode": output_mode})
+    yield _sse({"type": "sources", "sources": sources})
 
     answer_parts = []
     answer_started_at = time.perf_counter()
@@ -298,10 +358,10 @@ def _run_query_chat_stream_inner(
             output_mode=output_mode,
         ):
             answer_parts.append(chunk)
-            yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+            yield _sse({"type": "token", "content": chunk})
     except Exception as exc:  # pragma: no cover
         _emit_query_progress("[chat.query] Generate answer stream failed: %s", exc)
-        yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)})}\n\n"
+        yield _sse({"type": "error", "detail": str(exc)})
         return
 
     answer = "".join(answer_parts)
@@ -331,4 +391,4 @@ def _run_query_chat_stream_inner(
     
     _emit_query_progress("[chat.query] Completed request: session_id=%d", session.id)
     
-    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+    yield _sse({"type": "done"})

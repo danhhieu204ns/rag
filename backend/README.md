@@ -8,11 +8,11 @@ Backend là **Orchestrator** chính của hệ thống RAG. Nó là service duy 
 - **Async Indexing**: Incremental indexing pipeline per document (BackgroundTasks)
 - **Dual PDF Parser**: Support `legacy` (PyMuPDF) hoặc `marker` mode
 - **Section-Aware Chunking**: Parent-child chunk model theo markdown heading sections
-- **Hybrid Search**: Vector + keyword search with reciprocal-rank-fusion
+- **Retrieval Delegation**: Search delegated to `retrieval_service` (vector + keyword + rerank)
 - **Delegation Architecture**: Parse → ingestion_service, Search → retrieval_service, LLM → ollama_service
 - **Parent-Child Retrieval**: Child vectors indexed, parent text returned to LLM
 - **Chat History**: Persistent SQLite chat sessions and messages
-- **Vector Storage**: Qdrant backend (embedded local hoặc remote mode)
+- **Vector Storage**: Managed by `retrieval_service` (Qdrant)
 - **Authentication**: JWT-based admin auth, public chat endpoints
 
 ## Architecture Role
@@ -55,7 +55,7 @@ ingestion_service         retrieval_service          ollama_service
 - Document upload & metadata persistence
 - RAG orchestration (question → retrieval → prompt → LLM → answer + sources)
 - Indexing orchestration (queue jobs → call ingestion → persist state)
-- Fallback local Qdrant mode (when `RETRIEVAL_SERVICE_URL` empty)
+- LLM orchestrator đơn giản: phân loại câu hỏi có cần retrieval hay trả lời trực tiếp
 
 **Should NOT own:**
 - Heavy document parsing (→ ingestion_service)
@@ -144,12 +144,9 @@ backend/
 │       ├── retrieval_client.py    # Client to retrieval_service
 │       ├── ollama_service_client.py # Client to ollama_service
 │       ├── chunk_metadata.py      # Chunk metadata builders
-│       └── rag/                    # RAG orchestration (fallback local mode)
+│       └── rag/                    # RAG orchestration
 │           ├── orchestrator.py    # RAG query orchestration
 │           ├── generation.py      # Answer generation
-│           ├── retrieval.py       # Hybrid search (local fallback)
-│           ├── query.py           # Query processing
-│           ├── qdrant.py          # Direct Qdrant access (local fallback)
 │           ├── models.py          # RAG data models
 │           ├── logging.py         # RAG logging
 │           └── utils.py           # Helper functions
@@ -262,7 +259,7 @@ OLLAMA_API_KEY=change-this-key
 OLLAMA_CHAT_MODEL=default
 OLLAMA_EMBEDDING_MODEL=default
 
-# Optional: Delegated services
+# Delegated services
 INGESTION_SERVICE_URL=http://localhost:8100
 RETRIEVAL_SERVICE_URL=http://localhost:8300
 
@@ -308,6 +305,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8200
 UPSTREAM_OLLAMA_BASE_URL=http://127.0.0.1:11434
 SHIELD_API_KEY=change-this-key
 CHAT_MODEL=qwen3:30b-a3b-instruct-2507-q4_K_M
+ORCHESTRATOR_MODEL=qwen3:4b-instruct-2507-q4_K_M
 EMBEDDING_MODEL=qwen3-embedding:0.6b
 ```
 
@@ -330,7 +328,7 @@ Xem [ingestion_service/README.md](../ingestion_service/README.md) để chi ti�
 
 #### Retrieval Service
 
-Tùy chọn, sở hữu Qdrant:
+Bắt buộc, sở hữu Qdrant:
 
 ```bash
 cd retrieval_service
@@ -338,8 +336,6 @@ pip install -r requirements.txt
 cp .env.example .env
 uvicorn app.main:app --host 0.0.0.0 --port 8300
 ```
-
-Để `RETRIEVAL_SERVICE_URL` trống → backend dùng Qdrant embedded local.
 
 Xem [retrieval_service/README.md](../retrieval_service/README.md) để chi tiết.
 
@@ -360,6 +356,7 @@ Response `status=ok` nếu tất cả services sẵn sàng.
 - `OLLAMA_API_KEY`: API key xác thực qua header `x-api-key` (yêu cầu, phải trùng với `SHIELD_API_KEY` của ollama_service)
 - `OLLAMA_CHAT_MODEL`: Model name cho chat (có thể để `default`, ollama_service sẽ override)
 - `OLLAMA_EMBEDDING_MODEL`: Model name cho embedding (có thể để `default`)
+- `ORCHESTRATOR_TIMEOUT_SECONDS` (tùy chọn): timeout backend khi gọi endpoint orchestrator của `ollama_service` (default: 30s)
 
 ### Core Settings
 
@@ -381,13 +378,11 @@ CORS_ALLOW_ORIGIN_REGEX=^http(s)?://(localhost|.*\.example\.com).*
   - Nếu không khả dụng → upload/embed sẽ fail
 - `INGESTION_TIMEOUT_SECONDS`: HTTP timeout (default: 300s)
 
-**Retrieval Service** (tùy chọn, khuyến nghị):
+**Retrieval Service** (bắt buộc):
 - `RETRIEVAL_SERVICE_URL`: URL tới retrieval_service, ví dụ `http://localhost:8300`
-  - Nếu trống → backend dùng local Qdrant (fallback mode)
-  - Khuyến nghị để cho retrieval_service sở hữu Qdrant
 - `RETRIEVAL_TIMEOUT_SECONDS`: HTTP timeout (default: 60s)
 
-### Vector Storage (Qdrant)
+### Vector Storage (Qdrant via retrieval_service)
 
 ```env
 QDRANT_URL=                                 # Empty = local embedded mode
@@ -396,9 +391,7 @@ QDRANT_COLLECTION_NAME=documents
 QDRANT_API_KEY=                             # Required if QDRANT_URL is set
 ```
 
-- Nếu `QDRANT_URL` trống → backend dùng embedded Qdrant (local mode)
-- Nếu `QDRANT_URL` set → backend dùng remote Qdrant server (khuyến nghị cho production)
-- Data persisted tại: `backend/storage/indexes/global_qdrant/`
+Backend không query Qdrant trực tiếp trong runtime chat/retrieval. Qdrant được quản lý bởi `retrieval_service`.
 
 ### Document Processing
 
@@ -550,7 +543,7 @@ Backend dùng `BackgroundTasks` để xử lý indexing không đồng bộ:
 |---------|--------|-----------------|-------------------|
 | `ollama_service` | ✓ REQUIRED | N/A | ✗ Fail (503) |
 | `ingestion_service` | ○ Recommended | Parse local | ✗ Fail (503) |
-| `retrieval_service` | ○ Recommended | Use local Qdrant fallback | ✗ Use local fallback |
+| `retrieval_service` | ✓ Required | Handles search/index/delete | Query/index unavailable |
 | Qdrant | ○ Optional | Embedded local (`QDRANT_PATH`) | N/A |
 
 **Recommended Production Setup:**
@@ -594,7 +587,7 @@ rm backend/storage/app.db
 - Check `RETRIEVAL_SERVICE_URL` is set
 - Verify documents indexed successfully (status = `embedded`)
 - Try: `curl http://localhost:8300/ready` (retrieval_service health)
-- Check hybrid search parameters (top_k, filters)
+- Check retrieval request parameters (top_k, filters)
 
 **LLM not responding**
 - Check `OLLAMA_BASE_URL` is reachable

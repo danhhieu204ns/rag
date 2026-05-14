@@ -3,9 +3,9 @@
 Service shield/proxy đặt trước Ollama. Backend chỉ gọi service này, còn service sẽ:
 
 - Bảo vệ API bằng header `x-api-key`.
-- Ép model theo cấu hình server cho chat và embedding.
+- Ép model theo cấu hình server cho chat, orchestrator và embedding.
 - Giới hạn số request/phút, độ dài prompt/input, số message và `num_predict`.
-- Ép `stream=false` trên các route proxy tương thích và giữ `num_predict` không vượt quá giới hạn cấu hình.
+- Ép `stream=false` trên các route `/v1/*`; các route native `/api/chat` và `/api/generate` giữ streaming khi client gửi `stream=true`.
 - Cung cấp cả route proxy ổn định (`/v1/*`) lẫn native Ollama (`/api/*`) để dùng với `ChatOllama` và `OllamaEmbeddings`.
 - Chỉ cung cấp inference endpoints; `POST /v1/indexing/batch` bị vô hiệu hóa và trả `410 Gone`.
 
@@ -31,17 +31,21 @@ OLLAMA_UPSTREAM_BASE_URL=http://127.0.0.1:11434
 SHIELD_API_KEY=change-this-key
 
 CHAT_MODEL=qwen3:30b-a3b-instruct-2507-q4_K_M
+ORCHESTRATOR_MODEL=qwen3:4b-instruct-2507-q4_K_M
 EMBEDDING_MODEL=qwen3-embedding:0.6b
 
 MAX_CHAT_CHARS=24000
 MAX_EMBEDDING_CHARS=12000
 MAX_MESSAGES=20
 MAX_CHAT_NUM_PREDICT=2048
+ORCHESTRATOR_NUM_PREDICT=500
+ORCHESTRATOR_TEMPERATURE=0.0
 RATE_LIMIT_PER_MINUTE=30
 
 # Timeout settings (seconds)
 OLLAMA_CONNECT_TIMEOUT_SECONDS=10
 OLLAMA_CHAT_TIMEOUT_SECONDS=240
+OLLAMA_ORCHESTRATOR_TIMEOUT_SECONDS=30
 OLLAMA_EMBEDDING_TIMEOUT_SECONDS=180
 
 # Optional
@@ -75,6 +79,7 @@ Protected bằng `x-api-key`:
 - `GET /api/tags`
 - `POST /v1/chat`
 - `POST /v1/generate`
+- `POST /v1/orchestrator/classify`
 - `POST /v1/indexing/batch` trả `410 Gone`; LLM metadata indexing đã bị tắt.
 - `POST /v1/embed`
 - `POST /api/chat`
@@ -84,7 +89,8 @@ Protected bằng `x-api-key`:
 
 Ghi chú theo code hiện tại:
 
-- `/v1/chat`, `/v1/generate`, `/api/chat` và `/api/generate` đều ép `stream=false` và cap `num_predict` theo `MAX_CHAT_NUM_PREDICT`.
+- `/v1/chat` và `/v1/generate` ép `stream=false`; `/api/chat` và `/api/generate` stream NDJSON khi client gửi `stream=true`. Tất cả đều cap `num_predict` theo `MAX_CHAT_NUM_PREDICT`.
+- `/v1/orchestrator/classify` nhận `{ "query": "..." }`, dùng `ORCHESTRATOR_MODEL` và trả JSON đã chuẩn hóa: `query_type`, `requires_retrieval`, `confidence`, `reason`, `signals`.
 - `/v1/embed` nhận `input` là chuỗi hoặc danh sách chuỗi; `/api/embed` nhận `input` hoặc `prompt` và forward thêm `truncate`, `options`, `keep_alive`, `dimensions` khi có.
 - `/api/embeddings` là biến thể Ollama cũ hơn, chỉ nhận `prompt`.
 - `/v1/models` trả thêm `configured_models` ngoài dữ liệu `/api/tags` upstream.
@@ -94,6 +100,7 @@ Ghi chú theo code hiện tại:
 Backend hiện dùng:
 
 - Chat/RAG: `POST /api/chat` qua `ChatOllama`.
+- Orchestrator: `POST /v1/orchestrator/classify`.
 - Embedding: `POST /api/embed` qua `OllamaEmbeddings`.
 - Indexing only uses embeddings. Ingestion no longer calls LLM metadata indexing.
 

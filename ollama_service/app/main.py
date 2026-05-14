@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi.responses import StreamingResponse
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[1]
 _REPO_ROOT = _SERVICE_ROOT.parent
@@ -20,7 +22,9 @@ from .core.settings import settings
 from .ollama_client import (
     enforce_num_predict,
     get_ollama,
+    iter_ollama_stream,
     model_dump,
+    open_ollama_stream,
     post_ollama,
     validate_text_batch,
     validate_text_length,
@@ -34,10 +38,28 @@ from .schemas import (
     OllamaNativeEmbedRequest,
     OllamaNativeEmbeddingsRequest,
     OllamaNativeGenerateRequest,
+    OrchestratorClassifyRequest,
 )
 
 
 logger = logging.getLogger(__name__)
+
+
+_ORCHESTRATOR_SYSTEM_PROMPT = """You are a strict query router for a Vietnamese RAG assistant.
+Return ONLY valid JSON with this schema:
+{
+  "query_type": "greeting|chitchat|needs_retrieval",
+  "requires_retrieval": true|false,
+  "confidence": 0.0-1.0,
+  "reason": "short reason",
+  "signals": ["..."]
+}
+Rules:
+- greeting/chitchat (hello, thanks, social small talk, identity questions about the assistant)
+  => requires_retrieval=false
+- questions requiring factual/document knowledge => requires_retrieval=true
+- be conservative: if unsure, requires_retrieval=true
+"""
 
 
 def _ms(start: float) -> float:
@@ -88,6 +110,7 @@ async def health() -> dict[str, Any]:
         "service": "ollama-fastapi-shield",
         "models": {
             "chat": settings.chat_model,
+            "orchestrator": settings.orchestrator_model,
             "embedding": settings.embedding_model,
         },
     }
@@ -146,6 +169,7 @@ async def list_models(api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     return {
         "configured_models": {
             "chat": settings.chat_model,
+            "orchestrator": settings.orchestrator_model,
             "embedding": settings.embedding_model,
         },
         "ollama_models": models,
@@ -235,6 +259,72 @@ async def generate(req: GenerateRequest, api_key: str = Depends(verify_api_key))
     )
     logger.info("[ollama-service][generate] response sent model=%s elapsed_ms=%.2f", model_name, _ms(request_start))
     return result
+
+
+@app.post("/v1/orchestrator/classify")
+async def orchestrator_classify(
+    req: OrchestratorClassifyRequest,
+    api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    request_start = time.perf_counter()
+    logger.info("[ollama-service][orchestrator] request received query_chars=%d", len(req.query))
+
+    logger.debug("[ollama-service][orchestrator] step=enforce_rate_limit")
+    enforce_rate_limit(api_key, "orchestrator")
+    logger.debug("[ollama-service][orchestrator] step=rate_limit_ok elapsed_ms=%.2f", _ms(request_start))
+
+    logger.debug("[ollama-service][orchestrator] step=validate_query max_chars=%d", settings.max_chat_chars)
+    validate_text_length(req.query, settings.max_chat_chars, "query")
+    logger.debug("[ollama-service][orchestrator] step=validate_ok elapsed_ms=%.2f", _ms(request_start))
+
+    logger.debug(
+        "[ollama-service][orchestrator] step=construct_payload model=%s",
+        settings.orchestrator_model,
+    )
+    payload: dict[str, Any] = {
+        "model": settings.orchestrator_model,
+        "messages": [
+            {"role": "system", "content": _ORCHESTRATOR_SYSTEM_PROMPT},
+            {"role": "user", "content": req.query},
+        ],
+        "format": "json",
+        "options": {
+            "temperature": settings.orchestrator_temperature,
+            "num_predict": settings.orchestrator_num_predict,
+        },
+        "stream": False,
+    }
+    payload = enforce_num_predict(payload, settings.orchestrator_num_predict)
+    logger.debug("[ollama-service][orchestrator] step=payload_ready elapsed_ms=%.2f", _ms(request_start))
+
+    logger.debug(
+        "[ollama-service][orchestrator] step=call_upstream timeout_seconds=%.1f",
+        settings.ollama_orchestrator_timeout_seconds,
+    )
+    result = await post_ollama(
+        "/api/chat",
+        payload,
+        timeout_seconds=settings.ollama_orchestrator_timeout_seconds,
+    )
+    content = (result.get("message") or {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+        logger.error("[ollama-service][orchestrator] empty upstream content")
+        raise HTTPException(status_code=502, detail="Orchestrator model returned empty content.")
+
+    parsed = _parse_orchestrator_json(content)
+    if parsed is None:
+        logger.error("[ollama-service][orchestrator] invalid JSON content=%s", content[:300])
+        raise HTTPException(status_code=502, detail="Orchestrator model returned invalid JSON.")
+
+    response = _normalize_orchestrator_result(parsed)
+    logger.info(
+        "[ollama-service][orchestrator] response sent model=%s type=%s requires_retrieval=%s elapsed_ms=%.2f",
+        settings.orchestrator_model,
+        response["query_type"],
+        response["requires_retrieval"],
+        _ms(request_start),
+    )
+    return response
 
 
 @app.post("/v1/indexing/batch")
@@ -389,8 +479,11 @@ async def native_embeddings(
     return result
 
 
-@app.post("/api/chat")
-async def native_chat(req: OllamaNativeChatRequest, api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+@app.post("/api/chat", response_model=None)
+async def native_chat(
+    req: OllamaNativeChatRequest,
+    api_key: str = Depends(verify_api_key),
+) -> Any:
     started = time.perf_counter()
     logger.info("[ollama-service][api_chat] request received messages=%d", len(req.messages))
     
@@ -413,10 +506,27 @@ async def native_chat(req: OllamaNativeChatRequest, api_key: str = Depends(verif
     if req.keep_alive is not None:
         payload["keep_alive"] = req.keep_alive
 
-    payload = enforce_num_predict(payload, settings.max_chat_num_predict)
+    payload = enforce_num_predict(payload, settings.max_chat_num_predict, stream=req.stream)
     logger.debug("[ollama-service][api_chat] step=payload_ready num_messages=%d elapsed_ms=%.2f", len(req.messages), _ms(started))
     
     logger.debug("[ollama-service][api_chat] step=call_upstream timeout_seconds=%d", settings.ollama_chat_timeout_seconds)
+    if req.stream:
+        client, response = await open_ollama_stream(
+            "/api/chat",
+            payload,
+            timeout_seconds=settings.ollama_chat_timeout_seconds,
+        )
+        logger.info("[ollama-service][api_chat] stream response started elapsed_ms=%.2f", _ms(started))
+        return StreamingResponse(
+            iter_ollama_stream(client, response, path="/api/chat", started=started),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     result = await post_ollama(
         "/api/chat",
         payload,
@@ -426,8 +536,11 @@ async def native_chat(req: OllamaNativeChatRequest, api_key: str = Depends(verif
     return result
 
 
-@app.post("/api/generate")
-async def native_generate(req: OllamaNativeGenerateRequest, api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+@app.post("/api/generate", response_model=None)
+async def native_generate(
+    req: OllamaNativeGenerateRequest,
+    api_key: str = Depends(verify_api_key),
+) -> Any:
     started = time.perf_counter()
     logger.info("[ollama-service][api_generate] request received prompt_chars=%d", len(req.prompt))
     
@@ -452,10 +565,27 @@ async def native_generate(req: OllamaNativeGenerateRequest, api_key: str = Depen
     if req.keep_alive is not None:
         payload["keep_alive"] = req.keep_alive
 
-    payload = enforce_num_predict(payload, settings.max_chat_num_predict)
+    payload = enforce_num_predict(payload, settings.max_chat_num_predict, stream=req.stream)
     logger.debug("[ollama-service][api_generate] step=payload_ready elapsed_ms=%.2f", _ms(started))
     
     logger.debug("[ollama-service][api_generate] step=call_upstream timeout_seconds=%d", settings.ollama_chat_timeout_seconds)
+    if req.stream:
+        client, response = await open_ollama_stream(
+            "/api/generate",
+            payload,
+            timeout_seconds=settings.ollama_chat_timeout_seconds,
+        )
+        logger.info("[ollama-service][api_generate] stream response started elapsed_ms=%.2f", _ms(started))
+        return StreamingResponse(
+            iter_ollama_stream(client, response, path="/api/generate", started=started),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     result = await post_ollama(
         "/api/generate",
         payload,
@@ -463,6 +593,78 @@ async def native_generate(req: OllamaNativeGenerateRequest, api_key: str = Depen
     )
     logger.info("[ollama-service][api_generate] response sent elapsed_ms=%.2f", _ms(started))
     return result
+
+
+def _parse_orchestrator_json(content: str) -> dict[str, Any] | None:
+    text = _strip_json_response(content)
+    candidates = [text]
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        candidates.append("\n".join(lines).strip())
+
+    decoder = json.JSONDecoder()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+
+        for index, char in enumerate(candidate):
+            if char != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(candidate[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+
+    return None
+
+
+def _strip_json_response(content: str) -> str:
+    text = str(content or "").strip()
+    while "<think>" in text and "</think>" in text:
+        start = text.find("<think>")
+        end = text.find("</think>", start)
+        if end < 0:
+            break
+        text = (text[:start] + text[end + len("</think>"):]).strip()
+    return text.replace("<think>", "").replace("</think>", "").strip()
+
+
+def _normalize_orchestrator_result(parsed: dict[str, Any]) -> dict[str, Any]:
+    requires_retrieval = bool(parsed.get("requires_retrieval", True))
+    query_type = str(parsed.get("query_type") or "").strip()
+    if query_type not in {"greeting", "chitchat", "needs_retrieval"}:
+        query_type = "needs_retrieval" if requires_retrieval else "chitchat"
+
+    confidence_raw = parsed.get("confidence", 0.0)
+    try:
+        confidence = max(0.0, min(1.0, float(confidence_raw)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    signals = parsed.get("signals") or []
+    if not isinstance(signals, list):
+        signals = [str(signals)]
+
+    return {
+        "query_type": query_type,
+        "requires_retrieval": requires_retrieval,
+        "confidence": confidence,
+        "reason": str(parsed.get("reason") or ""),
+        "signals": [str(item) for item in signals if item],
+    }
 
 
 def _validate_messages(messages: list[Any]) -> None:
