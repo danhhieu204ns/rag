@@ -106,23 +106,19 @@ def upsert_child_documents(
 def similarity_search(
     query: str,
     *,
-    top_k: int,
+    top_k: int | None,
     document_ids: list[int] | None = None,
     plan: Any | None = None,
 ) -> list[Document]:
     payload: dict[str, Any] = {
         "query": query,
-        "top_k": top_k,
         "filters": {
             "document_ids": document_ids or [],
             "metadata": {"index_type": "section_parent_child"},
         },
     }
-    
-    # Enable query rewriting from settings if not already set
-    if settings.query_rewrite_enabled and "enable_query_rewrite" not in payload:
-        payload["enable_query_rewrite"] = True
-
+    if top_k is not None:
+        payload["top_k"] = top_k
     started_at = time.perf_counter()
     response = _request(
         "POST",
@@ -190,7 +186,7 @@ def similarity_search(
 def _emit_retrieval_service_log(
     *,
     query: str,
-    top_k: int,
+    top_k: int | None,
     elapsed_ms: float,
     documents: list[Document],
     raw_context_count: int,

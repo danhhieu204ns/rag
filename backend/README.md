@@ -529,9 +529,9 @@ Backend dùng `BackgroundTasks` để xử lý indexing không đồng bộ:
 - Debug markdown: `ingestion_service/storage/markdown_logs/marker/` (nếu dùng marker)
 
 **Performance Tuning:**
-- `RETRIEVER_K`: Số context cuối đưa vào prompt mặc định khi request không truyền `top_k`
-- `CHUNK_SIZE`: Tăng → ít chunks hơn, nhưng context dài hơn
-- `CHUNK_OVERLAP`: Overlap để tránh mất context ở boundaries
+- `RETRIEVAL_TOP_K`: nằm trong `retrieval_service`; số context mặc định khi request không truyền `top_k`
+- `CHILD_CHUNK_SIZE`: nằm trong `ingestion_service`; tăng → ít chunks hơn, nhưng context dài hơn
+- `CHILD_CHUNK_OVERLAP`: nằm trong `ingestion_service`; overlap để tránh mất context ở boundaries
 - `RERANKER_ENABLED`: nằm trong `retrieval_service`; rerank candidate pool trước khi trả top_k
 
 **Scaling:**

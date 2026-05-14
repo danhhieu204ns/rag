@@ -30,6 +30,7 @@ from ..schemas import (
 )
 from ..services.ingestion_client import (
     build_index_bundle_from_markdown,
+    get_parser_mode,
     parse_source_to_markdown,
     upsert_index_bundle,
 )
@@ -143,7 +144,7 @@ def _get_or_parse_markdown(
     file_path: Path,
     file_hash: str,
 ) -> tuple[str, str, str, bool]:
-    parser_mode = settings.pdf_parser_mode
+    parser_mode = get_parser_mode()
     cached = _load_cached_markdown(
         document_id=document_id,
         file_hash=file_hash,

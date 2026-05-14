@@ -220,7 +220,12 @@ async def search_hybrid(request: RetrieveRequest) -> RetrieveResponse:
     # Optional: Rewrite query for better retrieval
     query_to_embed = request.query
     rewrite_details: dict[str, Any] = {}
-    if request.enable_query_rewrite:
+    enable_query_rewrite = (
+        request.enable_query_rewrite
+        if request.enable_query_rewrite is not None
+        else settings.query_rewrite_enabled
+    )
+    if enable_query_rewrite:
         from .services.query_rewrite import maybe_rewrite_query
         rewritten_query, rewrite_details = maybe_rewrite_query(request.query)
         if rewrite_details.get("rewritten"):
@@ -301,7 +306,10 @@ async def index_chunks(request: IndexChunksRequest) -> IndexChunksResponse:
 
     if texts_to_embed:
         embed_start = time.perf_counter()
-        embedded = await embed_texts(texts_to_embed)
+        embedded: list[list[float]] = []
+        for start in range(0, len(texts_to_embed), settings.embedding_batch_size):
+            batch = texts_to_embed[start : start + settings.embedding_batch_size]
+            embedded.extend(await embed_texts(batch))
         logger.info("[retrieval][index_chunks] step=embed_texts elapsed_ms=%.2f collection=%s to_embed=%d", _ms(embed_start), name, len(texts_to_embed))
         for index, vector in zip(text_indexes, embedded):
             vectors_by_index[index] = vector

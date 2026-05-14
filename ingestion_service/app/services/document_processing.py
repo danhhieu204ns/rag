@@ -255,7 +255,7 @@ def _render_pdf_with_marker(file_path: Path) -> tuple[str, dict[str, Any]]:
         from marker.converters.pdf import PdfConverter
     except ImportError as exc:  # pragma: no cover - depends on optional package
         raise ValueError(
-            "PDF_PARSER_MODE=marker requires marker-pdf to be installed in backend venv. "
+            "PDF_PARSER_MODE=marker requires marker-pdf to be installed in ingestion service venv. "
             "Run: pip install marker-pdf"
         ) from exc
 

@@ -17,6 +17,7 @@ class Settings:
     ollama_service_url: str
     ollama_api_key: str
     vector_batch_size: int
+    embedding_batch_size: int
     default_top_k: int
     search_child_chunks: bool
     expand_to_parent: bool
@@ -34,6 +35,9 @@ class Settings:
     bm25_bilingual_expansion: bool
     bm25_candidate_limit_multiplier: int
     bm25_extra_synonyms: str
+    query_rewrite_enabled: bool
+    query_rewrite_min_terms: int
+    query_rewrite_max_terms: int
 
 
 def _string_env(name: str, default: str) -> str:
@@ -117,6 +121,7 @@ def get_settings() -> Settings:
         ollama_service_url=_string_env("OLLAMA_SERVICE_URL", "http://localhost:8200").rstrip("/"),
         ollama_api_key=_string_env("OLLAMA_API_KEY", ""),
         vector_batch_size=max(1, _int_env("VECTOR_BATCH_SIZE", 64)),
+        embedding_batch_size=max(1, _int_env("EMBEDDING_BATCH_SIZE", 128)),
         default_top_k=max(1, _int_env("RETRIEVAL_TOP_K", 5)),
         search_child_chunks=_bool_env("RETRIEVAL_SEARCH_CHILD_CHUNKS", True),
         expand_to_parent=_bool_env("RETRIEVAL_EXPAND_TO_PARENT", True),
@@ -134,6 +139,9 @@ def get_settings() -> Settings:
         bm25_bilingual_expansion=_bool_env("BM25_BILINGUAL_EXPANSION", True),
         bm25_candidate_limit_multiplier=max(1, _int_env("BM25_CANDIDATE_LIMIT_MULTIPLIER", 10)),
         bm25_extra_synonyms=_string_env("BM25_EXTRA_SYNONYMS", ""),
+        query_rewrite_enabled=_bool_env("QUERY_REWRITE_ENABLED", False),
+        query_rewrite_min_terms=max(1, _int_env("QUERY_REWRITE_MIN_TERMS", 5)),
+        query_rewrite_max_terms=max(1, _int_env("QUERY_REWRITE_MAX_TERMS", 12)),
     )
 
 

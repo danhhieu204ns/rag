@@ -34,6 +34,23 @@ def _raise_service_error(response: httpx.Response) -> None:
     )
 
 
+def get_parser_mode() -> str:
+    _require_service_url()
+    try:
+        url = _service_url("/ready")
+        with httpx.Client(timeout=settings.ingestion_timeout_seconds) as client:
+            response = client.get(url)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError("Ingestion service request timed out while checking parser mode.") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"Failed to connect to ingestion service: {exc}") from exc
+
+    if response.status_code >= 400:
+        _raise_service_error(response)
+    payload = response.json()
+    return str(payload.get("parser_mode") or "legacy").strip().lower()
+
+
 def parse_source_to_markdown(file_path: Path) -> tuple[str, str, str]:
     _require_service_url()
 

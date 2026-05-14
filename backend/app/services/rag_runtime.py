@@ -47,7 +47,7 @@ def retrieval_service_enabled() -> bool:
 
 def similarity_search(
     query: str,
-    top_k: int,
+    top_k: int | None,
     db: Session | None = None,
     document_ids: list[int] | None = None,
     plan: OrchestrationPlan | None = None,

@@ -209,7 +209,7 @@ def query_chat(
     """Run one RAG query, save both user and assistant messages, and stream the response."""
 
     user_text = payload.message.strip()
-    top_k = payload.top_k or settings.retriever_k
+    top_k = payload.top_k
 
     return StreamingResponse(
         _run_query_chat_stream(payload, user_text, top_k, db, current_user),
@@ -225,7 +225,7 @@ def query_chat(
 def _run_query_chat_stream(
     payload: ChatQueryRequest,
     user_text: str,
-    top_k: int,
+    top_k: int | None,
     db: Session,
     current_user: User,
 ):
@@ -240,7 +240,7 @@ def _run_query_chat_stream(
 def _run_query_chat_stream_inner(
     payload: ChatQueryRequest,
     user_text: str,
-    top_k: int,
+    top_k: int | None,
     db: Session,
     _qlog,
     current_user: User,
@@ -248,9 +248,9 @@ def _run_query_chat_stream_inner(
     request_started_at = time.perf_counter()
 
     _emit_query_progress(
-        "[chat.query] Start stream request: session_id=%s, top_k=%d, document_filter=%s, message='%s'",
+        "[chat.query] Start stream request: session_id=%s, top_k=%s, document_filter=%s, message='%s'",
         payload.session_id,
-        top_k,
+        top_k if top_k is not None else "retrieval_service_default",
         payload.document_ids or [],
         _preview_text(user_text),
     )

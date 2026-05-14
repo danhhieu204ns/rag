@@ -13,7 +13,7 @@ class RetrievalFilters(BaseModel):
 class RetrieveRequest(BaseModel):
     query: str = Field(..., min_length=1)
     collection: str | None = None
-    top_k: int = Field(default=5, ge=1, le=50)
+    top_k: int | None = Field(default=None, ge=1, le=50)
     filters: RetrievalFilters | None = None
     # Strategy parameters (optional, defaults provided by service)
     vector_weight: float | None = None  # RRF weight for vector search (default: 1.0)

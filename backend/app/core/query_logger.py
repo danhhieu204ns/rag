@@ -32,7 +32,7 @@ def get_query_log() -> QueryLog | None:
 def query_logging_context(
     query: str,
     session_id: int | None,
-    top_k: int,
+    top_k: int | None,
 ) -> Iterator[QueryLog]:
     """
     Context manager tạo QueryLog, gắn vào context var,
@@ -73,7 +73,7 @@ class QueryLog:
     dễ đọc theo từng phase: retrieval (semantic, keyword, RRF, rerank) + generation.
     """
 
-    def __init__(self, query: str, session_id: int | None, top_k: int) -> None:
+    def __init__(self, query: str, session_id: int | None, top_k: int | None) -> None:
         self._query = query
         self._session_id = session_id
         self._top_k = top_k
@@ -226,7 +226,7 @@ class QueryLog:
         kv("Session ID", self._session_id if self._session_id is not None else "-")
         kv("Trace ID", self._trace_id or "-")
         kv("Câu hỏi", _preview(self._query, 100))
-        kv("Top-K", self._top_k)
+        kv("Top-K", self._top_k if self._top_k is not None else "retrieval_service_default")
         sep()
 
         # ── PHASE 1 — RETRIEVAL ─────────────────────────────────────────
@@ -279,7 +279,7 @@ class QueryLog:
         if d:
             parent_ids = d.get("semantic_parent_ids", [])
             child_types = d.get("semantic_child_type_preview", {})
-            n = min(self._top_k, len(parent_ids))
+            n = min(self._top_k or len(parent_ids), len(parent_ids))
             kv("  Parent chunks tổng", len(parent_ids))
             sem_chunks: dict[int, dict[str, Any]] = {
                 int(c["chunk_id"]): c
@@ -324,7 +324,7 @@ class QueryLog:
         d = self._keyword
         if d:
             selected = d.get("keyword_selected_parent_ids", [])
-            n = min(self._top_k, len(selected))
+            n = min(self._top_k or len(selected), len(selected))
             kv("  Parent chunks tổng", len(selected))
             # DB fallback có keyword_selected_chunks với score đầy đủ
             kw_chunks: dict[int, dict[str, Any]] = {
@@ -369,7 +369,7 @@ class QueryLog:
             kv("  Vector pool", f"{len(vec_ids)} chunks")
             kv("  Keyword pool", f"{len(kw_ids)} chunks")
             kv("  Merged pool", f"{len(merged)} chunks (input cho reranker/output)")
-            n = min(self._top_k, len(score_preview))
+            n = min(self._top_k or len(score_preview), len(score_preview))
             lines.append(f"  Top {n} merged (RRF score):")
             lines.append(f"    {'rank':<7}  {'chunk_id':<12}  {'rrf_score':<14}  mode")
             lines.append("    " + "-" * 50)

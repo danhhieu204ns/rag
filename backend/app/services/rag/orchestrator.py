@@ -93,7 +93,7 @@ class OrchestrationPlan:
     query_type: str
     output_mode: OutputMode
     strategy: QueryStrategy
-    top_k: int
+    top_k: int | None
     max_iterations: int
     expand_query: bool
     signals: list[str] = field(default_factory=list)
@@ -146,7 +146,7 @@ def _looks_like_retrieval_query(query: str) -> bool:
 
 def classify_query(
     query: str,
-    base_top_k: int,
+    base_top_k: int | None,
     output_mode_override: OutputMode | None = None,
 ) -> OrchestrationPlan:
     started_at = time.perf_counter()
@@ -198,13 +198,13 @@ def _emit_plan(query: str, started_at: float, plan: OrchestrationPlan) -> Orches
     llm_reason = getattr(plan, "llm_reason", None)
 
     _emit_query_progress(
-        "[orchestrator] src=%s type=%s mode=%s strategy=%s top_k=%d "
+        "[orchestrator] src=%s type=%s mode=%s strategy=%s top_k=%s "
         "retrieval_defaults=retrieval_service iters=%d signals=%s (%.2fms)",
         src,
         plan.query_type,
         plan.output_mode,
         plan.strategy,
-        plan.top_k,
+        plan.top_k if plan.top_k is not None else "retrieval_service_default",
         plan.max_iterations,
         plan.signals,
         elapsed,
