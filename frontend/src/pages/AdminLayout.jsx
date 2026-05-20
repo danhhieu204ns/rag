@@ -7,7 +7,7 @@ function AdminLayout({ onLogout }) {
         <div className="brand-wrap" style={{ padding: "1.5rem", borderBottom: "1px solid var(--border-light)", marginBottom: "1rem" }}>
           <h1 style={{ fontSize: "1.25rem", margin: 0 }}>
             <span className="brand-red">viettel</span>
-            <span className="brand-black">Admin</span>
+            <span className="brand-black">Academy</span>
           </h1>
         </div>
         <nav className="admin-nav" style={{ display: "flex", flexDirection: "column", gap: "0.5rem", padding: "0 1rem" }}>

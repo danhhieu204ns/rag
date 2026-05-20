@@ -49,7 +49,7 @@ function LoginPage({ onLogin }) {
       <form className="admin-login-card" onSubmit={submitLogin}>
         <div className="brand-wrap">
           <h1>
-            <span className="brand-red">viettel</span>
+            <span className="brand-red">vtaca</span>
             <span className="brand-black">Chatbot</span>
           </h1>
           <h2>Đăng nhập Hệ thống</h2>

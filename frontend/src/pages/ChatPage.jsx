@@ -296,7 +296,7 @@ function AssistantMessage({ msg }) {
     <div className="cgpt-assistant-row">
       <BotAvatar />
       <div className="cgpt-assistant-content">
-        <div className="cgpt-assistant-name">ViettelRAG</div>
+        <div className="cgpt-assistant-name">VTAca RAG</div>
 
         {thinking !== null && (
           <ThinkBlock content={thinking} isStreaming={isThinking} />
@@ -589,7 +589,7 @@ function ChatPage({ user, onLogout }) {
             </button>
           </div>
           <div className="cgpt-model-pill">
-            <span>ViettelRAG</span>
+            <span>Trợ lý tri thức VTAca</span>
             <IconChevronDown />
           </div>
           <div className="cgpt-topbar-right">
@@ -632,7 +632,7 @@ function ChatPage({ user, onLogout }) {
                   <div className="cgpt-assistant-row">
                     <BotAvatar />
                     <div className="cgpt-assistant-content">
-                      <div className="cgpt-assistant-name">ViettelRAG</div>
+                      <div className="cgpt-assistant-name">VTAca RAG</div>
                       <div className="cgpt-typing">
                         <span /><span /><span />
                       </div>
@@ -672,7 +672,7 @@ function ChatPage({ user, onLogout }) {
             </div>
           </form>
           {error && <p className="cgpt-error">{error}</p>}
-          <p className="cgpt-disclaimer">ViettelRAG có thể mắc lỗi. Hãy kiểm tra các thông tin quan trọng.</p>
+          <p className="cgpt-disclaimer">Trợ lý tri thức có thể mắc lỗi. Hãy kiểm tra các thông tin quan trọng.</p>
         </div>
       </main>
     </div>
