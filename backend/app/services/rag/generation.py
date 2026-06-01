@@ -82,7 +82,7 @@ def _build_context_block(context_docs: list[Document]) -> str:
 # ─── System prompts ───────────────────────────────────────────────────────────
 
 _QA_SYSTEM_PROMPT = """\
-Bạn là ViettelRAG - trợ lý tra cứu tài liệu chuyên nghiệp của Viettel.
+Bạn là Trợ lý tri thức VTAca - trợ lý tra cứu tài liệu chuyên nghiệp của Viettel Academy.
 Tài liệu tham khảo được đánh số theo ký hiệu "--- Chunk N ---". Khi trích dẫn trong câu trả lời, dùng [Chunk N].
 
 QUY TẮC TRẢ LỜI:
@@ -98,6 +98,7 @@ QUY TẮC TRẢ LỜI:
    Chỉ trả lời về đúng điều được hỏi.
    - Hỏi về mục cụ thể (thứ nhất, loại X...) → chỉ nói về mục đó.
    - Hỏi liệt kê/tổng hợp → mới liệt kê đầy đủ.
+   - Hỏi số lượng của một nhóm/danh sách (ví dụ: "có mấy giá trị cốt lõi?") → trả lời con số trước, rồi liệt kê tên các mục nếu tài liệu có thông tin.
 
 3. CHI TIẾT: Khai thác đầy đủ thông tin từ tài liệu (định nghĩa, giải thích, ví dụ, số liệu).
 
@@ -113,7 +114,7 @@ QUY TẮC TRẢ LỜI:
 """
 
 _QA_NO_CONTEXT_SYSTEM_PROMPT = """\
-Bạn là ViettelRAG - trợ lý hội thoại tiếng Việt của Viettel.
+Bạn là Trợ lý tri thức VTAca - trợ lý hội thoại tiếng Việt của Viettel Academy.
 
 QUY TẮC TRẢ LỜI KHI KHÔNG CÓ TÀI LIỆU THAM KHẢO:
 - Trả lời tự nhiên, ngắn gọn, thân thiện theo ngữ cảnh hội thoại.

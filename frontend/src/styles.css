@@ -574,6 +574,42 @@ button.danger:hover {
   margin-bottom: 4px;
 }
 
+.cgpt-stream-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  color: #667085;
+  font-size: 14px;
+}
+
+.cgpt-stream-error {
+  color: #b42318;
+}
+
+.cgpt-answer-complete {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 8px;
+  color: #7a828f;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.cgpt-complete-check {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 1px solid #c7ccd4;
+  color: #19a66f;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+}
+
 .cgpt-msg-text {
   font-size: 15px;
   line-height: 1.7;
@@ -818,6 +854,10 @@ button.danger:hover {
   align-items: center;
   gap: 5px;
   padding: 6px 0;
+}
+
+.cgpt-typing-inline {
+  padding: 0;
 }
 
 .cgpt-typing span {
@@ -1096,7 +1136,9 @@ button.danger:hover {
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  background: linear-gradient(180deg, #0c0f1b, #110d1a);
+  background:
+    linear-gradient(rgba(8, 9, 14, 0), rgba(8, 9, 14, 0)),
+    url("./assets/image/viettel.jpg") center / cover no-repeat;
 }
 
 .admin-login-page::before,

@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import "katex/dist/katex.min.css";
 import api from "../api";
 
 // ── Icons ──────────────────────────────────────────────────────────────────
@@ -182,7 +185,11 @@ function MarkdownWithCitations({ content, sources }) {
   const clean = content.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<\/?think>/g, "").trim();
   return (
     <div className="md-body">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMdComponents(sources)}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex]}
+        components={makeMdComponents(sources)}
+      >
         {clean}
       </ReactMarkdown>
     </div>
@@ -208,7 +215,12 @@ function ThinkBlock({ content, isStreaming }) {
         )}
       </summary>
       <div className="think-block-body">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm, remarkMath]}
+          rehypePlugins={[rehypeKatex]}
+        >
+          {content}
+        </ReactMarkdown>
       </div>
     </details>
   );
@@ -266,6 +278,20 @@ function SourcesPanel({ sources }) {
   );
 }
 
+function normalizeChatMessages(items) {
+  return items.map((item) =>
+    item.role === "assistant"
+      ? {
+          ...item,
+          isComplete: true,
+          error: item.content?.trim()
+            ? ""
+            : "Câu trả lời trước đó không có nội dung. Bạn vui lòng gửi lại câu hỏi.",
+        }
+      : item
+  );
+}
+
 // ── Parse think block from message content ─────────────────────────────────
 
 function parseContent(content) {
@@ -291,6 +317,7 @@ function AssistantMessage({ msg }) {
   const { thinking, answer, isThinking } = parseContent(msg.content);
   const sources = msg.sources ?? [];
   const answerText = thinking !== null ? answer : msg.content;
+  const status = msg.error || msg.status || (msg.isComplete ? "" : "Đang xử lý...");
 
   return (
     <div className="cgpt-assistant-row">
@@ -304,6 +331,24 @@ function AssistantMessage({ msg }) {
 
         {answerText && (
           <MarkdownWithCitations content={answerText} sources={sources} />
+        )}
+
+        {!answerText && !thinking && status && (
+          <div className={`cgpt-stream-status${msg.error ? " cgpt-stream-error" : ""}`}>
+            {!msg.error && (
+              <div className="cgpt-typing cgpt-typing-inline">
+                <span /><span /><span />
+              </div>
+            )}
+            <span>{status}</span>
+          </div>
+        )}
+
+        {answerText && msg.isComplete && (
+          <div className="cgpt-answer-complete" title="Câu trả lời đã hoàn tất">
+            <span className="cgpt-complete-check" aria-hidden="true">✓</span>
+            <span>Hoàn tất</span>
+          </div>
         )}
 
       </div>
@@ -325,6 +370,7 @@ function ChatPage({ user, onLogout }) {
   const [searchQuery, setSearchQuery] = useState("");
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
+  const sendLockRef = useRef(false);
 
   const filteredSessions = useMemo(() => {
     if (!searchQuery.trim()) return sessions;
@@ -352,7 +398,7 @@ function ChatPage({ user, onLogout }) {
   async function fetchMessages(sessionId) {
     if (!sessionId) { setMessages([]); return; }
     const response = await api.get(`/chat/sessions/${sessionId}/messages`);
-    setMessages(response.data);
+    setMessages(normalizeChatMessages(response.data));
   }
 
   function createSession() {
@@ -374,7 +420,8 @@ function ChatPage({ user, onLogout }) {
 
   async function sendMessage(event) {
     event.preventDefault();
-    if (!input.trim() || isSending) return;
+    if (!input.trim() || isSending || sendLockRef.current) return;
+    sendLockRef.current = true;
     setError("");
     setIsSending(true);
     setIsReceiving(false);
@@ -409,30 +456,63 @@ function ChatPage({ user, onLogout }) {
       let newSessionId = activeSessionId;
       let buffer = "";
 
-      let tokenQueue = [];
-      let isRenderingQueue = false;
+      let pendingTokenText = "";
+      let streamFrameId = null;
       let isStreamFinished = false;
+      let shouldMarkComplete = false;
       let resolveQueue = null;
       const queuePromise = new Promise((resolve) => { resolveQueue = resolve; });
 
-      const processQueue = () => {
-        if (tokenQueue.length === 0) {
-          isRenderingQueue = false;
-          if (isStreamFinished) resolveQueue();
-          return;
-        }
-        isRenderingQueue = true;
-        const chunk = tokenQueue.shift();
+      function ensureAssistantMessage(status = "Đang xử lý...") {
+        if (isAssistantMessageAdded) return;
+        setMessages((prev) => [
+          ...prev,
+          { id: assistantMessageId, role: "assistant", content: "", sources: [], status, isComplete: false },
+        ]);
+        isAssistantMessageAdded = true;
+        setIsReceiving(true);
+      }
+
+      function updateAssistantStatus(status) {
+        ensureAssistantMessage(status);
         setMessages((prev) =>
           prev.map((msg) =>
-            msg.id === assistantMessageId ? { ...msg, content: msg.content + chunk } : msg
+            msg.id === assistantMessageId ? { ...msg, status } : msg
           )
         );
-        let delay = 30;
-        if (tokenQueue.length > 20) delay = 15;
-        if (tokenQueue.length > 50) delay = 5;
-        setTimeout(processQueue, delay);
-      };
+      }
+
+      function scheduleTokenFlush() {
+        if (streamFrameId !== null) return;
+        streamFrameId = window.requestAnimationFrame(flushPendingTokens);
+      }
+
+      function flushPendingTokens() {
+        streamFrameId = null;
+        if (pendingTokenText) {
+          const chunk = pendingTokenText;
+          pendingTokenText = "";
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMessageId
+                ? { ...msg, content: msg.content + chunk, status: "", isComplete: shouldMarkComplete }
+                : msg
+            )
+          );
+          shouldMarkComplete = false;
+        }
+        if (pendingTokenText) {
+          scheduleTokenFlush();
+        } else if (isStreamFinished) {
+          resolveQueue();
+        }
+      }
+
+      function appendStreamToken(content) {
+        ensureAssistantMessage("");
+        pendingTokenText += content || "";
+        scheduleTokenFlush();
+      }
 
       while (!doneReading) {
         const { value, done } = await reader.read();
@@ -451,27 +531,43 @@ function ChatPage({ user, onLogout }) {
             if (dataLines.length === 0) continue;
             try {
               const data = JSON.parse(dataLines.join("\n"));
-              if (!isAssistantMessageAdded && data.type !== "error") {
-                setMessages((prev) => [
-                  ...prev,
-                  { id: assistantMessageId, role: "assistant", content: "", sources: [] },
-                ]);
-                isAssistantMessageAdded = true;
-                setIsReceiving(true);
-              }
               if (data.type === "session") {
+                ensureAssistantMessage("Đang xử lý...");
                 newSessionId = data.session_id;
+              } else if (data.type === "status") {
+                updateAssistantStatus(data.message || "Đang xử lý...");
               } else if (data.type === "sources") {
+                ensureAssistantMessage("Đang chuẩn bị câu trả lời...");
                 setMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMessageId ? { ...msg, sources: data.sources } : msg
                   )
                 );
+              } else if (data.type === "output_mode") {
+                ensureAssistantMessage("Đang chuẩn bị câu trả lời...");
               } else if (data.type === "token") {
-                tokenQueue.push(data.content);
-                if (!isRenderingQueue) processQueue();
+                appendStreamToken(data.content);
+              } else if (data.type === "done") {
+                shouldMarkComplete = true;
+                if (!pendingTokenText) {
+                  setMessages((prev) =>
+                    prev.map((msg) =>
+                      msg.id === assistantMessageId
+                        ? { ...msg, status: "", isComplete: true }
+                        : msg
+                    )
+                  );
+                }
               } else if (data.type === "error") {
-                setError(data.detail || "Có lỗi xảy ra trong quá trình tạo câu trả lời.");
+                const detail = data.detail || "Có lỗi xảy ra trong quá trình tạo câu trả lời.";
+                setError(detail);
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === assistantMessageId
+                      ? { ...msg, status: "", error: detail, isComplete: true }
+                      : msg
+                  )
+                );
               }
             } catch (e) {
               console.error("Error parsing SSE data", e, eventBlock);
@@ -481,7 +577,8 @@ function ChatPage({ user, onLogout }) {
       }
 
       isStreamFinished = true;
-      if (!isRenderingQueue && tokenQueue.length === 0) resolveQueue();
+      if (pendingTokenText) scheduleTokenFlush();
+      else if (streamFrameId === null) resolveQueue();
       await queuePromise;
 
       await fetchSessions();
@@ -494,6 +591,7 @@ function ChatPage({ user, onLogout }) {
       console.error(err);
       setError("Không thể gửi câu hỏi hoặc mất kết nối.");
     } finally {
+      sendLockRef.current = false;
       setIsSending(false);
       setIsReceiving(false);
     }

@@ -49,8 +49,8 @@ function LoginPage({ onLogin }) {
       <form className="admin-login-card" onSubmit={submitLogin}>
         <div className="brand-wrap">
           <h1>
-            <span className="brand-red">vtaca</span>
-            <span className="brand-black">Chatbot</span>
+            <span className="brand-red">Trợ lý tri thức </span>
+            <span className="brand-black">VTAcademy</span>
           </h1>
           <h2>Đăng nhập Hệ thống</h2>
         </div>

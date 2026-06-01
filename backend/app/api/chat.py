@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 import time
+import unicodedata
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -33,6 +35,43 @@ from ..services.rag_runtime import (
 router = APIRouter(prefix="/chat", tags=["chat"])
 logger = logging.getLogger(__name__)
 
+_FAST_GREETING_INPUTS = {
+    "hi",
+    "hello",
+    "hey",
+    "helo",
+    "alo",
+    "aloo",
+    "chao",
+    "xin chao",
+    "chao a",
+    "chao ban",
+    "chao ad",
+    "xin chao ban",
+    "xin chao a",
+    "hello bot",
+    "hi bot",
+}
+_FAST_THANKS_INPUTS = {
+    "cam on",
+    "cam on a",
+    "cam on ban",
+    "cam on nhe",
+    "thanks",
+    "thank",
+    "thank you",
+    "thank u",
+    "ok thanks",
+    "oke thanks",
+}
+_FAST_IDENTITY_INPUTS = {
+    "ban la ai",
+    "ban la gi",
+    "ten ban la gi",
+    "who are you",
+    "what are you",
+}
+
 
 def _emit_query_progress(message: str, *args: object) -> None:
     text = message % args if args else message
@@ -44,6 +83,58 @@ def _preview_text(value: str, limit: int = 120) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+def _normalize_fast_reply_text(value: str) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "").casefold())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.replace("đ", "d")
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _fast_chat_reply(user_text: str) -> tuple[str, str, str] | None:
+    normalized = _normalize_fast_reply_text(user_text)
+    if normalized in _FAST_GREETING_INPUTS:
+        return (
+            "greeting",
+            "Xin chào! Mình là Trợ lý tri thức VTAca. Bạn muốn tra cứu nội dung nào trong tài liệu?",
+            "matched greeting fast path",
+        )
+    if normalized in _FAST_THANKS_INPUTS:
+        return (
+            "chitchat",
+            "Không có gì. Bạn cần mình hỗ trợ thêm nội dung nào?",
+            "matched thanks fast path",
+        )
+    if normalized in _FAST_IDENTITY_INPUTS:
+        return (
+            "chitchat",
+            "Mình là Trợ lý tri thức VTAca, hỗ trợ hỏi đáp và tra cứu thông tin từ tài liệu của hệ thống.",
+            "matched identity fast path",
+        )
+    return None
+
+
+def _record_fast_path_plan(_qlog, user_text: str, query_type: str, output_mode: str, reason: str) -> None:
+    _qlog.record(
+        "orchestrator_plan",
+        {
+            "query_preview": _preview_text(user_text),
+            "query_type": query_type,
+            "output_mode": output_mode,
+            "strategy": "balanced",
+            "top_k": None,
+            "retrieval_defaults_source": "local_fast_path",
+            "max_iterations": 0,
+            "expand_query": False,
+            "signals": ["low_latency_direct_reply"],
+            "orchestrator_source": "local_fast_path",
+            "confidence": 1.0,
+            "requires_retrieval": False,
+            "llm_reason": reason,
+            "elapsed_ms": 0.0,
+        },
+    )
 
 
 def _build_title_from_first_question(message: str) -> str:
@@ -303,6 +394,56 @@ def _run_query_chat_stream_inner(
     db.commit()
     _emit_query_progress("[chat.query] Saved user message: session_id=%d", session.id)
 
+    # Send the first event before orchestration/retrieval so the UI stays alive
+    # while slower backend steps are running.
+    yield ": stream-start\n\n"
+    yield _sse({"type": "session", "session_id": session.id})
+    yield _sse({"type": "status", "message": "Đang xử lý câu hỏi..."})
+
+    fast_reply = _fast_chat_reply(user_text)
+    if fast_reply is not None:
+        query_type, answer, fast_reason = fast_reply
+        output_mode = payload.output_mode or "qa"
+        sources: list[dict] = []
+        _record_fast_path_plan(_qlog, user_text, query_type, output_mode, fast_reason)
+        _emit_query_progress(
+            "[chat.query] Fast direct reply: query_type=%s reason=%s",
+            query_type,
+            fast_reason,
+        )
+
+        yield _sse({"type": "output_mode", "mode": output_mode})
+        yield _sse({"type": "sources", "sources": sources})
+
+        answer_started_at = time.perf_counter()
+        _qlog.record_generation_start()
+        yield _sse({"type": "token", "content": answer})
+        _qlog.record_generation_done(len(answer))
+
+        _emit_query_progress(
+            "[timing][chat.query] DONE step=fast_direct_answer session_id=%d answer_len=%d elapsed_ms=%.2f",
+            session.id,
+            len(answer),
+            (time.perf_counter() - answer_started_at) * 1000,
+        )
+
+        assistant_message = ChatMessage(
+            session_id=session.id,
+            role="assistant",
+            content=answer,
+            sources_json=json.dumps(sources, ensure_ascii=False),
+            created_at=datetime.utcnow(),
+        )
+        db.add(assistant_message)
+        live_session = db.get(ChatSession, session.id)
+        if live_session is not None:
+            live_session.updated_at = datetime.utcnow()
+        db.commit()
+
+        _emit_query_progress("[chat.query] Completed fast direct request: session_id=%d", session.id)
+        yield _sse({"type": "done"})
+        return
+
     history_started_at = time.perf_counter()
     history = (
         db.query(ChatMessage)
@@ -315,6 +456,7 @@ def _run_query_chat_stream_inner(
     # ── Orchestrate: classify query + resolve output mode ─────────────────────
     plan = None
     if settings.orchestrator_enabled:
+        yield _sse({"type": "status", "message": "Đang phân loại câu hỏi..."})
         explicit_mode = payload.output_mode or None
         plan = classify_query(
             user_text,
@@ -326,6 +468,7 @@ def _run_query_chat_stream_inner(
     retrieved_docs = []
     if plan is None or getattr(plan, "requires_retrieval", True):
         retrieval_started_at = time.perf_counter()
+        yield _sse({"type": "status", "message": "Đang tìm kiếm tài liệu liên quan..."})
         retrieved_docs = similarity_search(
             user_text,
             top_k=top_k,
@@ -339,18 +482,16 @@ def _run_query_chat_stream_inner(
 
     sources = _enrich_sources_with_document_name(db, build_sources(retrieved_docs))
 
-    # Send comment prelude early to reduce proxy buffering on some deployments.
-    yield ": stream-start\n\n"
-    yield _sse({"type": "session", "session_id": session.id})
     yield _sse({"type": "output_mode", "mode": output_mode})
     yield _sse({"type": "sources", "sources": sources})
+    yield _sse({"type": "status", "message": "Đang soạn câu trả lời..."})
 
     answer_parts = []
     answer_started_at = time.perf_counter()
     _qlog.record_generation_start()
 
     try:
-        from ..services.rag_runtime import generate_answer_stream
+        from ..services.rag_runtime import generate_answer, generate_answer_stream
         for chunk in generate_answer_stream(
             question=user_text,
             context_docs=retrieved_docs,
@@ -365,6 +506,28 @@ def _run_query_chat_stream_inner(
         return
 
     answer = "".join(answer_parts)
+    if not answer.strip():
+        _emit_query_progress("[chat.query] Empty streamed answer; retrying with non-stream generation")
+        yield _sse({"type": "status", "message": "Đang thử tạo lại câu trả lời..."})
+        try:
+            answer = generate_answer(
+                question=user_text,
+                context_docs=retrieved_docs,
+                history_messages=history,
+                output_mode=output_mode,
+            ).strip()
+        except Exception as exc:  # pragma: no cover
+            _emit_query_progress("[chat.query] Generate answer fallback failed: %s", exc)
+            answer = ""
+
+        if answer:
+            yield _sse({"type": "token", "content": answer})
+        else:
+            answer = "Mình chưa tạo được nội dung trả lời cho câu hỏi này. Bạn vui lòng thử gửi lại hoặc diễn đạt cụ thể hơn."
+            yield _sse({"type": "error", "detail": answer})
+            yield _sse({"type": "done"})
+            return
+
     _qlog.record_generation_done(len(answer))
 
     _emit_query_progress(
