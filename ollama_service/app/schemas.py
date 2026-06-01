@@ -13,6 +13,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     messages: list[Message] = Field(..., min_length=1)
     options: dict[str, Any] | None = None
+    think: bool | Literal["low", "medium", "high"] | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -20,6 +21,7 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     system: str | None = None
     options: dict[str, Any] | None = None
+    think: bool | Literal["low", "medium", "high"] | None = None
 
 
 class OrchestratorClassifyRequest(BaseModel):
@@ -58,6 +60,7 @@ class OllamaNativeChatRequest(BaseModel):
     model: str | None = None
     messages: list[Message] = Field(..., min_length=1)
     stream: bool | None = False
+    think: bool | Literal["low", "medium", "high"] | None = None
     format: str | dict[str, Any] | None = None
     options: dict[str, Any] | None = None
     keep_alive: float | str | None = None
@@ -68,6 +71,7 @@ class OllamaNativeGenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     system: str | None = None
     stream: bool | None = False
+    think: bool | Literal["low", "medium", "high"] | None = None
     format: str | dict[str, Any] | None = None
     options: dict[str, Any] | None = None
     keep_alive: float | str | None = None

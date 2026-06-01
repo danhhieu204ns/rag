@@ -99,6 +99,7 @@ QUY TẮC TRẢ LỜI:
    - Hỏi về mục cụ thể (thứ nhất, loại X...) → chỉ nói về mục đó.
    - Hỏi liệt kê/tổng hợp → mới liệt kê đầy đủ.
    - Hỏi số lượng của một nhóm/danh sách (ví dụ: "có mấy giá trị cốt lõi?") → trả lời con số trước, rồi liệt kê tên các mục nếu tài liệu có thông tin.
+   - Nếu tài liệu có danh sách tổng quan nêu "gồm X giai đoạn/Y hoạt động/bước", hãy ưu tiên đúng danh sách tổng quan đó để liệt kê tên giai đoạn và bước; không tự đổi tên, gộp, tách hoặc chuyển bước sang giai đoạn khác.
 
 3. CHI TIẾT: Khai thác đầy đủ thông tin từ tài liệu (định nghĩa, giải thích, ví dụ, số liệu).
 

@@ -209,6 +209,7 @@ async def chat(req: ChatRequest, api_key: str = Depends(verify_api_key)) -> dict
         "model": settings.chat_model,
         "messages": [model_dump(item) for item in req.messages],
         "options": req.options or {},
+        "think": False if req.think is None else req.think,
     }
     payload = enforce_num_predict(payload, settings.max_chat_num_predict)
     logger.debug("[ollama-service][chat] step=payload_ready num_messages=%d elapsed_ms=%.2f", len(req.messages), _ms(request_start))
@@ -244,6 +245,7 @@ async def generate(req: GenerateRequest, api_key: str = Depends(verify_api_key))
         "model": model_name,
         "prompt": req.prompt,
         "options": req.options or {},
+        "think": False if req.think is None else req.think,
     }
     if req.system:
         payload["system"] = req.system
@@ -293,6 +295,7 @@ async def orchestrator_classify(
             "num_predict": settings.orchestrator_num_predict,
         },
         "stream": False,
+        "think": False,
     }
     payload = enforce_num_predict(payload, settings.orchestrator_num_predict)
     logger.debug("[ollama-service][orchestrator] step=payload_ready elapsed_ms=%.2f", _ms(request_start))
@@ -503,6 +506,7 @@ async def native_chat(
     }
     if req.format:
         payload["format"] = req.format
+    payload["think"] = False if req.think is None else req.think
     if req.keep_alive is not None:
         payload["keep_alive"] = req.keep_alive
 
@@ -562,6 +566,7 @@ async def native_generate(
         payload["system"] = req.system
     if req.format:
         payload["format"] = req.format
+    payload["think"] = False if req.think is None else req.think
     if req.keep_alive is not None:
         payload["keep_alive"] = req.keep_alive
 

@@ -68,8 +68,35 @@ def rerank_contexts(
     ]
     scored.sort(key=lambda item: item[1], reverse=True)
 
+    preserved_by_rrf = contexts[: min(top_k, settings.reranker_preserve_rrf_top_n)]
+    selected_ids = {item.chunk_id for item in preserved_by_rrf if item.chunk_id is not None}
+    selected_scores = {item.chunk_id: score for item, score in scored if item.chunk_id is not None}
+
     reranked: list[ContextItem] = []
-    for item, score in scored[:top_k]:
+    for item in preserved_by_rrf:
+        metadata = dict(item.metadata or {})
+        if item.chunk_id in selected_scores:
+            metadata["reranker_score"] = selected_scores[item.chunk_id]
+        metadata["reranker_preserved_rrf"] = True
+        reranked.append(
+            ContextItem(
+                chunk_id=item.chunk_id,
+                document_id=item.document_id,
+                content=item.content,
+                source=item.source,
+                page=item.page,
+                score=item.score,
+                metadata=metadata,
+            )
+        )
+
+    for item, score in scored:
+        if len(reranked) >= top_k:
+            break
+        if item.chunk_id is not None and item.chunk_id in selected_ids:
+            continue
+        if item.chunk_id is not None:
+            selected_ids.add(item.chunk_id)
         metadata = dict(item.metadata or {})
         metadata["reranker_score"] = score
         reranked.append(
@@ -90,6 +117,7 @@ def rerank_contexts(
             "output_count": len(reranked),
             "original_top_score": contexts[0].score if contexts else None,
             "reranked_top_score": scored[0][1] if scored else None,
+            "preserved_rrf_top_n": len(preserved_by_rrf),
             "score_preview": [
                 {
                     "chunk_id": item.chunk_id,

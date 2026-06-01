@@ -63,6 +63,7 @@ def get_llm() -> ChatOllama:
                     base_url=base_url,
                     client_kwargs={"headers": headers},
                     temperature=0.0,
+                    reasoning=False,
                 )
     return _llm
 

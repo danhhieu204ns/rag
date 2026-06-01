@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
@@ -17,6 +18,11 @@ from .parent_retrieval import ChildHit, ParentRecord, expand_child_hits_to_paren
 from .reranker import rerank_contexts
 
 _client: QdrantClient | None = None
+_LIST_OVERVIEW_PATTERN = re.compile(
+    r"\bgồm\b.{0,80}\b(?:giai\s*đoạn|hoạt\s*động\s*chính|bước)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_LIST_OVERVIEW_NEIGHBOR_COUNT = 4
 
 
 def collection_name(override: str | None = None) -> str:
@@ -367,6 +373,78 @@ def _context_from_stored_chunk(
     )
 
 
+def _looks_like_split_list_overview(content: str) -> bool:
+    text = " ".join(str(content or "").split())
+    return bool(_LIST_OVERVIEW_PATTERN.search(text))
+
+
+def _expand_split_list_neighbors(
+    contexts: list[ContextItem],
+    *,
+    top_k: int,
+) -> list[ContextItem]:
+    neighbor_map: dict[int, tuple[ContextItem, list[int]]] = {}
+    neighbor_ids: list[int] = []
+    for context in contexts:
+        chunk_id = _to_int(context.chunk_id)
+        if chunk_id is None or not _looks_like_split_list_overview(context.content):
+            continue
+        ids = [chunk_id + offset for offset in range(1, _LIST_OVERVIEW_NEIGHBOR_COUNT + 1)]
+        neighbor_map[chunk_id] = (context, ids)
+        neighbor_ids.extend(ids)
+
+    stored_neighbors = load_chunks_by_ids(neighbor_ids)
+    if not stored_neighbors:
+        return contexts[:top_k]
+
+    expanded: list[ContextItem] = []
+    seen_ids: set[int] = set()
+
+    def append_context(item: ContextItem) -> None:
+        chunk_id = _to_int(item.chunk_id)
+        if chunk_id is not None:
+            if chunk_id in seen_ids:
+                return
+            seen_ids.add(chunk_id)
+        expanded.append(item)
+
+    for context in contexts:
+        append_context(context)
+        if len(expanded) >= top_k:
+            break
+
+        chunk_id = _to_int(context.chunk_id)
+        if chunk_id is None or chunk_id not in neighbor_map:
+            continue
+
+        source_context, ids = neighbor_map[chunk_id]
+        for neighbor_id in ids:
+            stored = stored_neighbors.get(neighbor_id)
+            if stored is None or stored.document_id != source_context.document_id:
+                continue
+            neighbor_context = _context_from_stored_chunk(
+                stored,
+                score=source_context.score,
+                retrieval_mode="neighbor",
+            )
+            metadata = dict(neighbor_context.metadata or {})
+            metadata["neighbor_of_chunk_id"] = chunk_id
+            neighbor_context = ContextItem(
+                chunk_id=neighbor_context.chunk_id,
+                document_id=neighbor_context.document_id,
+                content=neighbor_context.content,
+                source=neighbor_context.source,
+                page=neighbor_context.page,
+                score=neighbor_context.score,
+                metadata=metadata,
+            )
+            append_context(neighbor_context)
+            if len(expanded) >= top_k:
+                break
+
+    return expanded[:top_k]
+
+
 def _debug_preview_text(value: str, limit: int = 160) -> str:
     text = " ".join(str(value or "").split())
     return text if len(text) <= limit else text[: limit - 3] + "..."
@@ -609,6 +687,8 @@ def search_hybrid_contexts(
             enabled=False,
         )
         reranker_elapsed_ms = 0.0
+
+    final_contexts = _expand_split_list_neighbors(final_contexts, top_k=top_k)
 
     if debug is not None:
         timings = debug.setdefault("timings_ms", {})

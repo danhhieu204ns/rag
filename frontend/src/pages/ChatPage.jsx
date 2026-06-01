@@ -68,6 +68,13 @@ const IconDocument = () => (
   </svg>
 );
 
+const IconClose = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+    <line x1="18" y1="6" x2="6" y2="18" />
+    <line x1="6" y1="6" x2="18" y2="18" />
+  </svg>
+);
+
 const IconThink = () => (
   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <circle cx="12" cy="12" r="10" />
@@ -83,62 +90,138 @@ const BotAvatar = () => (
   </div>
 );
 
-// ── Citation badge ─────────────────────────────────────────────────────────
+// ── Citation source helpers ────────────────────────────────────────────────
 
-function CitationBadge({ chunkNum, source }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef(null);
-
-  useEffect(() => {
-    if (!open) return;
-    function handler(e) {
-      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
-    }
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [open]);
-
+function getSourceDisplay(source, fallbackIndex) {
   const sourceMetadata = source?.source_metadata;
   const sourceInfo = sourceMetadata?.source_info;
+  const headingPath = Array.isArray(sourceMetadata?.heading_path)
+    ? sourceMetadata.heading_path
+    : Array.isArray(sourceMetadata?.context?.heading_path)
+      ? sourceMetadata.context.heading_path
+      : [];
+  const sectionTitle =
+    sourceMetadata?.section_title ||
+    sourceMetadata?.title ||
+    sourceMetadata?.context?.h6 ||
+    sourceMetadata?.context?.h5 ||
+    sourceMetadata?.context?.h4 ||
+    sourceMetadata?.context?.h3 ||
+    sourceMetadata?.context?.h2 ||
+    sourceMetadata?.context?.h1 ||
+    headingPath[headingPath.length - 1];
   const fileName =
     sourceInfo?.file_name ||
     sourceMetadata?.file_name ||
     sourceMetadata?.original_filename ||
     sourceMetadata?.filename ||
     sourceMetadata?.title ||
-    (source?.document_id != null ? `Tài liệu #${source.document_id}` : `Chunk ${chunkNum}`);
-  const page = source?.page ?? sourceInfo?.page_number;
-  const excerpt = source?.excerpt;
+    (source?.document_id != null ? `Tài liệu #${source.document_id}` : `Chunk ${fallbackIndex}`);
+  const page =
+    source?.page ??
+    sourceMetadata?.page_start ??
+    sourceMetadata?.source_page ??
+    sourceInfo?.page_number;
+  const pageEnd = sourceMetadata?.page_end;
+
+  return {
+    fileName,
+    page,
+    pageEnd,
+    sectionTitle,
+    headingPath,
+    chunkId: source?.chunk_id ?? sourceMetadata?.parent_chunk_id ?? sourceMetadata?.parent_id,
+    chunkIndex: source?.chunk_index,
+  };
+}
+
+function citationKey(source, chunkNum) {
+  return [
+    source?.document_id ?? "doc",
+    source?.chunk_id ?? source?.source_metadata?.parent_chunk_id ?? "chunk",
+    source?.chunk_index ?? "idx",
+    source?.page ?? "page",
+    chunkNum,
+  ].join(":");
+}
+
+function isPdfDocument(document) {
+  const contentType = String(document?.content_type || "").toLowerCase();
+  const filename = String(document?.original_filename || "").toLowerCase();
+  return contentType.includes("pdf") || filename.endsWith(".pdf");
+}
+
+function normalizeForMatch(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function findWhitespaceInsensitiveRange(text, query) {
+  const source = String(text || "");
+  const needle = normalizeForMatch(query);
+  if (!source || !needle) return null;
+
+  let normalized = "";
+  const indexMap = [];
+  let inWhitespace = false;
+
+  for (let i = 0; i < source.length; i += 1) {
+    const char = source[i];
+    if (/\s/.test(char)) {
+      if (normalized && !inWhitespace) {
+        normalized += " ";
+        indexMap.push(i);
+        inWhitespace = true;
+      }
+      continue;
+    }
+    normalized += char.toLowerCase();
+    indexMap.push(i);
+    inWhitespace = false;
+  }
+
+  const matchIndex = normalized.indexOf(needle);
+  if (matchIndex === -1) return null;
+
+  const start = indexMap[matchIndex] ?? 0;
+  const endMapIndex = matchIndex + needle.length - 1;
+  const end = (indexMap[endMapIndex] ?? source.length - 1) + 1;
+  return { start, end };
+}
+
+function HighlightedSourceText({ text, highlight }) {
+  const range = findWhitespaceInsensitiveRange(text, highlight);
+  if (!range) return <>{text}</>;
 
   return (
-    <span ref={ref} className="cgpt-citation-wrap">
+    <>
+      {text.slice(0, range.start)}
+      <mark>{text.slice(range.start, range.end)}</mark>
+      {text.slice(range.end)}
+    </>
+  );
+}
+
+// ── Citation badge ─────────────────────────────────────────────────────────
+
+function CitationBadge({ chunkNum, source, isActive, onSelect }) {
+  const display = getSourceDisplay(source, chunkNum);
+
+  return (
+    <span className="cgpt-citation-wrap">
       <button
-        className="cgpt-citation-badge"
-        onClick={() => setOpen((v) => !v)}
-        title={`Xem nguồn Chunk ${chunkNum}`}
+        className={`cgpt-citation-badge${isActive ? " cgpt-citation-active" : ""}`}
+        onClick={() => onSelect?.({ source, chunkNum, key: citationKey(source, chunkNum) })}
+        title={`Mở nguồn ${display.fileName}`}
       >
         {chunkNum}
       </button>
-      {open && (
-        <div className="cgpt-citation-tooltip">
-          {source ? (
-            <>
-              <div className="cgpt-citation-title">{fileName}</div>
-              {page != null && <div className="cgpt-citation-meta">Trang&nbsp;{page}</div>}
-              {excerpt && <div className="cgpt-citation-excerpt">{excerpt}</div>}
-            </>
-          ) : (
-            <div className="cgpt-citation-title">Không tìm thấy thông tin nguồn</div>
-          )}
-        </div>
-      )}
     </span>
   );
 }
 
 // ── Markdown renderer with inline citations ────────────────────────────────
 
-function makeMdComponents(sources) {
+function makeMdComponents(sources, onCitationSelect, activeCitationKey) {
   function injectCitations(children) {
     if (!sources?.length) return children;
     const items = Array.isArray(children) ? children : [children];
@@ -154,7 +237,16 @@ function makeMdComponents(sources) {
             .map((num, k) => {
               const src = sources[parseInt(num, 10) - 1];
               if (!src) return null;
-              return <CitationBadge key={`${i}-${j}-${k}`} chunkNum={num} source={src} />;
+              const key = citationKey(src, num);
+              return (
+                <CitationBadge
+                  key={`${i}-${j}-${k}`}
+                  chunkNum={num}
+                  source={src}
+                  isActive={key === activeCitationKey}
+                  onSelect={onCitationSelect}
+                />
+              );
             })
             .filter(Boolean);
         }
@@ -180,7 +272,7 @@ function makeMdComponents(sources) {
   };
 }
 
-function MarkdownWithCitations({ content, sources }) {
+function MarkdownWithCitations({ content, sources, onCitationSelect, activeCitationKey }) {
   // Strip any stray <think> tags that may leak into the answer
   const clean = content.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<\/?think>/g, "").trim();
   return (
@@ -188,7 +280,7 @@ function MarkdownWithCitations({ content, sources }) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
-        components={makeMdComponents(sources)}
+        components={makeMdComponents(sources, onCitationSelect, activeCitationKey)}
       >
         {clean}
       </ReactMarkdown>
@@ -239,10 +331,6 @@ function SourceCard({ source, index }) {
     sourceMetadata?.title ||
     (source?.document_id != null ? `Tài liệu #${source.document_id}` : `Nguồn ${index}`);
   const page = source?.page ?? sourceInfo?.page_number;
-  const excerpt = source?.excerpt;
-  const shortExcerpt = excerpt
-    ? excerpt.substring(0, 140).trim() + (excerpt.length > 140 ? "…" : "")
-    : null;
 
   return (
     <div className="source-card">
@@ -252,11 +340,10 @@ function SourceCard({ source, index }) {
         </div>
         <div className="source-card-info">
           <div className="source-card-name" title={fileName}>{fileName}</div>
-          {page != null && <div className="source-card-page">Trang {page}</div>}
+          <div className="source-card-page">{page != null ? `Vị trí: trang ${page}` : "Vị trí: chưa rõ trang"}</div>
         </div>
         <span className="source-card-num">{index}</span>
       </div>
-      {shortExcerpt && <div className="source-card-excerpt">{shortExcerpt}</div>}
     </div>
   );
 }
@@ -275,6 +362,80 @@ function SourcesPanel({ sources }) {
         ))}
       </div>
     </div>
+  );
+}
+
+function SourceViewer({
+  activeCitation,
+  detail,
+  isLoading,
+  error,
+  filePreviewUrl,
+  isFileLoading,
+  onClose,
+}) {
+  if (!activeCitation) return null;
+
+  const fallbackDisplay = getSourceDisplay(activeCitation.source, activeCitation.chunkNum);
+  const document = detail?.document;
+  const fileName = document?.original_filename || fallbackDisplay.fileName;
+  const page = detail?.page ?? fallbackDisplay.page;
+  const pageEnd = detail?.page_end ?? fallbackDisplay.pageEnd;
+  const pageLabel = page != null
+    ? `Trang ${page}${pageEnd && pageEnd !== page ? `-${pageEnd}` : ""}`
+    : "Không rõ trang";
+  const locationLabel = `Vị trí trích dẫn: ${pageLabel}`;
+  const canPreviewPdf = filePreviewUrl && isPdfDocument(document);
+  const pdfSrc = canPreviewPdf && page != null
+    ? `${filePreviewUrl}#page=${page}`
+    : filePreviewUrl;
+
+  return (
+    <aside className="source-viewer" aria-label="Nguồn trích dẫn">
+      <div className="source-viewer-head">
+        <div className="source-viewer-title-wrap">
+          <div className="source-viewer-eyebrow">Nguồn {activeCitation.chunkNum}</div>
+          <h2 className="source-viewer-title" title={fileName}>{fileName}</h2>
+          <div className="source-viewer-subtitle">{locationLabel}</div>
+        </div>
+        <button className="source-viewer-close" onClick={onClose} aria-label="Đóng nguồn">
+          <IconClose />
+        </button>
+      </div>
+
+      <div className="source-viewer-body">
+        {isLoading ? (
+          <div className="source-viewer-state">Đang tải vị trí nguồn...</div>
+        ) : error ? (
+          <div className="source-viewer-state source-viewer-state-error">
+            <strong>Không thể tải vị trí trích dẫn.</strong>
+            <span>{error}</span>
+          </div>
+        ) : (
+          <>
+            <div className="source-viewer-locator">
+              <span>{locationLabel}</span>
+            </div>
+
+            {document && isPdfDocument(document) && (
+              <div className="source-viewer-preview">
+                {isFileLoading ? (
+                  <div className="source-viewer-state">Đang mở file PDF...</div>
+                ) : canPreviewPdf ? (
+                  <iframe
+                    title={`Preview ${fileName}`}
+                    src={pdfSrc}
+                    className="source-viewer-frame"
+                  />
+                ) : (
+                  <div className="source-viewer-state">Không thể mở file PDF.</div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </aside>
   );
 }
 
@@ -313,7 +474,7 @@ function parseContent(content) {
 
 // ── AssistantMessage ───────────────────────────────────────────────────────
 
-function AssistantMessage({ msg }) {
+function AssistantMessage({ msg, onCitationSelect, activeCitationKey }) {
   const { thinking, answer, isThinking } = parseContent(msg.content);
   const sources = msg.sources ?? [];
   const answerText = thinking !== null ? answer : msg.content;
@@ -330,7 +491,12 @@ function AssistantMessage({ msg }) {
         )}
 
         {answerText && (
-          <MarkdownWithCitations content={answerText} sources={sources} />
+          <MarkdownWithCitations
+            content={answerText}
+            sources={sources}
+            onCitationSelect={onCitationSelect}
+            activeCitationKey={activeCitationKey}
+          />
         )}
 
         {!answerText && !thinking && status && (
@@ -368,9 +534,16 @@ function ChatPage({ user, onLogout }) {
   const [error, setError] = useState("");
   const [isSidebarOpen, setIsSidebarOpen] = useState(() => window.innerWidth >= 769);
   const [searchQuery, setSearchQuery] = useState("");
+  const [activeCitation, setActiveCitation] = useState(null);
+  const [sourceDetail, setSourceDetail] = useState(null);
+  const [sourceError, setSourceError] = useState("");
+  const [isSourceLoading, setIsSourceLoading] = useState(false);
+  const [sourceFileUrl, setSourceFileUrl] = useState("");
+  const [isSourceFileLoading, setIsSourceFileLoading] = useState(false);
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
   const sendLockRef = useRef(false);
+  const activeCitationKey = activeCitation?.key || "";
 
   const filteredSessions = useMemo(() => {
     if (!searchQuery.trim()) return sessions;
@@ -390,6 +563,100 @@ function ChatPage({ user, onLogout }) {
     el.style.height = Math.min(el.scrollHeight, 200) + "px";
   }, [input]);
 
+  useEffect(() => {
+    if (!activeCitation?.source?.document_id) {
+      setSourceDetail(null);
+      setSourceError("");
+      setIsSourceLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    const source = activeCitation.source;
+    setIsSourceLoading(true);
+    setSourceError("");
+    setSourceDetail(null);
+
+    api
+      .get("/chat/source", {
+        params: {
+          document_id: source.document_id,
+          chunk_id: source.chunk_id || undefined,
+          chunk_index: source.chunk_index ?? undefined,
+          page: source.page || undefined,
+        },
+      })
+      .then((response) => {
+        if (!cancelled) {
+          setSourceDetail(response.data);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          const detail = err?.response?.data?.detail;
+          setSourceError(typeof detail === "string" ? detail : "Không tìm thấy vị trí nguồn.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsSourceLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeCitationKey]);
+
+  useEffect(() => {
+    if (!sourceDetail?.document || !sourceDetail.file_available || !isPdfDocument(sourceDetail.document)) {
+      setSourceFileUrl((current) => {
+        if (current) URL.revokeObjectURL(current);
+        return "";
+      });
+      setIsSourceFileLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    let objectUrl = "";
+    setIsSourceFileLoading(true);
+    setSourceFileUrl((current) => {
+      if (current) URL.revokeObjectURL(current);
+      return "";
+    });
+
+    api
+      .get(`/chat/source/file/${sourceDetail.document.id}`, { responseType: "blob" })
+      .then((response) => {
+        if (cancelled) return;
+        const contentType = response.headers?.["content-type"] || sourceDetail.document.content_type || "application/pdf";
+        objectUrl = URL.createObjectURL(new Blob([response.data], { type: contentType }));
+        setSourceFileUrl(objectUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setSourceFileUrl("");
+      })
+      .finally(() => {
+        if (!cancelled) setIsSourceFileLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [sourceDetail?.document?.id, sourceDetail?.file_available]);
+
+  function closeSourceViewer() {
+    setActiveCitation(null);
+    setSourceDetail(null);
+    setSourceError("");
+  }
+
+  function handleCitationSelect(nextCitation) {
+    setActiveCitation(nextCitation);
+  }
+
   async function fetchSessions() {
     const response = await api.get("/chat/sessions");
     setSessions(response.data);
@@ -404,6 +671,7 @@ function ChatPage({ user, onLogout }) {
   function createSession() {
     setActiveSessionId(null);
     setMessages([]);
+    closeSourceViewer();
   }
 
   async function deleteSession(sessionId) {
@@ -411,6 +679,7 @@ function ChatPage({ user, onLogout }) {
     const remaining = sessions.filter((item) => item.id !== sessionId);
     setSessions(remaining);
     if (activeSessionId === sessionId) {
+      closeSourceViewer();
       const next = remaining[0]?.id || null;
       setActiveSessionId(next);
       if (next) await fetchMessages(next);
@@ -427,6 +696,7 @@ function ChatPage({ user, onLogout }) {
     setIsReceiving(false);
     const userText = input.trim();
     setInput("");
+    closeSourceViewer();
     setMessages((prev) => [
       ...prev,
       { id: `pending-${Date.now()}`, role: "user", content: userText, sources: [] },
@@ -650,7 +920,13 @@ function ChatPage({ user, onLogout }) {
                   key={session.id}
                   className={`cgpt-session${session.id === activeSessionId ? " cgpt-session-active" : ""}`}
                 >
-                  <button className="cgpt-session-btn" onClick={() => setActiveSessionId(session.id)}>
+                  <button
+                    className="cgpt-session-btn"
+                    onClick={() => {
+                      closeSourceViewer();
+                      setActiveSessionId(session.id);
+                    }}
+                  >
                     <span className="cgpt-session-title">{session.title}</span>
                   </button>
                   <button className="cgpt-session-del" onClick={() => deleteSession(session.id)} aria-label="Xóa">
@@ -668,7 +944,7 @@ function ChatPage({ user, onLogout }) {
       </aside>
 
       {/* ── MAIN ── */}
-      <main className="cgpt-main">
+      <main className={`cgpt-main${activeCitation ? " cgpt-main-source-open" : ""}`}>
         {isSidebarOpen && (
           <div className="cgpt-backdrop" onClick={() => setIsSidebarOpen(false)} aria-hidden="true" />
         )}
@@ -707,70 +983,88 @@ function ChatPage({ user, onLogout }) {
           </div>
         </header>
 
-        {/* Messages */}
-        <div className="cgpt-messages-wrap">
-          {messages.length === 0 ? (
-            <div className="cgpt-empty">
-              <h1>Chúng ta nên bắt đầu từ đâu?</h1>
-            </div>
-          ) : (
-            <div className="cgpt-messages">
-              {messages.map((msg) => (
-                <div key={msg.id} className={`cgpt-msg cgpt-msg-${msg.role}`}>
-                  {msg.role === "user" ? (
-                    <div className="cgpt-user-bubble">{msg.content}</div>
-                  ) : (
-                    <AssistantMessage msg={msg} />
-                  )}
+        <div className="cgpt-content-split">
+          <section className="cgpt-chat-pane">
+            {/* Messages */}
+            <div className="cgpt-messages-wrap">
+              {messages.length === 0 ? (
+                <div className="cgpt-empty">
+                  <h1>Chúng ta nên bắt đầu từ đâu?</h1>
                 </div>
-              ))}
+              ) : (
+                <div className="cgpt-messages">
+                  {messages.map((msg) => (
+                    <div key={msg.id} className={`cgpt-msg cgpt-msg-${msg.role}`}>
+                      {msg.role === "user" ? (
+                        <div className="cgpt-user-bubble">{msg.content}</div>
+                      ) : (
+                        <AssistantMessage
+                          msg={msg}
+                          onCitationSelect={handleCitationSelect}
+                          activeCitationKey={activeCitationKey}
+                        />
+                      )}
+                    </div>
+                  ))}
 
-              {isSending && !isReceiving && (
-                <div className="cgpt-msg cgpt-msg-assistant">
-                  <div className="cgpt-assistant-row">
-                    <BotAvatar />
-                    <div className="cgpt-assistant-content">
-                      <div className="cgpt-assistant-name">VTAca RAG</div>
-                      <div className="cgpt-typing">
-                        <span /><span /><span />
+                  {isSending && !isReceiving && (
+                    <div className="cgpt-msg cgpt-msg-assistant">
+                      <div className="cgpt-assistant-row">
+                        <BotAvatar />
+                        <div className="cgpt-assistant-content">
+                          <div className="cgpt-assistant-name">VTAca RAG</div>
+                          <div className="cgpt-typing">
+                            <span /><span /><span />
+                          </div>
+                        </div>
                       </div>
                     </div>
-                  </div>
+                  )}
+                  <div ref={messagesEndRef} />
                 </div>
               )}
-              <div ref={messagesEndRef} />
             </div>
-          )}
-        </div>
 
-        {/* Composer */}
-        <div className="cgpt-composer-wrap">
-          <form className="cgpt-composer" onSubmit={sendMessage}>
-            <div className="cgpt-composer-inner">
-              <button type="button" className="cgpt-attach-btn" aria-label="Thêm nội dung">
-                <IconPlus />
-              </button>
-              <textarea
-                ref={textareaRef}
-                className="cgpt-textarea"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Hỏi bất kỳ điều gì"
-                rows={1}
-              />
-              <button
-                type="submit"
-                className={`cgpt-send-btn${input.trim() && !isSending ? " cgpt-send-active" : ""}`}
-                disabled={isSending || !input.trim()}
-                aria-label="Gửi"
-              >
-                <IconSend />
-              </button>
+            {/* Composer */}
+            <div className="cgpt-composer-wrap">
+              <form className="cgpt-composer" onSubmit={sendMessage}>
+                <div className="cgpt-composer-inner">
+                  <button type="button" className="cgpt-attach-btn" aria-label="Thêm nội dung">
+                    <IconPlus />
+                  </button>
+                  <textarea
+                    ref={textareaRef}
+                    className="cgpt-textarea"
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={handleKeyDown}
+                    placeholder="Hỏi bất kỳ điều gì"
+                    rows={1}
+                  />
+                  <button
+                    type="submit"
+                    className={`cgpt-send-btn${input.trim() && !isSending ? " cgpt-send-active" : ""}`}
+                    disabled={isSending || !input.trim()}
+                    aria-label="Gửi"
+                  >
+                    <IconSend />
+                  </button>
+                </div>
+              </form>
+              {error && <p className="cgpt-error">{error}</p>}
+              <p className="cgpt-disclaimer">Trợ lý tri thức có thể mắc lỗi. Hãy kiểm tra các thông tin quan trọng.</p>
             </div>
-          </form>
-          {error && <p className="cgpt-error">{error}</p>}
-          <p className="cgpt-disclaimer">Trợ lý tri thức có thể mắc lỗi. Hãy kiểm tra các thông tin quan trọng.</p>
+          </section>
+
+          <SourceViewer
+            activeCitation={activeCitation}
+            detail={sourceDetail}
+            isLoading={isSourceLoading}
+            error={sourceError}
+            filePreviewUrl={sourceFileUrl}
+            isFileLoading={isSourceFileLoading}
+            onClose={closeSourceViewer}
+          />
         </div>
       </main>
     </div>

@@ -7,21 +7,24 @@ from datetime import datetime
 import time
 import unicodedata
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..core.settings import settings
 from ..core.query_logger import query_logging_context
 from ..core.request_logger import request_logging_context, get_request_logger
 from ..db import get_db
-from ..models import ChatMessage, ChatSession, Document, User
+from ..models import ChatMessage, ChatSession, Document, DocumentChunk, User
 from ..schemas import (
+    CitationDocumentRead,
+    CitationSourceRead,
     ChatMessageRead,
     ChatQueryRequest,
     ChatQueryResponse,
     ChatSessionCreate,
     ChatSessionRead,
+    DocumentChunkRead,
     SourceItem,
 )
 from .auth import get_current_user
@@ -219,6 +222,158 @@ def _message_to_read(item: ChatMessage, db: Session | None = None) -> ChatMessag
         content=item.content,
         sources=sources,
         created_at=item.created_at,
+    )
+
+
+def _parse_chunk_metadata(raw_json: str | None) -> dict:
+    if not raw_json:
+        return {}
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _to_positive_int(value: object) -> int | None:
+    try:
+        if value is None:
+            return None
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _metadata_heading_path(metadata: dict) -> list[str]:
+    heading_path = metadata.get("heading_path")
+    if isinstance(heading_path, list):
+        return [str(item) for item in heading_path if str(item).strip()]
+
+    context = metadata.get("context")
+    if isinstance(context, dict):
+        context_path = context.get("heading_path")
+        if isinstance(context_path, list):
+            return [str(item) for item in context_path if str(item).strip()]
+
+    return []
+
+
+def _metadata_section_title(metadata: dict) -> str | None:
+    section_title = metadata.get("section_title") or metadata.get("title")
+    if section_title is not None and str(section_title).strip():
+        return str(section_title).strip()
+
+    context = metadata.get("context")
+    if isinstance(context, dict):
+        for key in ("h6", "h5", "h4", "h3", "h2", "h1"):
+            value = context.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+
+    heading_path = _metadata_heading_path(metadata)
+    return heading_path[-1] if heading_path else None
+
+
+def _chunk_to_read(chunk: DocumentChunk, source_metadata: dict) -> DocumentChunkRead:
+    return DocumentChunkRead(
+        id=chunk.id,
+        document_id=chunk.document_id,
+        chunk_index=chunk.chunk_index,
+        content=chunk.content,
+        source_page=chunk.source_page,
+        source_kind=chunk.source_kind,
+        source_metadata=source_metadata,
+        created_at=chunk.created_at,
+    )
+
+
+@router.get("/source", response_model=CitationSourceRead)
+def get_citation_source(
+    document_id: int = Query(..., ge=1),
+    chunk_id: int | None = Query(default=None, ge=1),
+    chunk_index: int | None = Query(default=None, ge=0),
+    page: int | None = Query(default=None, ge=1),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> CitationSourceRead:
+    """Return the exact stored chunk behind a chat citation for the source panel."""
+
+    del current_user
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    base_query = db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id)
+    chunk: DocumentChunk | None = None
+    if chunk_id is not None:
+        chunk = base_query.filter(DocumentChunk.id == chunk_id).first()
+    if chunk is None and chunk_index is not None:
+        chunk = (
+            base_query
+            .filter(DocumentChunk.chunk_index == chunk_index)
+            .order_by(DocumentChunk.id.asc())
+            .first()
+        )
+    if chunk is None and page is not None:
+        chunk = (
+            base_query
+            .filter(DocumentChunk.source_page == page)
+            .order_by(DocumentChunk.chunk_index.asc(), DocumentChunk.id.asc())
+            .first()
+        )
+
+    if chunk is None:
+        raise HTTPException(status_code=404, detail="Source chunk not found.")
+
+    source_metadata = _parse_chunk_metadata(chunk.source_metadata_json)
+    page_start = (
+        _to_positive_int(chunk.source_page)
+        or _to_positive_int(source_metadata.get("page_start"))
+        or _to_positive_int(source_metadata.get("source_page"))
+    )
+    page_end = _to_positive_int(source_metadata.get("page_end"))
+    file_path = settings.uploads_dir / document.stored_filename
+
+    return CitationSourceRead(
+        document=CitationDocumentRead(
+            id=document.id,
+            title=document.title,
+            original_filename=document.original_filename,
+            content_type=document.content_type,
+            status=document.status,
+        ),
+        chunk=_chunk_to_read(chunk, source_metadata),
+        page=page_start,
+        page_end=page_end,
+        section_title=_metadata_section_title(source_metadata),
+        heading_path=_metadata_heading_path(source_metadata),
+        file_available=file_path.exists(),
+    )
+
+
+@router.get("/source/file/{document_id}")
+def get_citation_source_file(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FileResponse:
+    """Stream the original uploaded document for the source panel preview."""
+
+    del current_user
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    file_path = settings.uploads_dir / document.stored_filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Stored file does not exist.")
+
+    return FileResponse(
+        path=file_path,
+        media_type=document.content_type or "application/octet-stream",
+        filename=document.original_filename,
+        content_disposition_type="inline",
     )
 
 

@@ -31,6 +31,7 @@ class Settings:
     reranker_enabled: bool
     reranker_model: str
     reranker_candidate_pool: int
+    reranker_preserve_rrf_top_n: int
     bm25_enabled: bool
     bm25_bilingual_expansion: bool
     bm25_candidate_limit_multiplier: int
@@ -135,6 +136,7 @@ def get_settings() -> Settings:
         reranker_enabled=_bool_env("RERANKER_ENABLED", True),
         reranker_model=_string_env("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
         reranker_candidate_pool=max(1, _int_env("RERANKER_CANDIDATE_POOL", 20)),
+        reranker_preserve_rrf_top_n=max(0, _int_env("RERANKER_PRESERVE_RRF_TOP_N", 5)),
         bm25_enabled=_bool_env("BM25_ENABLED", True),
         bm25_bilingual_expansion=_bool_env("BM25_BILINGUAL_EXPANSION", True),
         bm25_candidate_limit_multiplier=max(1, _int_env("BM25_CANDIDATE_LIMIT_MULTIPLIER", 10)),

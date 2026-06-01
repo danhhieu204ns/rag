@@ -146,6 +146,24 @@ class SourceItem(BaseModel):
     excerpt: str
 
 
+class CitationDocumentRead(BaseModel):
+    id: int
+    title: str
+    original_filename: str
+    content_type: str | None = None
+    status: str
+
+
+class CitationSourceRead(BaseModel):
+    document: CitationDocumentRead
+    chunk: DocumentChunkRead
+    page: int | None = Field(default=None, ge=1)
+    page_end: int | None = Field(default=None, ge=1)
+    section_title: str | None = None
+    heading_path: list[str] = Field(default_factory=list)
+    file_available: bool = False
+
+
 class ChatSessionCreate(BaseModel):
     title: str | None = Field(default=None, max_length=255)
 
