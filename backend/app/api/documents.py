@@ -12,6 +12,7 @@ from typing import Any
 import re
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy.exc import OperationalError
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -788,6 +789,30 @@ def get_document(
         db.commit()
 
     return _to_document_read(document, int(chunk_count))
+
+
+@router.get("/{document_id}/file")
+def get_document_file(
+    document_id: int,
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin),
+) -> FileResponse:
+    """Stream the original uploaded document for the admin document viewer."""
+
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    file_path = settings.uploads_dir / document.stored_filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Stored file does not exist.")
+
+    return FileResponse(
+        path=file_path,
+        media_type=document.content_type or "application/octet-stream",
+        filename=document.original_filename,
+        content_disposition_type="inline",
+    )
 
 
 @router.get("/{document_id}/chunks", response_model=DocumentChunkListResponse)

@@ -1634,88 +1634,147 @@ button.danger:hover {
   font-weight: 600;
 }
 
-.chunk-inspector {
-  margin-top: 22px;
-  border-top: 1px solid #e5e9f1;
-  padding-top: 18px;
+.document-viewer-overlay {
+  align-items: center;
+  padding: 24px;
 }
 
-.chunk-inspector-head {
+.document-viewer-dialog {
+  width: min(1180px, 100%);
+  max-width: 1180px;
+  height: min(840px, calc(100vh - 48px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 10px;
+}
+
+.document-viewer-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.chunk-inspector-head h3 {
-  margin: 0;
-  font-size: 20px;
-}
-
-.chunk-inspector-head p {
-  margin: 6px 0 0;
-}
-
-.chunk-inspector-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.chunk-list {
-  display: grid;
-  gap: 10px;
-}
-
-.chunk-card {
-  border: 1px solid #e2e7f0;
-  border-radius: 10px;
-  background: #fbfcff;
-  padding: 14px;
-}
-
-.chunk-card-head {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.chunk-pill {
-  font-size: 12px;
-  border: 1px solid #d0d8e8;
-  background: #f0f4fb;
-  border-radius: 999px;
-  padding: 3px 8px;
-  color: #33435f;
-}
-
-.chunk-card details {
-  margin-top: 8px;
-}
-
-.chunk-card summary {
-  cursor: pointer;
-  font-weight: 600;
-  color: #2d3a53;
-}
-
-.chunk-pre {
-  margin: 8px 0 0;
-  padding: 10px;
-  border-radius: 10px;
-  border: 1px solid #d7deec;
+  gap: 14px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line-soft);
   background: #fff;
+  flex-shrink: 0;
+}
+
+.document-viewer-title-wrap {
+  min-width: 0;
+}
+
+.document-viewer-eyebrow {
+  margin-bottom: 4px;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.document-viewer-header h3 {
+  margin: 0;
+  color: #111827;
+  font-size: 18px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-viewer-header p {
+  margin: 3px 0 0;
+  color: #6b7280;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-viewer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.soft-link-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 42px;
+  border-radius: 10px;
+  border: 1px solid #dce1eb;
+  background: #fff;
+  color: #2d3340;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.soft-link-button:hover {
+  background: #f6f8fb;
+  border-color: #cbd3df;
+}
+
+.document-viewer-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 14px;
+  background: #f7f8fb;
+}
+
+.document-viewer-frame {
+  width: 100%;
+  height: 100%;
+  min-height: 360px;
+  border: 1px solid #dbe2ea;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.document-text-preview {
+  width: 100%;
+  height: 100%;
+  min-height: 360px;
+  margin: 0;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid #dbe2ea;
+  border-radius: 8px;
+  background: #fff;
+  color: #111827;
   font-family: Consolas, "Courier New", monospace;
-  font-size: 12px;
-  line-height: 1.6;
+  font-size: 13px;
+  line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 280px;
-  overflow: auto;
+}
+
+.document-viewer-state {
+  flex: 1;
+  min-height: 240px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  color: #64748b;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  font-size: 14px;
+  text-align: center;
+}
+
+.document-viewer-state-error {
+  color: #991b1b;
+  background: #fff7f7;
+  border-color: #fecaca;
 }
 
 /* Animation backdrop – đặt NGOÀI @media để tránh lỗi parse trên mobile browser cũ */
@@ -1937,6 +1996,39 @@ button.danger:hover {
 
   .admin-docs-head {
     flex-direction: column;
+  }
+
+  .document-viewer-overlay {
+    padding: 10px;
+  }
+
+  .document-viewer-dialog {
+    width: 100%;
+    height: calc(100vh - 20px);
+  }
+
+  .document-viewer-header {
+    flex-direction: column;
+  }
+
+  .document-viewer-title-wrap {
+    width: 100%;
+  }
+
+  .document-viewer-header h3,
+  .document-viewer-header p {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .document-viewer-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .document-viewer-frame,
+  .document-text-preview {
+    min-height: 280px;
   }
 
   .cgpt-composer-wrap {

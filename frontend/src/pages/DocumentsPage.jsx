@@ -1,9 +1,32 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
 import api from "../api";
 
-const CHUNK_PAGE_SIZE = 10;
 const DOCUMENT_PROGRESS_POLL_INTERVAL_MS = 2500;
+const EMPTY_FILE_VIEWER = {
+  document: null,
+  objectUrl: "",
+  textContent: "",
+  contentType: "",
+  isLoading: false,
+  error: "",
+};
+
+function isPdfDocument(document, contentTypeOverride = "") {
+  const contentType = String(contentTypeOverride || document?.content_type || "").toLowerCase();
+  const filename = String(document?.original_filename || "").toLowerCase();
+  return contentType.includes("pdf") || filename.endsWith(".pdf");
+}
+
+function isTextDocument(document, contentTypeOverride = "") {
+  const contentType = String(contentTypeOverride || document?.content_type || "").toLowerCase();
+  const filename = String(document?.original_filename || "").toLowerCase();
+  return (
+    contentType.startsWith("text/") ||
+    contentType.includes("markdown") ||
+    filename.endsWith(".txt") ||
+    filename.endsWith(".md")
+  );
+}
 
 function DocumentsPage() {
   const [documents, setDocuments] = useState([]);
@@ -16,74 +39,98 @@ function DocumentsPage() {
     action: "",
   });
   const [error, setError] = useState("");
-
-  const [selectedChunkDocumentId, setSelectedChunkDocumentId] = useState(null);
-  const [chunks, setChunks] = useState([]);
-  const [chunkTotal, setChunkTotal] = useState(0);
-  const [chunkOffset, setChunkOffset] = useState(0);
-  const [isChunksBusy, setIsChunksBusy] = useState(false);
-  const [chunksError, setChunksError] = useState("");
+  const [fileViewer, setFileViewer] = useState(EMPTY_FILE_VIEWER);
   const [showReindexConfirm, setShowReindexConfirm] = useState(false);
   const isPollingRef = useRef(false);
+  const fileViewerRequestRef = useRef(0);
+  const fileViewerObjectUrlRef = useRef("");
 
-  const totalChunks = useMemo(
-    () => documents.reduce((sum, item) => sum + (item.chunk_count || 0), 0),
-    [documents]
-  );
-
-  const selectedChunkDocument = useMemo(
-    () => documents.find((item) => item.id === selectedChunkDocumentId) || null,
-    [documents, selectedChunkDocumentId]
-  );
-
-  const hasIndexingDocuments = useMemo(
-    () => documents.some((item) => item.status === "indexing"),
-    [documents]
-  );
-
-  const chunkRangeStart = chunkTotal === 0 ? 0 : chunkOffset + 1;
-  const chunkRangeEnd = Math.min(chunkOffset + CHUNK_PAGE_SIZE, chunkTotal);
-  const canGoChunkPrev = chunkOffset > 0;
-  const canGoChunkNext = chunkOffset + CHUNK_PAGE_SIZE < chunkTotal;
-
-  function closeChunksInspector() {
-    setSelectedChunkDocumentId(null);
-    setChunks([]);
-    setChunkTotal(0);
-    setChunkOffset(0);
-    setChunksError("");
-  }
+  const hasIndexingDocuments = documents.some((item) => item.status === "indexing");
 
   async function fetchDocuments() {
     const response = await api.get("/documents");
     setDocuments(response.data);
-
-    if (selectedChunkDocumentId && !response.data.some((item) => item.id === selectedChunkDocumentId)) {
-      closeChunksInspector();
-    }
   }
 
-  async function fetchDocumentChunks(documentId, offset = 0) {
-    setIsChunksBusy(true);
-    setChunksError("");
+  function closeFileViewer() {
+    fileViewerRequestRef.current += 1;
+    setFileViewer((current) => {
+      if (current.objectUrl) {
+        URL.revokeObjectURL(current.objectUrl);
+      }
+      fileViewerObjectUrlRef.current = "";
+      return EMPTY_FILE_VIEWER;
+    });
+  }
+
+  async function openDocumentFile(doc) {
+    const requestId = fileViewerRequestRef.current + 1;
+    fileViewerRequestRef.current = requestId;
+    setError("");
+    setFileViewer((current) => {
+      if (current.objectUrl) {
+        URL.revokeObjectURL(current.objectUrl);
+      }
+      fileViewerObjectUrlRef.current = "";
+      return {
+        ...EMPTY_FILE_VIEWER,
+        document: doc,
+        isLoading: true,
+      };
+    });
 
     try {
-      const response = await api.get(`/documents/${documentId}/chunks`, {
-        params: {
-          offset,
-          limit: CHUNK_PAGE_SIZE,
-        },
-      });
+      const response = await api.get(`/documents/${doc.id}/file`, { responseType: "blob" });
+      if (fileViewerRequestRef.current !== requestId) {
+        return;
+      }
 
-      setSelectedChunkDocumentId(documentId);
-      setChunks(response.data.items || []);
-      setChunkTotal(response.data.total_chunks || 0);
-      setChunkOffset(response.data.offset || 0);
+      const contentType =
+        response.headers?.["content-type"] ||
+        response.data?.type ||
+        doc.content_type ||
+        "application/octet-stream";
+      const blob = response.data instanceof Blob
+        ? response.data
+        : new Blob([response.data], { type: contentType });
+      const typedBlob = blob.type ? blob : new Blob([blob], { type: contentType });
+
+      if (isTextDocument(doc, contentType)) {
+        const textContent = await typedBlob.text();
+        if (fileViewerRequestRef.current !== requestId) {
+          return;
+        }
+        setFileViewer({
+          ...EMPTY_FILE_VIEWER,
+          document: doc,
+          textContent,
+          contentType,
+        });
+        return;
+      }
+
+      const objectUrl = URL.createObjectURL(typedBlob);
+      if (fileViewerRequestRef.current !== requestId) {
+        URL.revokeObjectURL(objectUrl);
+        return;
+      }
+      fileViewerObjectUrlRef.current = objectUrl;
+      setFileViewer({
+        ...EMPTY_FILE_VIEWER,
+        document: doc,
+        objectUrl,
+        contentType,
+      });
     } catch (err) {
+      if (fileViewerRequestRef.current !== requestId) {
+        return;
+      }
       const detail = err?.response?.data?.detail;
-      setChunksError(typeof detail === "string" ? detail : "Không thể tải danh sách chunks.");
-    } finally {
-      setIsChunksBusy(false);
+      setFileViewer({
+        ...EMPTY_FILE_VIEWER,
+        document: doc,
+        error: typeof detail === "string" ? detail : "Không thể mở file tài liệu.",
+      });
     }
   }
 
@@ -142,8 +189,8 @@ function DocumentsPage() {
     setError("");
     try {
       await api.delete(`/documents/${documentId}`);
-      if (selectedChunkDocumentId === documentId) {
-        closeChunksInspector();
+      if (fileViewer.document?.id === documentId) {
+        closeFileViewer();
       }
       await fetchDocuments();
     } catch (err) {
@@ -180,23 +227,6 @@ function DocumentsPage() {
     setShowReindexConfirm(false);
   }
 
-  function handleChunkToggle(doc) {
-    if (selectedChunkDocumentId === doc.id) {
-      closeChunksInspector();
-      return;
-    }
-    fetchDocumentChunks(doc.id, 0);
-  }
-
-  function formatChunkDate(value) {
-    if (!value) return "";
-    const parsed = new Date(value);
-    if (Number.isNaN(parsed.getTime())) {
-      return "";
-    }
-    return parsed.toLocaleString();
-  }
-
   function getStatusLabel(status) {
     const labels = {
       uploaded: "Chưa index",
@@ -217,6 +247,16 @@ function DocumentsPage() {
 
   useEffect(() => {
     fetchDocuments().catch(() => setError("Không thể tải danh sách tài liệu."));
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      fileViewerRequestRef.current += 1;
+      if (fileViewerObjectUrlRef.current) {
+        URL.revokeObjectURL(fileViewerObjectUrlRef.current);
+        fileViewerObjectUrlRef.current = "";
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -253,7 +293,6 @@ function DocumentsPage() {
         <h2>Quản lý tài liệu</h2>
         <div className="panel-actions">
           <span className="metric-pill">Tài liệu: {documents.length}</span>
-          <span className="metric-pill">Tổng chunks: {totalChunks}</span>
           {hasIndexingDocuments ? <span className="status-pill progress">Đang cập nhật tiến độ</span> : null}
           <button className="soft-button" onClick={openReindexConfirm} disabled={isBusy}>
             Index tài liệu còn thiếu
@@ -286,7 +325,6 @@ function DocumentsPage() {
               <th>Tiêu đề</th>
               <th>File gốc</th>
               <th>Trạng thái</th>
-              <th>Chunks</th>
               <th>Thao tác</th>
 
             </tr>
@@ -302,7 +340,6 @@ function DocumentsPage() {
                     {getStatusLabel(doc.status)}
                   </span>
                 </td>
-                <td>{doc.chunk_count}</td>
                 <td className="row-actions">
                   {doc.status !== "embedded" && doc.status !== "indexing" ? (
                     <button
@@ -315,8 +352,8 @@ function DocumentsPage() {
                         : "Index"}
                     </button>
                   ) : null}
-                  <button onClick={() => handleChunkToggle(doc)} disabled={isBusy || isChunksBusy}>
-                    {selectedChunkDocumentId === doc.id ? "Ẩn chunks" : "Xem chunks"}
+                  <button onClick={() => openDocumentFile(doc)} disabled={isBusy || fileViewer.isLoading}>
+                    {fileViewer.isLoading && fileViewer.document?.id === doc.id ? "Đang mở..." : "Xem file"}
                   </button>
                   <button className="danger" onClick={() => deleteDocument(doc.id)} disabled={isBusy}>
                     Xóa
@@ -326,91 +363,83 @@ function DocumentsPage() {
             ))}
             {documents.length === 0 ? (
               <tr>
-                <td colSpan="6" className="empty-cell">Chưa có tài liệu nào.</td>
+                <td colSpan="5" className="empty-cell">Chưa có tài liệu nào.</td>
               </tr>
             ) : null}
           </tbody>
         </table>
       </div>
 
-      {selectedChunkDocumentId ? (
-        <section className="chunk-inspector">
-          <div className="chunk-inspector-head">
-            <div>
-              <h3>
-                Chunks - Tài liệu #{selectedChunkDocumentId}
-                {selectedChunkDocument ? `: ${selectedChunkDocument.title}` : ""}
-              </h3>
-              <p className="muted">
-                Tổng: {chunkTotal}
-                {chunkTotal > 0 ? ` | Đang hiển thị ${chunkRangeStart}-${chunkRangeEnd}` : ""}
-              </p>
+      {fileViewer.document ? (
+        <div className="modal-overlay document-viewer-overlay" onClick={closeFileViewer}>
+          <div
+            className="modal-dialog document-viewer-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Xem file tài liệu"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="document-viewer-header">
+              <div className="document-viewer-title-wrap">
+                <div className="document-viewer-eyebrow">Tài liệu #{fileViewer.document.id}</div>
+                <h3 title={fileViewer.document.title}>{fileViewer.document.title}</h3>
+                <p title={fileViewer.document.original_filename}>
+                  {fileViewer.document.original_filename}
+                </p>
+              </div>
+              <div className="document-viewer-actions">
+                {fileViewer.objectUrl ? (
+                  <a className="soft-link-button" href={fileViewer.objectUrl} target="_blank" rel="noreferrer">
+                    Mở tab mới
+                  </a>
+                ) : null}
+                <button className="danger" onClick={closeFileViewer}>
+                  Đóng
+                </button>
+              </div>
             </div>
-            <div className="chunk-inspector-actions">
-              <button
-                onClick={() =>
-                  fetchDocumentChunks(
-                    selectedChunkDocumentId,
-                    Math.max(0, chunkOffset - CHUNK_PAGE_SIZE)
-                  )
-                }
-                disabled={!canGoChunkPrev || isChunksBusy}
-              >
-                Trước
-              </button>
-              <button
-                onClick={() =>
-                  fetchDocumentChunks(selectedChunkDocumentId, chunkOffset + CHUNK_PAGE_SIZE)
-                }
-                disabled={!canGoChunkNext || isChunksBusy}
-              >
-                Sau
-              </button>
-              <button className="danger" onClick={closeChunksInspector}>
-                Đóng
-              </button>
+
+            <div className="document-viewer-body">
+              {fileViewer.isLoading ? (
+                <div className="document-viewer-state">Đang mở file tài liệu...</div>
+              ) : null}
+
+              {!fileViewer.isLoading && fileViewer.error ? (
+                <div className="document-viewer-state document-viewer-state-error">
+                  {fileViewer.error}
+                </div>
+              ) : null}
+
+              {!fileViewer.isLoading &&
+              !fileViewer.error &&
+              isPdfDocument(fileViewer.document, fileViewer.contentType) &&
+              fileViewer.objectUrl ? (
+                <iframe
+                  title={`Xem ${fileViewer.document.original_filename}`}
+                  src={fileViewer.objectUrl}
+                  className="document-viewer-frame"
+                />
+              ) : null}
+
+              {!fileViewer.isLoading &&
+              !fileViewer.error &&
+              isTextDocument(fileViewer.document, fileViewer.contentType) ? (
+                <pre className="document-text-preview">
+                  {fileViewer.textContent || "File không có nội dung."}
+                </pre>
+              ) : null}
+
+              {!fileViewer.isLoading &&
+              !fileViewer.error &&
+              !isPdfDocument(fileViewer.document, fileViewer.contentType) &&
+              !isTextDocument(fileViewer.document, fileViewer.contentType) ? (
+                <div className="document-viewer-state">
+                  Định dạng này không hỗ trợ xem trực tiếp trong trình duyệt.
+                </div>
+              ) : null}
             </div>
           </div>
-
-          {isChunksBusy ? <p className="muted">Đang tải chunks...</p> : null}
-          {chunksError ? <p className="error-text">{chunksError}</p> : null}
-          {!isChunksBusy && !chunksError && chunks.length === 0 ? (
-            <p className="muted">Tài liệu này chưa có chunk. Bấm Index để tạo chunks.</p>
-          ) : null}
-
-          <div className="chunk-list">
-            {chunks.map((chunk) => {
-              const metadata = chunk.source_metadata || {};
-              const hasMetadata = Object.keys(metadata).length > 0;
-
-              return (
-                <article className="chunk-card" key={chunk.id}>
-                  <div className="chunk-card-head">
-                    <strong>Chunk #{chunk.chunk_index}</strong>
-                    <span className="chunk-pill">id {chunk.id}</span>
-                    {chunk.source_page ? <span className="chunk-pill">trang {chunk.source_page}</span> : null}
-                    {chunk.source_kind ? <span className="chunk-pill">{chunk.source_kind}</span> : null}
-                    {chunk.created_at ? (
-                      <span className="chunk-pill">{formatChunkDate(chunk.created_at)}</span>
-                    ) : null}
-                  </div>
-
-                  <details open>
-                    <summary>Nội dung</summary>
-                    <pre className="chunk-pre">{chunk.content}</pre>
-                  </details>
-
-                  <details>
-                    <summary>Metadata</summary>
-                    <pre className="chunk-pre">
-                      {hasMetadata ? JSON.stringify(metadata, null, 2) : "{}"}
-                    </pre>
-                  </details>
-                </article>
-              );
-            })}
-          </div>
-        </section>
+        </div>
       ) : null}
 
       {error ? <p className="error-text">{error}</p> : null}
